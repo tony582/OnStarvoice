@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {getEventListeners} from 'node:events';
 import {DeviceError} from '../src/device/bounded.mjs';
-import {createOcrReadiness, OCR_KEEPALIVE_MS, OCR_WARMUP_RETRY_MS, OCR_WARMUP_TIMEOUT_MS} from '../src/device/ocr-readiness.mjs';
+import {createOcrReadiness, OCR_KEEPALIVE_MS, OCR_FRESHNESS_MS, OCR_WARMUP_RETRY_MS, OCR_WARMUP_TIMEOUT_MS} from '../src/device/ocr-readiness.mjs';
 
 async function flush() { for (let step = 0; step < 12; step++) await Promise.resolve(); }
 
@@ -64,19 +64,33 @@ test('startup remains ocr_warming through a fake 40 second cold recognition, the
   assert.deepEqual(f.diagnostics, [{event: 'ocr_warmup_ready', elapsedMs: 40_000}]);
 });
 
-test('an idle runner keeps OCR warm at the four minute boundary using only the bundled image', async t => {
-  const f = fixture(t);
+test('idle keepalive starts 30 seconds early and never flickers warming before, during or after refresh', async t => {
+  const f = fixture(t, [{}, {delay: 170}]);
   await f.startReady();
+  assert.equal(OCR_KEEPALIVE_MS, 210_000);
+  assert.equal(OCR_FRESHNESS_MS, 240_000);
+  const assertReady = () => {
+    assert.equal(f.readiness.status().readyForSearch, true);
+    assert.equal(f.readiness.status().reason, null);
+  };
+  assertReady();
   assert.equal(f.calls.length, 1);
   await f.advance(OCR_KEEPALIVE_MS - 1);
   assert.equal(f.calls.length, 1);
+  assertReady();
   await f.advance(1);
   assert.equal(f.calls.length, 2);
-  assert.equal(f.readiness.status().reason, 'ocr_warming');
+  assertReady();
   assert.equal(f.calls[1].bytes, f.image);
-  await f.advance(0);
-  assert.equal(f.readiness.status().readyForSearch, true);
+  await f.advance(169);
+  assertReady();
+  await f.advance(1);
+  assertReady();
   assert.equal(f.pool.pending, 0);
+  assert.equal(f.pool.lastSuccessAt, 211_170);
+  // Passing the old 240-second expiry must not withdraw readiness after the early successful refresh.
+  await f.advance(OCR_FRESHNESS_MS - OCR_KEEPALIVE_MS);
+  assertReady();
 });
 
 test('recent real recognition skips the scheduled keepalive and schedules it from that success', async t => {
@@ -84,7 +98,7 @@ test('recent real recognition skips the scheduled keepalive and schedules it fro
   await f.startReady();
   await f.advance(180_000);
   f.recognizeReal();
-  await f.advance(60_000);
+  await f.advance(30_000);
   assert.equal(f.calls.length, 1);
   assert.equal(f.readiness.status().readyForSearch, true);
   await f.advance(179_999);
@@ -93,6 +107,53 @@ test('recent real recognition skips the scheduled keepalive and schedules it fro
   assert.equal(f.calls.length, 2);
   await f.advance(0);
   assert.equal(f.readiness.status().readyForSearch, true);
+});
+
+test('a keepalive that exceeds the 30 second margin stops advertising readiness at the actual freshness expiry', async t => {
+  const f = fixture(t, [{}, {delay: 40_000}]);
+  await f.startReady();
+  await f.advance(OCR_KEEPALIVE_MS);
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.readiness.status().readyForSearch, true);
+  assert.equal(f.readiness.status().reason, null);
+  await f.advance(OCR_FRESHNESS_MS - OCR_KEEPALIVE_MS - 1);
+  assert.equal(f.readiness.status().readyForSearch, true);
+  await f.advance(1);
+  assert.equal(f.readiness.status().readyForSearch, false);
+  assert.equal(f.readiness.status().reason, 'ocr_warming');
+  await f.advance(10_000);
+  assert.equal(f.readiness.status().readyForSearch, true);
+  assert.equal(f.readiness.status().reason, null);
+});
+
+test('an early keepalive failure remains unavailable even when the previous success has not expired', async t => {
+  const failure = new DeviceError('ocr_failed', 'failed', {details: {error: 'recognition_failed'}});
+  const f = fixture(t, [{}, {delay: 170, failure}]);
+  await f.startReady();
+  await f.advance(OCR_KEEPALIVE_MS);
+  assert.equal(f.readiness.status().readyForSearch, true);
+  await f.advance(170);
+  assert.equal(f.readiness.status().readyForSearch, false);
+  assert.equal(f.readiness.status().reason, 'ocr_unavailable');
+  assert.equal(f.diagnostics.at(-1).details.error, 'recognition_failed');
+});
+
+test('task preparation joins an early keepalive without a second recognition or a readiness flicker', async t => {
+  const f = fixture(t, [{}, {delay: 170}]);
+  await f.startReady();
+  await f.advance(OCR_KEEPALIVE_MS);
+  f.readiness.setTaskActive(true);
+  let prepared = false;
+  const preparing = f.readiness.ensureReady().then(() => { prepared = true; });
+  await flush();
+  assert.equal(prepared, false);
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.readiness.status().readyForSearch, true);
+  await f.advance(170);
+  await preparing;
+  assert.equal(prepared, true);
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.readiness.status().reason, null);
 });
 
 test('busy devices do not send keepalive and maintenance resumes after the task releases them', async t => {
@@ -115,7 +176,7 @@ test('the task can await stale OCR warmth before starting its work while backgro
   const f = fixture(t, [{}, {delay: 40_000}]);
   await f.startReady();
   f.readiness.setTaskActive(true);
-  await f.advance(OCR_KEEPALIVE_MS);
+  await f.advance(OCR_FRESHNESS_MS);
   let taskStarted = false;
   const preparation = f.readiness.ensureReady().then(() => { taskStarted = true; });
   await flush();

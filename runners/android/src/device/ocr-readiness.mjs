@@ -2,7 +2,8 @@ import {readFileSync} from 'node:fs';
 import {DeviceError} from './bounded.mjs';
 
 export const OCR_WARMUP_TIMEOUT_MS = 120_000;
-export const OCR_KEEPALIVE_MS = 240_000;
+export const OCR_KEEPALIVE_MS = 210_000;
+export const OCR_FRESHNESS_MS = 240_000;
 export const OCR_WARMUP_RETRY_MS = 30_000;
 const WARMUP_IMAGE = new URL('../../tools/ocr/warmup.png', import.meta.url);
 
@@ -12,7 +13,7 @@ export function createOcrReadiness({ocr, now = Date.now, loadImage = () => readF
   let closed = false, busy = false, timer = null, flight = null, failure = null, retryAt = 0;
   let lastWarmupMs = null;
   const fresh = () => Number.isFinite(ocr.lastSuccessAt) && now() >= ocr.lastSuccessAt
-    && now() - ocr.lastSuccessAt < OCR_KEEPALIVE_MS;
+    && now() - ocr.lastSuccessAt < OCR_FRESHNESS_MS;
   const note = entry => { try { onDiagnostic(entry); } catch { /* Diagnostics never affect readiness. */ } };
   const stopTimer = () => { clearTimeout(timer); timer = null; };
   function schedule(wait) {
@@ -52,7 +53,8 @@ export function createOcrReadiness({ocr, now = Date.now, loadImage = () => readF
   function maintain() {
     if (closed || busy || flight) return;
     if (failure && now() < retryAt) { schedule(retryAt - now()); return; }
-    if (fresh() && !failure) { schedule(OCR_KEEPALIVE_MS - (now() - ocr.lastSuccessAt)); return; }
+    const untilKeepalive = OCR_KEEPALIVE_MS - (now() - ocr.lastSuccessAt);
+    if (fresh() && !failure && untilKeepalive > 0) { schedule(untilKeepalive); return; }
     // A real recognition may be in flight when its successful timestamp is not yet available.
     if (ocr.pending > 0) { schedule(1000); return; }
     startWarmup();
@@ -84,8 +86,10 @@ export function createOcrReadiness({ocr, now = Date.now, loadImage = () => readF
       if (busy) stopTimer(); else maintain();
     },
     status() {
-      return {readyForSearch: !closed && !flight && !failure && fresh(),
-        reason: closed || (!flight && failure) ? 'ocr_unavailable' : flight || !fresh() ? 'ocr_warming' : null,
+      // An early idle keepalive does not invalidate the last successful recognition while it is still fresh.
+      const readyForSearch = !closed && !failure && fresh();
+      return {readyForSearch,
+        reason: readyForSearch ? null : closed || (!flight && failure) ? 'ocr_unavailable' : 'ocr_warming',
         lastSuccessAt: ocr.lastSuccessAt ?? null, lastWarmupMs};
     },
     close() { closed = true; stopTimer(); flight?.controller.abort(); },
