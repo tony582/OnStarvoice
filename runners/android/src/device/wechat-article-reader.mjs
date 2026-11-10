@@ -129,7 +129,8 @@ export function createArticleReader({screen, look, assertArticle, card = null, n
         state.metrics = mergeMetrics(state.metrics, parseArticleMetrics(rows), state.capturedAt);
         const footer = footerEvidence(rows); let expandNext = null;
         // A footer peeking below the safe OCR region does not prove the obscured final body lines were read.
-        state.reachedEnd ||= !!footer.read && footer.read.y < 1900;
+        state.reachedEnd ||= !!footer.read && footer.read.y < 1900
+          || !!footer.header && footer.header.y + footer.header.h < 1900;
         if (state.reachedEnd) {
           const comments = parseArticleComments(rows, {reachedEnd: state.reachedEnd});
           state.entrySeen ||= comments.entrySeen;

@@ -10,6 +10,7 @@ const lines = (from, to, y = 300, step = 90) => Array.from({length: to - from}, 
 const footer = [row('阅读100', 55, 1850, 180), row('不喜欢', 855, 1850, 160)];
 const fixture = name => JSON.parse(readFileSync(new URL(`./fixtures/wechat-articles/${name}.json`, import.meta.url)));
 const t13 = name => fixture('t13-claude-phone-20261110')[name].rows;
+const t13Comments = number => fixture('t13-comment-footer-20261110')[`t12-renew-d/${number}`].rows;
 function harness(pages, options = {}) {
   let index = 0, checks = 0; const swipes = [];
   const reader = createArticleReader({screen: {swipe: async (...args) => { swipes.push(args.slice(0, 5)); index = Math.min(index + 1, pages.length - 1); }},
@@ -250,11 +251,95 @@ test('delegated scanning requires verified identity and retains page limits, can
   const {reader} = harness([lines(20, 28), [...lines(25, 33), row('留言', 55, 1700)]], {...supplemental, maxPages: 2});
   const result = await reader.read();
   assert.equal(result.hasMore, false); assert.equal(result.article.bodyStatus, 'delegated');
-  assert.equal(result.article.evidence.bodyEndObserved, false); assert.equal(result.article.evidence.scanReason, 'screen_budget_exhausted');
+  assert.equal(result.article.evidence.bodyEndObserved, true); assert.equal(result.article.evidence.scanReason, 'screen_budget_exhausted');
   assert.equal(result.comments.status, 'unknown'); assert.equal(result.comments.headerCount, null);
   const aborted = harness([lines(20, 28)], supplemental); const controller = new AbortController(); controller.abort();
   await assert.rejects(aborted.reader.read({signal: controller.signal}));
   assert.equal(aborted.checks(), 0); assert.equal(aborted.swipes.length, 0);
+});
+
+test('T13 delegated scans without any footer still stop at the page budget with unknown counts', async () => {
+  const {reader} = harness([lines(20, 28), lines(25, 33)], {...supplemental, maxPages: 2});
+  const result = await reader.read();
+  assert.equal(result.hasMore, false); assert.equal(result.pagesRead, 2);
+  assert.equal(result.article.evidence.bodyEndObserved, false);
+  assert.equal(result.article.evidence.scanReason, 'screen_budget_exhausted');
+  assert.equal(result.comments.status, 'unknown'); assert.equal(result.comments.headerCount, null);
+  assert.equal(result.article.metrics.read.value, null);
+});
+
+test('T13 original 130–135 screens reach comments after the merged read row and keep incomplete coverage partial', async () => {
+  const pages = Array.from({length: 6}, (_, index) => t13Comments(130 + index));
+  const {reader, swipes} = harness(pages, {...supplemental, maxPages: pages.length});
+  const result = await reader.read({limit: 50});
+  assert.equal(result.hasMore, false); assert.equal(result.pagesRead, 6); assert.equal(swipes.length, 5);
+  assert.equal(result.article.evidence.bodyEndObserved, true);
+  assert.deepEqual({raw: result.article.metrics.read.raw, value: result.article.metrics.read.value, precision: result.article.metrics.read.precision},
+    {raw: '3.6万', value: 36000, precision: 'rounded'});
+  assert.equal(result.comments.headerCount, 13); assert.equal(result.comments.status, 'partial');
+  assert.equal(result.comments.postingState, 'followers_only'); assert.equal(result.comments.visibleScopeComplete, false);
+  assert.ok(result.comments.items.length > 0 && result.comments.items.length < 13);
+  assert.ok(result.comments.items.every(item => !/(京东|新人0\.01|这个还真的要交钱|这个我觉得蛮正常)/u.test(item.content)));
+  assert.equal(result.comments.items.find(item => item.author === '欲.').content, '收费也能理解，毕竟人家提供了服务嘛');
+});
+
+test('T13 original header-only 131–135 screens independently start comment reading without a fabricated read count', async () => {
+  const pages = Array.from({length: 5}, (_, index) => t13Comments(131 + index));
+  const {reader, swipes} = harness(pages, {...supplemental, maxPages: pages.length, maxChunkPages: 1});
+  let result = await reader.read({limit: 50});
+  assert.equal(result.article.evidence.bodyEndObserved, true); assert.equal(result.comments.items.length, 1);
+  assert.equal(result.hasMore, true, 'the moving heading does not prove a pinned end');
+  while (result.hasMore) result = await reader.read({limit: 50});
+  assert.equal(result.pagesRead, 5); assert.equal(swipes.length, 4);
+  assert.deepEqual(result.article.metrics.read, {raw: null, value: null, precision: 'unknown'});
+  assert.equal(result.comments.headerCount, 13); assert.equal(result.comments.status, 'partial');
+  assert.ok(result.comments.items.length > 0 && result.comments.items.length < 13);
+});
+
+test('T13 a bare comment heading proves the end but does not prove empty or closed comments', async () => {
+  const end = [row('留言', 55, 700, 100)];
+  const result = await harness([end, end], supplemental).reader.read();
+  assert.equal(result.article.evidence.bodyEndObserved, true); assert.equal(result.hasMore, false);
+  assert.equal(result.comments.status, 'unknown'); assert.equal(result.comments.postingState, 'unknown');
+  assert.equal(result.comments.headerCount, null); assert.deepEqual(result.comments.items, []);
+  assert.deepEqual(result.article.metrics.read, {raw: null, value: null, precision: 'unknown'});
+});
+
+test('T13 a comment heading crossing the safe bottom edge is not yet an observed body end', async () => {
+  for (const y of [1850, 1880]) {
+    const pages = [[row('留言13', 55, y, 150, 50)], [row('留言13', 55, 1400, 150, 50)]];
+    const {reader} = harness(pages, {...supplemental, maxChunkPages: 1});
+    const peek = await reader.read();
+    assert.equal(peek.article.evidence.bodyEndObserved, false); assert.equal(peek.hasMore, true);
+    assert.equal(peek.comments.headerCount, null); assert.equal(peek.comments.status, 'unknown');
+    const result = await reader.read();
+    assert.equal(result.article.evidence.bodyEndObserved, true); assert.equal(result.comments.headerCount, 13);
+    assert.equal(result.article.metrics.read.value, null);
+  }
+});
+
+test('T13 diagnostic body capture ends before the comment heading and excludes the comment area', async () => {
+  const page = [...header, row('这是真实正文最后一段。', 55, 620), row('留言13', 55, 1000),
+    row('甲 上海 11月9日', 163, 1200), row('这条留言不是文章正文', 163, 1300)];
+  const result = await harness([page]).reader.read({commentsEnabled: false});
+  assert.equal(result.article.bodyStatus, 'complete'); assert.equal(result.article.content, '这是真实正文最后一段。');
+  assert.equal(result.article.evidence.bodyEndObserved, true); assert.equal(result.comments.status, 'disabled');
+  assert.equal(result.article.metrics.read.value, null);
+});
+
+test('T13 comment headings at or below y1900 do not freeze obscured final body text', async () => {
+  for (const y of [1900, 2000]) {
+    const lastLine = '最后的正文仍须完整读到。';
+    const pages = [[...header, ...lines(0, 15, 620)], [...lines(8, 23), row(lastLine, 55, 1850), row('留言13', 55, y)],
+      [...lines(16, 23), row(lastLine, 55, 1180), row('留言13', 55, 1450)]];
+    const {reader} = harness(pages, {maxChunkPages: 1});
+    await reader.read({commentsEnabled: false});
+    const peek = await reader.read({commentsEnabled: false});
+    assert.equal(peek.hasMore, true); assert.equal(peek.article.evidence.bodyEndObserved, false);
+    const result = await reader.read({commentsEnabled: false});
+    assert.equal(result.article.bodyStatus, 'complete'); assert.equal(result.article.evidence.bodyEndObserved, true);
+    assert.ok(result.article.content.includes(lastLine)); assert.ok(!result.article.content.includes('留言13'));
+  }
 });
 
 test('each displayed metric keeps its screen observation time after it scrolls out of view', async () => {

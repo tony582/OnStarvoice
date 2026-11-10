@@ -146,20 +146,23 @@ export function parseArticleHeader(rows, {card = null} = {}) {
     titleObserved: titleRows.length > 0, bodyTop: dated ? dated.y + dated.h + 30 : 540, headerVerified: !!meta && titleRows.length > 0 && accountObserved};
 }
 export function footerEvidence(rows) {
-  const read = rows.find(row => row.x < 180 && row.y > 240 && row.y < 2050 && /^阅读\s*\d/u.test(row.text)
+  const read = rows.find(row => row.x < 180 && row.y > 240 && row.y < 2050
+    && /^(?:阅读原文\s*)?阅读\s*\d+(?:\.\d+)?(?:万|亿)?\+?$/u.test(row.text.trim())
     && rows.some(other => other.x > 750 && Math.abs(other.y - row.y) < 70 && /不喜欢/u.test(other.text)));
   const header = rows.find(row => row.x < 130 && row.y > (read?.y ?? 240) && row.y < 2050 && /^留言\s*\d*$/u.test(row.text));
-  return {read, header, bodyEndY: read?.y ?? null};
+  // On a verified article page, the left-aligned comment heading is also an end marker when reads are hidden.
+  return {read, header, bodyEndY: read?.y ?? header?.y ?? null};
 }
 export function parseArticleMetrics(rows) {
   const read = footerEvidence(rows).read;
+  const readText = read?.text.trim().replace(/^阅读原文\s*/u, '');
   const bar = rows.filter(row => row.y >= 2160 && row.y < 2220);
   const at = (x0, x1) => bar.find(row => row.x >= x0 && row.x < x1)?.text;
   // Verified four-icon bar; three-icon variant uses shifted slots, distinguished by the 分享 label.
   const three = bar.some(row => row.x >= 790 && row.x < 900 && /^分享/u.test(row.text));
   const four = bar.some(row => row.x >= 570 && row.x < 680 && /^(?:\d|赞|喜欢)/u.test(row.text));
-  if (!three && !four) return {read: metric(read?.text, {read: true}), like: metric(null), share: metric(null), recommend: metric(null)};
-  return {read: metric(read?.text, {read: true}), like: metric(at(three ? 710 : 570, three ? 790 : 680)),
+  if (!three && !four) return {read: metric(readText, {read: true}), like: metric(null), share: metric(null), recommend: metric(null)};
+  return {read: metric(readText, {read: true}), like: metric(at(three ? 710 : 570, three ? 790 : 680)),
     share: metric(at(three ? 790 : 680, three ? 900 : 790)), recommend: metric(at(three ? 930 : 790, three ? 1020 : 880))};
 }
 export function articleBodyRows(rows, {first = false, header = null, reachedEnd = false} = {}) {

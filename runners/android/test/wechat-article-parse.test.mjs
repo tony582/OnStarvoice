@@ -8,6 +8,76 @@ const rows = name => JSON.parse(readFileSync(new URL(`./fixtures/wechat-articles
 const row = (text, x, y, w = 500, h = 45) => ({text, x, y, w, h, conf: 1});
 const t9 = name => rows('t9-claude-phone-20261109')[name].rows;
 const t13 = name => rows('t13-claude-phone-20261110')[name].rows;
+const t13Comments = number => rows('t13-comment-footer-20261110')[`t12-renew-d/${number}`].rows;
+
+test('T13 merged 阅读原文 and read count require the paired footer control and preserve rounded precision', () => {
+  const source = t13Comments(130), read = footerEvidence(source).read;
+  assert.equal(read.text, '阅读原文 阅读3.6万');
+  assert.deepEqual(parseArticleMetrics(source).read, {raw: '3.6万', value: 36000, precision: 'rounded'});
+  assert.deepEqual(parseArticleMetrics([row(' 阅读原文 阅读3.6万 ', 55, 700), row('不喜欢', 855, 700)]).read,
+    {raw: '3.6万', value: 36000, precision: 'rounded'});
+  for (const sample of [source.filter(item => !item.text.includes('不喜欢')),
+    [row('阅读原文 阅读3.6万', 55, 700), row('不喜欢', 855, 900)],
+    [row('阅读原文 阅读3.6万', 200, 700), row('不喜欢', 855, 700)],
+    [row('阅读原文的阅读3.6万案例', 55, 700), row('不喜欢', 855, 700)],
+    [row('阅读原文 阅读3.6万，欢迎留言', 55, 700), row('不喜欢', 855, 700)],
+    [row('阅读3.6万的案例', 55, 700), row('不喜欢', 855, 700)]]) {
+    assert.equal(footerEvidence(sample).read, undefined);
+    assert.deepEqual(parseArticleMetrics(sample).read, {raw: null, value: null, precision: 'unknown'});
+  }
+});
+
+test('T13 real header-only screens preserve comment count 13 and never invent a read count', () => {
+  for (const number of [131, 132]) {
+    const source = t13Comments(number), footer = footerEvidence(source);
+    assert.equal(footer.read, undefined); assert.equal(footer.bodyEndY, footer.header.y);
+    assert.equal(parseArticleComments(source).headerCount, 13);
+    assert.deepEqual(parseArticleMetrics(source).read, {raw: null, value: null, precision: 'unknown'});
+    assert.ok(articleBodyRows(source).every(item => item.y + item.h < footer.header.y));
+  }
+});
+
+test('T13 missing authors delimit preceding comments without inventing names or losing later valid comments', () => {
+  const source = [row('留言13', 55, 400), row('甲 上海 11月9日', 163, 600), row('第一条已知留言', 163, 680),
+    row('安徽 2023年9月14日', 208, 850), row('回复', 813, 850, 80), row('缺名字的下一条', 163, 920),
+    row('乙 江苏 11月9日', 163, 1100), row('后面的有效留言', 163, 1180)];
+  const parsed = parseArticleComments(source);
+  assert.equal(parsed.unparsed, true);
+  assert.deepEqual(parsed.comments.map(item => [item.author, item.content]), [['甲', '第一条已知留言'], ['乙', '后面的有效留言']]);
+  assert.equal(parsed.comments[0].cut, true); assert.equal(parsed.headerCount, 13);
+  const invalid = source.map(item => item.y === 850 && item.x === 208 ? {...item, text: `${'长'.repeat(61)} 安徽 2023年9月14日`} : item);
+  assert.deepEqual(parseArticleComments(invalid).comments.map(item => item.content), ['第一条已知留言', '后面的有效留言']);
+});
+
+test('T13 small right-side advertisement markers delimit only the preceding comment', () => {
+  for (const marker of ['广告', '广告♥', '广告<']) {
+    const source = [row('留言2', 55, 400), row('甲 上海 11月9日', 163, 600), row('正常正文提到京东和广告应保留', 163, 680),
+      row('京东', 163, 797), row(marker, 921, 800, 98, 33), row('新人优惠广告文案', 163, 880),
+      row('乙 江苏 11月9日', 163, 1100), row('后面的有效留言', 163, 1180)];
+    const parsed = parseArticleComments(source);
+    assert.deepEqual(parsed.comments.map(item => item.content), ['正常正文提到京东和广告应保留', '后面的有效留言']);
+  }
+  for (const marker of [row('广告', 163, 800), row('广告文案', 921, 800, 98, 33), row('广告', 921, 800, 98, 80)]) {
+    const parsed = parseArticleComments([row('留言1', 55, 400), row('甲 上海 11月9日', 163, 600), marker,
+      row('后面的正常内容', 163, 880)]);
+    assert.ok(parsed.comments[0].content.includes('后面的正常内容'), 'ordinary text or an unverified marker is not a boundary');
+  }
+});
+
+test('T13 original comment screens no longer join anonymous comments or advertisements into known authors', () => {
+  const second = parseArticleComments(t13Comments(132), {reachedEnd: true});
+  assert.ok(second.comments[0].content.includes('使用方向盘'));
+  assert.ok(!second.comments[0].content.includes('这个还真的要交钱'));
+  assert.equal(second.unparsed, true);
+  for (const number of [133, 134, 135]) {
+    const parsed = parseArticleComments(t13Comments(number), {reachedEnd: true});
+    const item = parsed.comments.find(comment => comment.author === '欲.');
+    assert.equal(item.content, '收费也能理解，毕竟人家提供了服务嘛');
+    assert.equal(parsed.unparsed, true);
+    if (number === 133) assert.ok(!parsed.comments[0].content.includes('这个通用没毛病'));
+    if (number === 135) assert.equal(parsed.comments.find(comment => comment.author === 'M.').content, '如果要用，这个钱还真的要交@');
+  }
+});
 
 test('T13 real shifted tabs need the keyword, article tab and two distinct known neighbours', () => {
   const source = t13('t12-renew-b/049');
@@ -210,10 +280,21 @@ test('article links reject foreign domains, query tricks, video links and embedd
     '点击发送给朋友']) assert.equal(ARTICLE_LINK.test(value), false);
 });
 
-test('a body heading named 留言 cannot establish the article end', () => {
+test('a left-aligned bare 留言 heading establishes the end without a numeric comment count', () => {
   const source = [row('这是正常正文', 55, 300), row('留言', 55, 600), row('后面还有正常内容', 55, 800)];
-  assert.equal(footerEvidence(source).bodyEndY, null);
-  assert.ok(articleBodyRows(source).some(item => item.text === '后面还有正常内容'));
+  assert.equal(footerEvidence(source).bodyEndY, 600);
+  assert.deepEqual(articleBodyRows(source).map(item => item.text), ['这是正常正文']);
+  assert.equal(parseArticleComments(source).headerCount, null);
+  assert.equal(parseArticleComments(source).empty, false);
+});
+
+test('sentences mentioning 留言 and text outside the footer heading region remain body text', () => {
+  for (const item of [row('正文中提到留言13条', 55, 600), row('「留言」', 55, 600), row('留言区讨论', 55, 600),
+    row('留言13', 130, 600), row('留言', 55, 240), row('留言13', 55, 2050)]) {
+    const source = [row('这是正常正文', 55, 300), item, row('后面还有正常内容', 55, 800)];
+    assert.equal(footerEvidence(source).bodyEndY, null);
+    assert.ok(articleBodyRows(source).some(value => value.text === '后面还有正常内容'));
+  }
 });
 
 test('foreign or hidden IP comment headers retain visible text but cannot claim complete parsing', () => {

@@ -13,6 +13,9 @@ export function parseArticleComments(rows, {reachedEnd = false} = {}) {
   const open = relevant.some(row => row.x < 200 && /^写留言$/u.test(row.text.trim()));
   const count = footer.header?.text.match(/\d+/u);
   const headers = [], uncertainBoundaries = []; let unparsed = false;
+  // A small right-side ad label delimits the preceding comment. Brand names in ordinary text do not.
+  const adBoundaries = relevant.filter(row => row.x > 900 && row.h <= 60 && /^广告[\p{P}\p{S}\s]*$/u.test(row.text.trim()))
+    .map(row => row.y);
   for (const row of relevant) {
     if (row.x < 140 || row.x > 430 || row.h > 75) continue;
     const date = row.text.match(TIME);
@@ -27,9 +30,9 @@ export function parseArticleComments(rows, {reachedEnd = false} = {}) {
     const replyControl = relevant.some(other => other.x > 800 && Math.abs(other.y - row.y) < 55 && /^回复/u.test(other.text));
     // Foreign/hidden IP locations cannot be split reliably from a display name using OCR alone. Preserve
     // the visible byline and text when the adjacent reply control proves a comment; mark coverage partial.
-    if (!location) { unparsed = true; if (!replyControl) continue; }
+    if (!location) { unparsed = true; if (!replyControl) { uncertainBoundaries.push(row.y); continue; } }
     const author = location ? prefix.slice(0, -location.length).trim() : prefix;
-    if (!author || author.length > 60) { unparsed = true; continue; }
+    if (!author || author.length > 60) { unparsed = true; uncertainBoundaries.push(row.y); continue; }
     headers.push({...row, author, location, timeLabel: date[1], reply: row.x >= 225});
   }
   // The centered invitation is a system empty state only in the observed comment area, not a comment
@@ -46,7 +49,7 @@ export function parseArticleComments(rows, {reachedEnd = false} = {}) {
         tap: {x: Math.round(row.x + row.w / 2), y: Math.round(row.y + row.h / 2)}} : null;
     }).filter(Boolean);
   const comments = headers.map((row, index) => {
-    const next = Math.min(headers[index + 1]?.y ?? 1900, ...uncertainBoundaries.filter(y => y > row.y));
+    const next = Math.min(headers[index + 1]?.y ?? 1900, ...uncertainBoundaries.filter(y => y > row.y), ...adBoundaries.filter(y => y > row.y));
     const lines = relevant.filter(item => item.y > row.y + row.h - 10 && item.y < next - 5 && item.x >= row.x - 25
       && item.x < 850 && !IGNORE.test(item.text.trim()) && !/^•/u.test(item.text.trim())
       && !/^(作者已设置|留言\d|展开\d)/u.test(item.text.trim()));
