@@ -394,3 +394,54 @@ T13 已经用户审查并由 Claude 真机复测通过，本轮在 `1b3d902` 上
 最终测试数字、实际数据库诊断 ID 与重放统计汇总在 `codex-validation-20261110/T14-validation-summary.json`。46 份历史来源文件 SHA 复核未改，见 `T14-sources-unchanged.json`。
 
 新版真机复测由 Claude 执行；本轮仅本地离线测试与隔离 PostgreSQL，不执行生产迁移、生产手机升级或调度动作。
+
+## 生产发布与真机验收（2026-11-10，d747336，已回滚）
+
+**结论：未上线完成。** CI 和服务端发布验证通过，但第 5 步 OnStar 真机冒烟失败，实际入库 **0/2 篇**。遵照部署任务单，已于 **15:09:09（北京时间）回滚服务端和后台**，手机恢复安吉星 `runtime-0.4.7-97583fa`。新 logo 也随旧 `index.html` 恢复而撤回；095 兼容迁移、登记和 SQL 文件按预案保留。未再次创建测试任务或继续修产品。
+
+### 提交、CI 和发布包
+
+- 发布源码 `d7473368a121df45e8582d91eb92e26682204ccf`，已推送 `codex/research-wechat-articles-20261109`。包含 logo 提交 `1303e0dda77cf21b1caf6f3fe94f0400cd32dcd7`；5 个 SVG 与官方 R3.1 素材逐字节一致。
+- CI [42770011377](https://github.com/tony582/OnStarvoice/actions/runs/42770011377) 为该精确提交，5/5 jobs 成功。主回归及生产 Node 回归各 **3596/3596**，Android **515/515**；三个 PostgreSQL 矩阵各 **572 通过、2 跳过、0 失败**（574 总数）。两项真实 events 环境未配置的用例为跳过，不能计为通过；两个 Node 24.12.0 矩阵另有真实控制面 Runner **1/1**，浮动 Node 24 矩阵该步骤按配置跳过。
+- `.gitattributes` 只关闭文章 DOM 夹具目录 HTML 的 whitespace 检查；当前 3 份真实 HTML 内容和 SHA 未改，`git diff --check dcb5d11..d747336` 通过。
+- 14:39 预检：最新生产仍为 `1ade51e`，无后续他人发布；33 路径全部与 `dcb5d11` 基线一致，活动任务/待执行命令/手机占用工作项均 0。发布包 32 JS + 095 SQL；29 个原文件、4 个新增文件（3 JS + SQL）。32 JS 语法检查通过，发布/回滚离线检查 18/18。
+- 后台由已提交代码重新构建，共 60 个文件；49 个新资源先加入，`index.html` 最后切换。旧资源存在则要求相同哈希，无覆盖碰撞。发布包 SHA-256：`cb3e19155ee5ef6faf9ca10106d7ec3e68ffbaea7204889f51a0e154aef59f7b`。
+
+### 数据库、服务及观察
+
+- 完整数据库备份 14:47:56–14:54:31，**2,126,621,454 bytes**，SHA-256 `9f5ac6033cb6deea8254c8a89f4a87f4e519f49fe725e35c4897cea6ca091e97`。已验证自定义归档目录包含相关数据表；没有进行恢复演练。
+- 095 使用一个事务，`lock_timeout=3s`、`statement_timeout=60s`，SQL 和完整文件名版本登记一起提交。第一次为 `55P03` 锁等待超时，整体回滚，等 30 秒后第二次于 **14:55:11** 成功。验证通过后才将迁移文件放到线上。
+- 实际为 **3 张表、9 列可空**（部署任务单“四张表”为笔误）、2 个已验证的平台约束、1 个 valid/ready 部分索引；2 个 Android 节点均含 `wechat_articles` 权限，遗漏 0；版本登记恰好 1 行。
+- 依次重启 API → scheduler → ai-media，每次恢复 ready 后才继续。未使用 `pm2 update`。
+
+| 服务 | 发布后 PID / 重启计数 | 发布后 ready 核验时间 | 回滚后 PID / 重启计数 | 回滚后 ready 核验时间 |
+| --- | --- | --- | --- | --- |
+| API | 1280046 / 23 | 14:55:22 | 1281936 / 24 | 15:08:51 |
+| scheduler | 1280155 / 2 | 14:55:31 | 1282035 / 3 | 15:08:58 |
+| ai-media | 1280250 / 3 | 14:55:40 | 1282132 / 4 | 15:09:08 |
+
+- 14:55:42 文件与服务验证完成；随后 **6 轮、348.968 秒**观察，三 PID 和重启次数固定、持续 online，本地 health/ready、公网 health 和后台 index SHA 全部通过。新增日志 Unhandled/服务异常签名 0；24 条“5xx 数字”候选均来自普通日志的记录 UUID。应用没有逐响应状态日志，故不能声称所有请求 5xx=0。服务端 `applied` 登记时间为 15:03:19，后续真机失败触发回滚。
+- 15:09:09 回滚验证完成：恢复 29 个原服务文件和旧 index，移除 3 个新 JS，保留 095 及其登记；新增不可变后台资源留在磁盘但旧页面不引用。15:12 公网 health/ready/admin 均 HTTP 200，旧 index SHA 恢复为 `c1cbdd7e18eb24561d183f8f678ab095eea69d1cf970c037b001ae118e19de3d`。
+
+### OnStar 两篇真机冒烟：失败的实际数字
+
+- 手机序列号 `829d89`，OnStar 节点 `00ac55d4-cc33-4c1f-a162-d59ea7cd8ce0`，临时运行 `runtime-0.5.0-d747336`，PID 47481。86 个 src 文件与提交一致；上线时 ready=true、三项能力 `wechat_articles` / `wechat_forward` / `wechat_search_filters` 均在生产心跳中。
+- 通过生产后台 OnStar 租户创建 **一个**一次性任务，关键词“安吉星 续费”，每词上限 2、排序/时间不限、附加评论开启且上限 50、AI 精准筛选关闭；不修改无人值守计划。
+- 父任务 `643c97e4-b458-4cbb-8a85-e80ac5a6e9cf`，工作项 `5c929283-faf7-45fd-a703-8d92dab058af`。创建 15:06:01，开始 15:06:10，结束 15:07:14，约 64.8 秒。
+- 采集器/服务器既有恢复机制执行 3 次尝试；没有人工重复下发。三次均停在搜索阶段（operation=search）：第一次 `ocr_timeout`（16.585 秒），后两次 `ocr_failed`（4.992 秒、1.458 秒），最终 `MOBILE_ATTEMPTS_EXHAUSTED`。三个 completion 回执均 accepted=true、deviceHeld=false；父任务 `completed_with_failures`、工作项 failed。各次子任务依次为 `50033cf6-6716-46e0-8964-6d3e5d85e056`、`a42d6068-ab58-4c75-850f-d7ab1376c62e`、`4125da85-e20b-4752-a5ad-388a4dc83f74`。
+- 本次文章上传回执 **0**、记录 **0**、观察 **0**、正文 **0**、图片 **0**、留言 **0**。发布时间和后台正文/图片/留言展示均未通过验收，没有可核验的文章样本。后台实际显示失败任务和无关联入库记录，失败记录保留供审查。
+- 已保存的错误只证明 OCR 超时/失败。当前 OCR 封装丢弃 stderr 和部分 helper 错误详情，原始检查点及诊断已导出为 `mobile-preparation/onstar-050-ocr-failure-evidence.json` 和 `onstar-050-ocr-failure-report.md`，因此本轮不能确认底层根因，不能把“冷启动”写成结论。按任务单在失败后停止发布，没有启动额外 OCR/真机重试来改写结果。
+
+### 手机恢复与晚间计划
+
+- 安吉星 0.4.7 在新鲜空闲检查通过后正常停止，15:02:41 停稳；两租户连接文件和 SQLite 经 `.backup` 等价接口完整备份，quick_check 均 ok。备份目录：`~/Documents/claude/StarVoice-Android/backups/before-0.5.0-d747336-20261110/`；未输出连接密钥，未删除/重放历史拒绝事件。
+- 冒烟失败后，OnStar 于 **15:08:36** 正常停止：active=null、pending=0、completionPending=false、closure=false，进程退出且手机锁释放。
+- 通过 Finder 双击旧版官方启动器恢复安吉星；**15:11** 核实 PID **53677**、cwd 为 `runtime-0.4.7-97583fa`，父进程链归属 Terminal → launchd，独立于工具会话。ready=true、active=null、pending=0、completionPending=false、closure=false；15:12:05 生产新心跳已确认可采抖音/视频号。未将安吉星升级到 0.5.0。
+- 安吉星“手机提前采集”计划 `870e620c-88a5-4d05-829c-8d8ee1499fcb` 仍 active，22:00 加原有 2 分钟随机偏移，下一轮 **2026-11-10 22:02（北京时间）**；仍关联恢复的手机节点。02:00 计划同样 active，下一轮 11-11 02:02。没有在安吉星创建测试任务；这里只证明恢复和计划就绪，不声称尚未发生的晚间采集已成功。
+
+### 证据与后续边界
+
+- 生产：`/opt/onstarvoice-private/releases/wechat-articles-d747336-20261110/`，含 manifest、私有备份、CI、迁移、三服务重启、6 轮观察、`applied` 与 `rollback-applied`。当前最终状态以 **rollback-applied** 为准。
+- 本地：`output/wechat-articles/deploy-20261110/remote-evidence/`、`release-d747336-20261110/mobile-preparation/`、`deploy-20261110/onstar-smoke-failed-after-rollback.jpg`。只下载发布证据，数据库备份留在生产私有目录。
+- 发布 SSH 客户端在远端脚本结束后未自行断开；确认无发布子进程、部署锁已释放后，仅关闭该本地 SSH 客户端（退出 255）。远端 `staged-applied`、6 轮观察和服务证据已核验；该清理不作为应用发布失败原因。失败点是之后的真机 OCR。
+- 本节为纯文档收尾，提交带 `[skip ci]`。本轮不继续修复或再次上线；下一次部署应先确认真实启动器路径下 OCR 稳定性，并将“旧代码 + 已应用 095 + 回滚目录”作为新的生产基线。
