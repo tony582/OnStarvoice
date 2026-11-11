@@ -17,6 +17,8 @@ import { EmptyState } from '@/components/shared/EmptyState'
 import { Tooltip } from '@/components/shared/Tooltip'
 import { RecordImageGallery } from '@/components/shared/RecordImageGallery'
 import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
+import { CrossPostSection } from '@/components/shared/CrossPostSection'
+import type { CrossPostMember } from '@/lib/cross-posts'
 import { WechatForwardAction } from '@/components/shared/WechatForwardAction'
 import { RecordVideoPlayer } from '@/components/shared/RecordVideoPlayer'
 import {
@@ -81,6 +83,9 @@ interface RecordDrawerProps {
   onDeleteCustomTag?: (tag: CustomTag) => Promise<number>
   initialTab?: RecordDrawerTab
   onProgressAdded?: (progress: RecordProgressSummary) => void
+  onOpenCrossPost?: (member: CrossPostMember) => Promise<void>
+  onCrossPostBatchStatus?: (ids: string[], status: string) => Promise<boolean>
+  onCrossPostGroupChanged?: () => Promise<void> | void
 }
 
 export function RecordDrawer(props: RecordDrawerProps) {
@@ -103,6 +108,9 @@ function RecordDrawerContent({
   onDeleteCustomTag,
   initialTab = 'content',
   onProgressAdded,
+  onOpenCrossPost,
+  onCrossPostBatchStatus,
+  onCrossPostGroupChanged,
 }: RecordDrawerProps) {
   const [tab, setTab] = useState<RecordDrawerTab>(initialTab)
   const [comments, setComments] = useState<any[]>([])
@@ -120,6 +128,7 @@ function RecordDrawerContent({
   const [savingEdit, setSavingEdit] = useState(false)
   const [savingLabels, setSavingLabels] = useState(false)
   const [statusBusy, setStatusBusy] = useState(false)
+  const [crossPostBusy, setCrossPostBusy] = useState(false)
   const [falsePositiveBusy, setFalsePositiveBusy] = useState(false)
   const [watchBusy, setWatchBusy] = useState(false)
   const [noteDraft, setNoteDraft] = useState('')
@@ -155,7 +164,7 @@ function RecordDrawerContent({
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return
-      if (statusBusy || falsePositiveBusy || savingEdit || savingLabels || savingNote) return
+      if (statusBusy || crossPostBusy || falsePositiveBusy || savingEdit || savingLabels || savingNote) return
       if (editingLabels) setEditingLabels(false)
       else if (editingJudgement) setEditingJudgement(false)
       else if (lightbox) setLightbox('')
@@ -163,11 +172,11 @@ function RecordDrawerContent({
     }
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
-  }, [editingJudgement, editingLabels, falsePositiveBusy, lightbox, onClose, savingEdit, savingLabels, savingNote, statusBusy])
+  }, [editingJudgement, editingLabels, falsePositiveBusy, lightbox, onClose, savingEdit, savingLabels, savingNote, statusBusy, crossPostBusy])
 
   useEffect(() => {
     const h = (e: MouseEvent) => {
-      if (statusBusy || falsePositiveBusy || savingEdit || savingLabels || savingNote || editingJudgement || editingLabels || lightbox) return
+      if (statusBusy || crossPostBusy || falsePositiveBusy || savingEdit || savingLabels || savingNote || editingJudgement || editingLabels || lightbox) return
       const target = e.target
       if (!(target instanceof Node) || panelRef.current?.contains(target)) return
       if (target instanceof Element && target.closest('[role="dialog"], [data-radix-popper-content-wrapper], [data-record-detail-trigger]')) return
@@ -175,7 +184,7 @@ function RecordDrawerContent({
     }
     document.addEventListener('mousedown', h)
     return () => document.removeEventListener('mousedown', h)
-  }, [editingJudgement, editingLabels, falsePositiveBusy, lightbox, onClose, savingEdit, savingLabels, savingNote, statusBusy])
+  }, [editingJudgement, editingLabels, falsePositiveBusy, lightbox, onClose, savingEdit, savingLabels, savingNote, statusBusy, crossPostBusy])
 
   // 小屏笔记本用覆盖式抽屉，避免把列表和筛选工具条挤变形；大屏才为抽屉留位。
   useEffect(() => {
@@ -232,7 +241,7 @@ function RecordDrawerContent({
       : ''
   const topicLabel = contentTopicLabel(r.content_topic, '')
   const archived = Boolean(r.archived_at)
-  const canProcess = canWrite && !archived
+  const canProcess = canWrite && !archived && !crossPostBusy
 
   const openJudgementEditor = () => {
     if (archived) return
@@ -418,7 +427,7 @@ function RecordDrawerContent({
 
         {/* Header */}
         <div data-drawer-header className="flex min-h-16 shrink-0 items-center gap-2 border-b border-border/60 bg-card px-2 pt-[env(safe-area-inset-top)] sm:gap-3 sm:px-5 lg:min-h-14">
-          <button onClick={onClose} aria-label="返回内容列表" disabled={savingEdit || savingLabels || savingNote || statusBusy || falsePositiveBusy}
+          <button onClick={onClose} aria-label="返回内容列表" disabled={savingEdit || savingLabels || savingNote || statusBusy || crossPostBusy || falsePositiveBusy}
             className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-foreground transition active:bg-accent disabled:pointer-events-none disabled:opacity-40 lg:hidden"><ArrowLeft className="h-5 w-5" /></button>
           <h2 className="shrink-0 text-[15px] font-semibold text-foreground">舆情内容详情</h2>
           {triageStatus === 'negative_feishu' && (
@@ -426,7 +435,7 @@ function RecordDrawerContent({
               <FeishuTableNumberControl
                 value={r.feishu_table_no}
                 onSave={!archived ? onSetFeishuTableNo : undefined}
-                disabled={statusBusy || falsePositiveBusy}
+                disabled={statusBusy || crossPostBusy || falsePositiveBusy}
                 className="max-w-full"
                 inputClassName="w-44"
               />
@@ -451,7 +460,7 @@ function RecordDrawerContent({
             ) : r.is_watched ? (
               <span className="inline-flex h-8 items-center gap-1 rounded-md bg-primary/8 px-2.5 text-[12px] font-medium text-primary"><Star className="h-3.5 w-3.5 fill-current" />已关注</span>
             ) : null}
-            <button onClick={onClose} aria-label="关闭舆情内容详情" disabled={savingEdit || savingLabels || savingNote || statusBusy || falsePositiveBusy}
+            <button onClick={onClose} aria-label="关闭舆情内容详情" disabled={savingEdit || savingLabels || savingNote || statusBusy || crossPostBusy || falsePositiveBusy}
               className="hidden rounded-lg p-1.5 text-muted-foreground transition hover:bg-accent disabled:pointer-events-none disabled:opacity-40 lg:block"><X className="h-5 w-5" /></button>
           </div>
         </div>
@@ -522,6 +531,10 @@ function RecordDrawerContent({
                 {detailDegraded && <StatusBadge tone="muted">详情待补采</StatusBadge>}
               </div>
             )}
+
+            {onOpenCrossPost && <CrossPostSection record={r} canWrite={canWrite && !archived}
+              modes={modeActions} onOpenRecord={onOpenCrossPost} onBatchStatus={onCrossPostBatchStatus}
+              onGroupChanged={onCrossPostGroupChanged} onBusyChange={setCrossPostBusy} />}
 
             {/* 属性面板：两列「名称 + 值」对齐排布，值用文字和小圆点而不是彩色胶囊；整块只留一个「编辑判断」。 */}
             <div className="mt-3.5 border-t border-border/60 pt-3">
@@ -806,7 +819,7 @@ function RecordDrawerContent({
                   {onSetStatus ? (
                     <DropdownMenu.Root>
                       <DropdownMenu.Trigger asChild>
-                        <button type="button" disabled={statusBusy || falsePositiveBusy}
+                        <button type="button" disabled={statusBusy || crossPostBusy || falsePositiveBusy}
                           aria-label={`当前处理状态：${currentModeLabel}，点击修改`}
                           className="rounded-full outline-none ring-offset-2 focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60">
                           <StatusBadge tone={triageStatus} className="h-8 gap-1.5 px-3 text-[12px]">
@@ -824,7 +837,7 @@ function RecordDrawerContent({
                               const Icon = item.icon
                               return (
                                 <DropdownMenu.RadioItem key={item.value} value={item.value}
-                                  disabled={statusBusy || falsePositiveBusy}
+                                  disabled={statusBusy || crossPostBusy || falsePositiveBusy}
                                   onSelect={() => { if (!active) void changeMode(item.value) }}
                                   className="flex h-10 cursor-default select-none items-center gap-2.5 rounded-md px-2.5 text-[13px] outline-none transition-colors data-[highlighted]:bg-accent data-[disabled]:opacity-45">
                                   <Icon className="h-4 w-4 shrink-0 text-muted-foreground" />
@@ -845,7 +858,7 @@ function RecordDrawerContent({
                 <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-1.5">
                   {onFalsePositive && (
                     <Tooltip text={falsePositivePending ? '误报已提交，等待平台管理员复核' : '提交误报'}>
-                      <Button variant="ghost" size="sm" disabled={falsePositivePending || statusBusy || falsePositiveBusy} onClick={markFalsePositive}
+                      <Button variant="ghost" size="sm" disabled={falsePositivePending || statusBusy || crossPostBusy || falsePositiveBusy} onClick={markFalsePositive}
                         className={cn('h-9 shrink-0 gap-1.5 px-2.5 text-[12px]', falsePositivePending ? 'text-emerald-600 disabled:opacity-100 dark:text-emerald-300' : 'text-rose-600 hover:bg-rose-100 hover:text-rose-700 dark:text-rose-300 dark:hover:bg-rose-950/40')}
                         aria-label={falsePositivePending ? '误报已提交' : '提交误报'}>
                         {falsePositiveBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : falsePositivePending ? <CheckCircle className="h-3.5 w-3.5" /> : <Ban className="h-3.5 w-3.5" />}
@@ -854,7 +867,7 @@ function RecordDrawerContent({
                     </Tooltip>
                   )}
                   {onSetArchived && (
-                    <Button variant="ghost" size="sm" className="h-9 shrink-0 gap-1.5 px-2.5 text-[12px]" disabled={statusBusy || falsePositiveBusy}
+                    <Button variant="ghost" size="sm" className="h-9 shrink-0 gap-1.5 px-2.5 text-[12px]" disabled={statusBusy || crossPostBusy || falsePositiveBusy}
                       onClick={() => runStatusAction(() => onSetArchived(true))} aria-label="归档">
                       <Archive className="h-3.5 w-3.5" />归档
                     </Button>

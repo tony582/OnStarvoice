@@ -7,7 +7,7 @@ import {
   User, FileText, Bell,
   ArrowUp, ArrowDown, ChevronsUpDown, Download, X, SlidersHorizontal,
   MoreHorizontal, Radar, ShieldAlert, Star,
-  Tags, AlertCircle, RefreshCw,
+  Tags, AlertCircle, RefreshCw, Layers,
 } from 'lucide-react'
 import { mergeRecordPatches, mergePatchMaps, reconcileQueryRecords } from '@/lib/triage-edit-context'
 import { api, isApiNetworkError } from '@/lib/api'
@@ -37,6 +37,8 @@ import {
   type FeishuTableNumberSaveResult,
 } from '@/components/shared/FeishuTableNumberControl'
 import { RecordLabelChips } from '@/components/shared/RecordLabels'
+import { CrossPostBadge } from '@/components/shared/CrossPostBadge'
+import { crossPostDrawerRecord, crossPostSummary, type CrossPostMember } from '@/lib/cross-posts'
 import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
 import {
   normalizeCustomTags, tagsFromRecord,
@@ -305,6 +307,7 @@ type TriageFilterSnapshot = {
   triageStatuses: string[]
   sentiment: string
   watchedFilter: string
+  crossPlatform: boolean
   contentTopic: string
   customTagIds: string[]
   intents: string[]
@@ -323,6 +326,7 @@ function recordMatchesFilters(record: Record<string, unknown>, filters: TriageFi
   if (filters.triageStatuses.length && !filters.triageStatuses.includes(String(record.triage_status || 'unhandled'))) return false
   if (filters.sentiment && String(record.sentiment || '') !== filters.sentiment) return false
   if (filters.watchedFilter === 'watched' && !record.is_watched) return false
+  if (filters.crossPlatform && !crossPostSummary(record).count) return false
   if (filters.contentTopic) {
     const topic = String(record.content_topic || '')
     if (filters.contentTopic === 'unclassified' ? topic !== '' : topic !== filters.contentTopic) return false
@@ -346,6 +350,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [relevances, setRelevances] = useState<string[]>(() => normalizePostRelevanceFilter(initial?.relevance))
   const [relevanceConfidences, setRelevanceConfidences] = useState<string[]>(() => normalizePostConfidenceFilter(initial?.relevanceConfidence))
   const [platform, setPlatform] = useState(initial?.platform ?? '')
+  const [crossPlatform, setCrossPlatform] = useState(initial?.crossPlatform === 'true')
   const [watchedFilter, setWatchedFilter] = useState(initial?.watched === 'watched' ? 'watched' : '')
   const [keyword, setKeyword] = useState(() => String(initial?.keyword ?? '').trim())
   const [keywordDraft, setKeywordDraft] = useState(() => String(initial?.keyword ?? '').trim())
@@ -402,6 +407,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     const params = new URLSearchParams({ sentiment, platform, keyword })
     if (contentTopic) params.set('contentTopic', contentTopic)
     if (watchedFilter) params.set('watched', watchedFilter)
+    if (crossPlatform) params.set('crossPlatform', 'true')
     if (archiveView !== 'active') params.set('bucket', archiveView)
     else params.set('queue', 'triage')
     appendPostIntentFilter(params, intents)
@@ -423,7 +429,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     if (dateRanges.handled.from) params.set('handledFrom', dateRanges.handled.from)
     if (dateRanges.handled.to) params.set('handledTo', dateRanges.handled.to)
     return params
-  }, [archiveView, triageStatuses, risk, identity, sentiment, contentTopic, intents, relevances, relevanceConfidences, platform, watchedFilter, keyword, sort, captureKeywords, customTagIds, dateRanges])
+  }, [archiveView, triageStatuses, risk, identity, sentiment, contentTopic, intents, relevances, relevanceConfidences, platform, watchedFilter, crossPlatform, keyword, sort, captureKeywords, customTagIds, dateRanges])
 
   // 勾选跟着「当前这一页的查询」走：筛选、排序、翻页、切视图都会自动清空勾选，避免带着看不见的幽灵选中去批量处理。
   const filterQuery = useMemo(() => filterParams().toString(), [filterParams])
@@ -560,13 +566,14 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const activeDateFilterCount = Object.values(dateRanges).filter(range => range.from || range.to).length
   const hasCustomSort = sort.field !== 'publish' || sort.dir !== 'desc'
   const activeIntentCount = intents.length + relevances.length + relevanceConfidences.length
-  const hasActiveFilters = Boolean(platform || sentiment || contentTopic || activeIntentCount || keyword || triageStatuses.length || risk.length || identity.length || captureKeywords.length || customTagIds.length || activeDateFilterCount || hasCustomSort)
+  const hasActiveFilters = Boolean(crossPlatform || platform || sentiment || contentTopic || activeIntentCount || keyword || triageStatuses.length || risk.length || identity.length || captureKeywords.length || customTagIds.length || activeDateFilterCount || hasCustomSort)
   const activeFilterCount = [platform, sentiment, contentTopic].filter(Boolean).length
-    + activeIntentCount + Number(Boolean(keyword)) + triageStatuses.length + risk.length + identity.length + captureKeywords.length + customTagIds.length + activeDateFilterCount + Number(hasCustomSort)
+    + Number(crossPlatform) + activeIntentCount + Number(Boolean(keyword)) + triageStatuses.length + risk.length + identity.length + captureKeywords.length + customTagIds.length + activeDateFilterCount + Number(hasCustomSort)
   const clearFilters = () => {
     setPlatform(''); setSentiment(''); setKeyword(''); setKeywordDraft(''); setTriageStatuses([]); setRisk([]); setIdentity([]); setCaptureKeywords([]); setCustomTagIds([]); setDateRanges(emptyDateRanges())
     setIntents([]); setRelevances([]); setRelevanceConfidences([])
     setContentTopic('')
+    setCrossPlatform(false)
     setSort({ field: 'publish', dir: 'desc' })
   }
   // 输入框只维护草稿，停顿后才提交搜索；回车只提前提交，不再额外发第二次请求。
@@ -866,19 +873,19 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     return changeTriageMode(record.id, newStatus, values)
   }
 
-  const runBatch = async (newStatus: TriageMode) => {
-    if (archiveView === 'archived' || sel.count === 0) return
+  const runBatch = async (newStatus: TriageMode, requestedIds = [...sel.selected]): Promise<boolean> => {
+    const ids = [...new Set(requestedIds)]
+    if (archiveView === 'archived' || !ids.length || batchBusy) return false
     const modeLabel = CONTENT_TRIAGE_MODES.find(mode => mode.value === newStatus)?.label || newStatus
     const values = await askStatusChange({
       statusLabel: modeLabel,
-      batchCount: sel.count,
+      batchCount: ids.length,
       requireFeishuTableNo: newStatus === 'negative_feishu',
     })
-    if (!values) return
+    if (!values) return false
     setBatchFeedback(null)
     setBatchBusy(true)
     try {
-      const ids = [...sel.selected]
       const result = await api.patch<BatchModeMutationResponse>('/triage/records/batch', {
         ids,
         status: newStatus,
@@ -889,7 +896,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       const skippedCount = Math.max(0, ids.length - changedIds.length)
       if (changedIds.length === 0) {
         showBatchFeedback('所选内容未能修改，请核对后重试', 'error')
-        return
+        return false
       }
 
       syncModeLocally(
@@ -905,9 +912,11 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
         skippedCount > 0 ? 'warning' : 'success',
       )
       refreshBadges()
+      return true
     } catch (err) {
       console.error(err)
       showBatchFeedback(`批量修改失败：${err instanceof Error ? err.message : '请稍后重试'}`, 'error')
+      return false
     }
     finally { setBatchBusy(false) }
   }
@@ -1027,8 +1036,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 
   // 已保存但不再符合当前筛选的行：淡显 + 提示，刷新后才移出。
   const filterSnapshot = useMemo<TriageFilterSnapshot>(() => ({
-    archiveView, triageStatuses, sentiment, watchedFilter, contentTopic, customTagIds, intents, relevances, relevanceConfidences,
-  }), [archiveView, triageStatuses, sentiment, watchedFilter, contentTopic, customTagIds, intents, relevances, relevanceConfidences])
+    archiveView, triageStatuses, sentiment, watchedFilter, crossPlatform, contentTopic, customTagIds, intents, relevances, relevanceConfidences,
+  }), [archiveView, triageStatuses, sentiment, watchedFilter, crossPlatform, contentTopic, customTagIds, intents, relevances, relevanceConfidences])
   const outOfFilterIds = useMemo(() => {
     const ids = new Set<string>()
     for (const record of records) {
@@ -1043,8 +1052,16 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     setDrawerInitialTab(initialTab)
     setDrawerRecord(record)
   }
+  const openCrossPost = async (member: CrossPostMember) => {
+    const response = await api.get<{ record?: Record<string, unknown> }>(`/opinion-analysis/records/${encodeURIComponent(member.id)}/detail`)
+    if (!response.record || response.record.id !== member.id) throw new Error('内容详情未能加载，请重试')
+    openDrawer(crossPostDrawerRecord(response.record, member))
+  }
   const drawerProps = drawerRecord ? {
     record: drawerRecord,
+    onOpenCrossPost: openCrossPost,
+    onCrossPostBatchStatus: (ids: string[], status: string) => runBatch(status as TriageMode, ids),
+    onCrossPostGroupChanged: () => load(pagination?.page || 1, { silent: true }),
     onClose: () => setDrawerRecord(null),
     canWrite: canWrite(),
     onSetStatus: drawerArchived ? undefined : async (s: string) => {
@@ -1221,6 +1238,11 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           </div>
 
           <div className="ml-auto inline-flex shrink-0 items-center justify-end gap-1.5">
+            <Button variant="outline" size="sm" aria-pressed={crossPlatform} aria-label="多平台同发"
+              onClick={() => setCrossPlatform(value => !value)}
+              className={cn(crossPlatform && 'border-primary/35 bg-primary/8 text-primary hover:bg-primary/12')}>
+              <Layers className="h-3.5 w-3.5" />多平台同发
+            </Button>
             <Button
               variant="outline"
               size="sm"
@@ -1722,6 +1744,7 @@ function MobileRecordCard({ record: r, canWrite, selected, outOfFilter, onToggle
           <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
             <span className="inline-flex min-w-0 items-center gap-1"><User className="h-3 w-3 shrink-0" /><span className="max-w-28 truncate">{r.author_name || '未知作者'}</span></span>
             <span>{platformName(r.platform)}</span>
+            <CrossPostBadge record={r} />
             <RecordSourceAction record={r} compact className="font-semibold" />
           </div>
         </div>
@@ -1916,6 +1939,7 @@ function RecordRow({ record: r, canWrite, open, selected, outOfFilter, onToggle,
               <span className="inline-flex min-w-0 max-w-[150px] items-center gap-1"><User className="h-2.5 w-2.5 shrink-0" /><span className="truncate">{r.author_name || '未知'}</span></span>
               <span className="text-muted-foreground/50">·</span>
               <span className="shrink-0">{platformName(r.platform)}</span>
+              <CrossPostBadge record={r} />
               <RecordTopicChips record={r} />
               <RecordSourceAction record={r} compact />
               {r.blogger_profile_url && <a href={r.blogger_profile_url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="inline-flex shrink-0 items-center gap-0.5 font-medium text-primary hover:underline"><User className="h-2.5 w-2.5" />主页</a>}

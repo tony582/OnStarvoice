@@ -148,7 +148,7 @@ test('negative Feishu status requires a searchable Feishu table number without r
 
   assert.match(queue, /搜索标题、正文、作者、飞书表号/);
   assert.match(queue, /requireFeishuTableNo: newStatus === 'negative_feishu'/);
-  assert.match(queue, /batchCount: sel\.count/);
+  assert.match(queue, /batchCount: ids\.length/);
   assert.match(queue, /feishuTableNo: values\.feishuTableNo/);
   const batchRoute = between(route, "router.patch('/records/batch'", '// 归档是独立生命周期');
   assert.match(batchRoute, /feishu_table_no_required/);

@@ -63,7 +63,7 @@ test('every status change opens an optional note prompt and batch notes share th
   const batch = between(queue, 'const runBatch', 'const syncArchiveLocally');
   assert.match(single, /await askStatusChange\(/);
   assert.match(single, /changeTriageMode\(record\.id, newStatus, values\)/);
-  assert.match(batch, /await askStatusChange\(\{[\s\S]*batchCount: sel\.count,[\s\S]*requireFeishuTableNo: newStatus === 'negative_feishu'/);
+  assert.match(batch, /await askStatusChange\(\{[\s\S]*batchCount: ids\.length,[\s\S]*requireFeishuTableNo: newStatus === 'negative_feishu'/);
   assert.match(batch, /note: values\.note/);
   assert.match(batch, /feishuTableNo: values\.feishuTableNo/);
   assert.match(prompt, /备注（选填）/);

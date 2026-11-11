@@ -61,14 +61,14 @@ test('failed save leaves record values and context intact', async () => {
 for (const ids of [['a'],['a','b']]) test(`batch status preserves ${ids.length} selections and patches only acknowledged successes`,async()=>{
   let visible=rows(); const selected=new Set(ids);
   const batch=action('runBatch','syncArchiveLocally',{
-    archiveView:'active',sel:{count:selected.size,selected,clear:()=>assert.fail('must keep selection')},
+    archiveView:'active',batchBusy:false,sel:{count:selected.size,selected,clear:()=>assert.fail('must keep selection')},
     CONTENT_TRIAGE_MODES:[{value:'reviewed',label:'已复核'}],askStatusChange:async()=>({note:'已核对'}),
     setBatchFeedback:()=>{},setBatchBusy:()=>{},api:{patch:async()=>({updatedIds:['a']})},
     changedBatchModeIds:result=>result.updatedIds,
     syncModeLocally:(changed,status)=>{visible=mergeRecordPatches(visible,Object.fromEntries(changed.map(id=>[id,{triage_status:status}])));},
     showBatchFeedback:()=>{},refreshBadges:()=>{},
   });
-  await batch('reviewed');
+  assert.equal(await batch('reviewed'),true);
   assert.deepEqual([...selected],ids);
   assert.equal(visible[0].triage_status,'reviewed');
   assert.equal(visible[1].triage_status,'unhandled');
@@ -79,6 +79,24 @@ test('ordinary mutations never reload/filter the list or clear selection',()=>{
     const block=queue.slice(queue.indexOf(`  const ${start} =`),queue.indexOf(`  const ${end} =`));
     assert.doesNotMatch(block,/\bload\(|sel\.clear\(|setDrawerRecord\(null\)|modeVisibleInCurrentList|leavesCurrentSentiment/,start);
   }
+});
+test('cross-post batch uses only explicit selected ids and keeps the unrelated list selection',async()=>{
+  const selected=new Set(['a','b']);let request,prompt,patched;
+  const batch=action('runBatch','syncArchiveLocally',{
+    archiveView:'active',batchBusy:false,sel:{count:selected.size,selected},
+    CONTENT_TRIAGE_MODES:[{value:'negative_feishu',label:'负面-飞书表'}],
+    askStatusChange:async options=>{prompt=options;return {note:'跨平台核对',feishuTableNo:'42'}},
+    setBatchFeedback:()=>{},setBatchBusy:()=>{},
+    api:{patch:async(path,body)=>{request={path,body};return {updatedIds:['b']}}},
+    changedBatchModeIds:result=>result.updatedIds,
+    syncModeLocally:(...args)=>{patched=args},showBatchFeedback:()=>{},refreshBadges:()=>{},
+  });
+  assert.equal(await batch('negative_feishu',['b','b']),true);
+  assert.equal(prompt.batchCount,1);
+  assert.equal(prompt.requireFeishuTableNo,true);
+  assert.deepEqual(request,{path:'/triage/records/batch',body:{ids:['b'],status:'negative_feishu',note:'跨平台核对',feishuTableNo:'42'}});
+  assert.deepEqual(patched,[['b'],'negative_feishu','42','跨平台核对']);
+  assert.deepEqual([...selected],['a','b']);
 });
 function queryHarness(get) {
   const state={records:rows(),pagination:null,saved:{},clears:0};
