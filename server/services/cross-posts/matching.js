@@ -114,10 +114,12 @@ function matchPrepared(a, b) {
   if (contentDice >= 0.6) contentRules.push('dice');
   if (substring.meaningfulLength >= 15) contentRules.push('substring');
   if (contains) contentRules.push('contains');
-  if (!contentRules.length) return null;
+  const commonSubstringCoverage = substring.meaningfulLength / shorterMeaningful;
+  // A repeated signature must not connect otherwise unrelated long posts through a short shared fragment.
+  if (!contentRules.length || (contentDice < 0.6 && commonSubstringCoverage < 0.4 && contentDice < 0.3)) return null;
   return {score: contentDice, evidence: {version: 1, authorRule: author.rule, authorDice: author.score,
     contentRules, contentDice, longestCommonSubstring: substring.rawLength, longestCommonSubstringMeaningful: substring.meaningfulLength,
-    shorterContentLength: shorter, shorterMeaningfulContentLength: shorterMeaningful,
+    shorterContentLength: shorter, shorterMeaningfulContentLength: shorterMeaningful, commonSubstringCoverage,
     hoursApart: Math.abs(a.time - b.time) / HOUR, timeSources: [a.timeSource, b.timeSource]}};
 }
 

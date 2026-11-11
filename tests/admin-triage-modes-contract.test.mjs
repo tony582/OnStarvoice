@@ -76,9 +76,13 @@ test('privacy-unreachable remains data-compatible while presenting as a negative
   const legacyCss = source('server/admin/admin.css');
 
   assert.match(queue, /value: 'privacy_unreachable', label: '负面–隐私设置无法触达'/);
-  assert.match(board, /key: 'privacy_unreachable'[^\n]+bg-status-red[^\n]+ring-status-red/);
-  assert.match(badges, /privacy_unreachable: 'red'/);
-  assert.match(dashboard, /key: 'privacy_unreachable', label: '负面–隐私设置无法触达', color: '#DC2626'/);
+  assert.match(board, /key: 'privacy_unreachable'[^\n]+bg-status-blue[^\n]+ring-status-blue/);
+  assert.match(badges, /privacy_unreachable: 'blue'/);
+  assert.match(dashboard, /key: 'privacy_unreachable', label: '负面–隐私设置无法触达', color: '#2563EB'/);
+  assert.match(dashboard, /key: 'negative_feishu', label: '负面-飞书表', color: '#DC2626'/);
+  for (const key of ['negative_cold', 'negative_comment']) {
+    assert.match(dashboard, new RegExp(`key: '${key}'[^\\n]+color: '#2563EB'`));
+  }
   assert.match(legacyCss, /badge\.negative_feishu, \.badge\.negative_cold, \.badge\.privacy_unreachable/);
 });
 
@@ -156,7 +160,7 @@ test('negative Feishu status requires a searchable Feishu table number without r
   assert.match(prompt, /飞书表号 <span/);
   assert.match(prompt, /备注（选填）/);
   assert.match(badges, /negative_feishu: 'red'/);
-  assert.match(badges, /negative_cold: 'red'/);
+  assert.match(badges, /negative_cold: 'blue'/);
 });
 
 test('content search covers visible business fields and treats wildcard symbols literally', () => {

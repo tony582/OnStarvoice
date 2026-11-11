@@ -103,7 +103,7 @@ test('rule 4: complete containment requires 12 characters and does not require h
 
 test('rule 4: longest common substring (not subsequence) requires 15 characters', () => {
   const common = 'abcdefghijklmno';
-  const result = matched({content: '甲'.repeat(40) + common}, {content: common + '乙'.repeat(40)});
+  const result = matched({content: '甲'.repeat(20) + common}, {content: common + '乙'.repeat(20)});
   assert.deepEqual(result.evidence.contentRules, ['substring']);
   assert.equal(result.evidence.longestCommonSubstring, 15);
   assert.equal(matched({content: '甲'.repeat(40) + common.slice(1)}, {content: common.slice(1) + '乙'.repeat(40)}), null);
@@ -219,10 +219,61 @@ test('a common substring needs 15 meaningful characters while preserving origina
     assert.equal(matched({content: '甲'.repeat(50) + common}, {content: common + '乙'.repeat(50)}), null);
   }
   const common = 'abcde!fghij!klmno';
-  const result = matched({content: '甲'.repeat(50) + common}, {content: common + '乙'.repeat(50)});
+  const result = matched({content: '甲'.repeat(20) + common}, {content: common + '乙'.repeat(20)});
   assert.deepEqual(result.evidence.contentRules, ['substring']);
   assert.equal(result.evidence.longestCommonSubstring, 17);
   assert.equal(result.evidence.longestCommonSubstringMeaningful, 15);
   assert.equal(matched({content: '甲'.repeat(50) + common}, {content: 'abcde?fghij?klmno' + '乙'.repeat(50)}), null,
     'different punctuation still breaks the continuous substring; it is not removed for this rule');
+});
+
+
+// Constructed equivalents of the reviewed dry-run samples; no production text is copied into the repository.
+test('reviewed sample 3: a 20-character signature cannot connect the unrelated post to the other two', () => {
+  const signature = 'abcdefghijklmnopqrst';
+  const posts = [record('unrelated', {author_name: 'ROUTERS路透', content: '甲'.repeat(134) + signature}),
+    record('same-a', {author_name: 'ROUTERS路透', platform: 'wechat_channels', content: '乙'.repeat(134) + signature}),
+    record('same-b', {author_name: 'ROUTERS路透', platform: 'xiaohongshu', content: '乙'.repeat(134) + signature + '丙'})];
+  // Old fragment-only rule matched all three: 20 common effective characters, Dice 19/153 ~= .124.
+  assert.equal(matchPair(posts[0], posts[1]), null);
+  assert.equal(matchPair(posts[0], posts[2]), null);
+  assert.ok(matchPair(posts[1], posts[2]));
+  assert.deepEqual(ids(groupCrossPosts(posts)), [['same-a', 'same-b']]);
+  assert.deepEqual(groupCrossPosts([...posts].reverse()), groupCrossPosts(posts));
+});
+
+test('reviewed samples 7, 16 and 19 retain their long common text or complete short-post containment', () => {
+  for (const [commonLength, prefixLength] of [[421, 287], [93, 63]]) {
+    const common = '公'.repeat(commonLength);
+    const result = matched({title: '甲'.repeat(prefixLength), content: common}, {title: '乙'.repeat(prefixLength), content: common});
+    assert.ok(result);
+    assert.deepEqual(result.evidence.contentRules, ['substring']);
+    assert.equal(result.evidence.longestCommonSubstringMeaningful, commonLength);
+    assert.ok(result.score > 0.593 && result.score < 0.595, 'overall Dice remains approximately .594');
+    assert.ok(result.evidence.commonSubstringCoverage > 0.4);
+  }
+  const short = 'abcdefghijklmnopq';
+  const result = matched({content: short}, {content: '甲'.repeat(480) + short});
+  assert.ok(result.score < 0.3);
+  assert.deepEqual(result.evidence.contentRules, ['substring', 'contains']);
+  assert.equal(result.evidence.commonSubstringCoverage, 1);
+});
+
+test('fragment coverage is inclusive at 40 percent of meaningful characters and fails immediately below', () => {
+  const common = 'abcdefghijklmnopqrst';
+  const accepted = matched({content: '甲'.repeat(30) + common}, {content: '乙'.repeat(180) + common});
+  assert.ok(accepted.score < 0.3);
+  assert.equal(accepted.evidence.commonSubstringCoverage, 0.4);
+  assert.equal(matched({content: '甲'.repeat(31) + common}, {content: '乙'.repeat(180) + common}), null);
+  const punctuated = matched({content: '!'.repeat(10) + '甲'.repeat(30) + common}, {content: '乙'.repeat(180) + common});
+  assert.equal(punctuated.evidence.commonSubstringCoverage, 0.4, 'punctuation does not pad the effective denominator');
+});
+
+test('Dice fallback is inclusive at .3 when fragment coverage is below 40 percent', () => {
+  const common = 'abcdefghijklmnop';
+  const accepted = matched({content: '甲'.repeat(35) + common}, {content: '乙'.repeat(35) + common});
+  assert.equal(accepted.score, 0.3);
+  assert.ok(accepted.evidence.commonSubstringCoverage < 0.4);
+  assert.equal(accepted.evidence.longestCommonSubstringMeaningful, 16);
+  assert.equal(matched({content: '甲'.repeat(36) + common}, {content: '乙'.repeat(35) + common}), null);
 });

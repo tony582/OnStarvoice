@@ -60,3 +60,16 @@ scheduler 每 10 分钟运行，复用 noOverlap 与 drain。每租户每轮最�
 - `npm test --prefix server`；`npm run build --prefix web/admin`。
 - 已授权的只读数据库环境可运行 `node server/scripts/cross-posts-dry-run.js --dry-run --days 30 --output /absolute/report.json`。脚本不导入 initDb/app/cron，不执行迁移、不提供 --apply。本轮生产实际使用相同纯匹配与摘要函数的 stdin 内存执行包；仅汇总与 30 组样例返回本机。
 - `web/admin/test/cross-posts-browser.mjs` 提供离线真实页面验收，设置 PLAYWRIGHT_MODULE 为本机已安装 Playwright 的入口；不联网安装依赖。
+
+
+## Claude 审查后的发布候选（2026-11-11）
+
+用户已授权发布和正式回填。对子串/包含单独成立的边（Dice < 0.6），增加「连续公共片段有效字数占短方至少 40%，或 Dice 至少 0.3」门槛；证据新增 commonSubstringCoverage。等价第3组三帖回归剔除无关主题且保留另两帖，第7/16/19组等价边和40%/0.3边界均通过；matching 24/24、只读脚本6/6。
+
+15:10:44 +08:00 在生产内存中只读重跑：**35 组72条 → 35组71条**，ROUTERS 路透汽车主题仍是两条组、马斯克主题不再属于组；凯迪电车之家仍为三平台组。只输出汇总和指定记录ID，未导出原始正文、未写标签。
+
+预检发现11:41已发布 `f893000` 的四处后台配色调整，分支用合并提交 `537c687` 保留。生产服务端仍为T16；0.5.3随后先发布时，T18预检将保留该次三文件与手机版本。
+
+新增正式回填入口 `server/scripts/cross-posts-backfill.js --apply --days 30`，要求显式 DATABASE_URL，可指定tenant/as-of/output。它与原只读脚本分开，扫描真实30天及边界并补齐已有组，CPU计算不在事务内；短写事务用同租户advisory锁、记录版本与共享锁、标签/排除版本核对，原子替换受影响标签。无关窗外组、排除、原始记录、分诊与scheduler游标不变，失败输出已完成租户，不自动重试。独立PG **18/18**（回填9+原跨平台9），包含真实CLI成功入口和三种并发修改拒绝写入。
+
+以下上线结果将在实际发布验收后补齐；本节不代表已上线。

@@ -56,7 +56,8 @@ test('row accent reflects handling state and sentiment without work-order lifecy
   const badge = source('web/admin/src/components/ui/badge.tsx');
   const accent = between(queue, 'function recordAccentClass', 'function getPaginationItems');
 
-  assert.match(accent, /triage_status === 'negative_feishu' \|\| record\.triage_status === 'negative_cold' \|\| record\.triage_status === 'negative_comment' \|\| record\.triage_status === 'privacy_unreachable'\) return 'bg-status-red'/);
+  assert.match(accent, /triage_status === 'negative_feishu'\) return 'bg-status-red'/);
+  assert.match(accent, /triage_status === 'negative_cold' \|\| record\.triage_status === 'negative_comment' \|\| record\.triage_status === 'privacy_unreachable'\) return 'bg-status-blue'/);
   assert.match(accent, /triage_status === 'replied'/);
   assert.match(accent, /sentiment === 'negative'/);
   assert.match(accent, /sentiment === 'positive'/);
@@ -64,13 +65,13 @@ test('row accent reflects handling state and sentiment without work-order lifecy
   assert.match(functionBlock(queue, 'MobileRecordCard'), /recordAccentClass\(r\)/);
   assert.match(functionBlock(queue, 'RecordRow'), /recordAccentClass\(r\)/);
   assert.match(board, /key: 'negative_feishu'[^\n]+bg-status-red/);
-  assert.match(board, /key: 'negative_cold'[^\n]+bg-status-red/);
-  assert.match(board, /key: 'negative_comment'[^\n]+bg-status-red/);
-  assert.match(board, /key: 'privacy_unreachable'[^\n]+bg-status-red/);
+  assert.match(board, /key: 'negative_cold'[^\n]+bg-status-blue/);
+  assert.match(board, /key: 'negative_comment'[^\n]+bg-status-blue/);
+  assert.match(board, /key: 'privacy_unreachable'[^\n]+bg-status-blue/);
   assert.match(badge, /negative_feishu: 'red'/);
-  assert.match(badge, /negative_cold: 'red'/);
-  assert.match(badge, /negative_comment: 'red'/);
-  assert.match(badge, /privacy_unreachable: 'red'/);
+  assert.match(badge, /negative_cold: 'blue'/);
+  assert.match(badge, /negative_comment: 'blue'/);
+  assert.match(badge, /privacy_unreachable: 'blue'/);
 });
 
 test('fixed processing cell combines handling state with a direct note action', () => {
