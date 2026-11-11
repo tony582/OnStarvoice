@@ -89,7 +89,7 @@ function prepare(record) {
   const content = normalizeContent(record), meaningfulContentLength = meaningfulLength(content);
   if (meaningfulContentLength < 8) return null;
   return {record, tenant, id, platform, author, content, time, created: Number.isFinite(created) ? created : Infinity,
-    meaningfulContentLength, authorGrams: bigrams(author), contentGrams: bigrams(content), timeSource: Number.isFinite(published) ? 'published' : 'created_at'};
+    meaningfulContentLength, authorGrams: bigrams(author), timeSource: Number.isFinite(published) ? 'published' : 'created_at'};
 }
 function authorMatch(a, b) {
   const score = dice(a.authorGrams, b.authorGrams), shortest = Math.min(length(a.author), length(b.author));
@@ -104,6 +104,9 @@ function matchPrepared(a, b) {
   if (!eligiblePair(a, b)) return null;
   const author = authorMatch(a, b);
   if (!author) return null;
+  // Most window candidates have no matching author. Do not retain a 500-character Map for every post.
+  a.contentGrams ??= bigrams(a.content);
+  b.contentGrams ??= bigrams(b.content);
   const contentDice = dice(a.contentGrams, b.contentGrams);
   a.substrings ??= suffixes(a.content);
   const substring = commonSubstring(a.substrings, b.content);
