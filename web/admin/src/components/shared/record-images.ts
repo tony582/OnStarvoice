@@ -1,11 +1,12 @@
-import { proxiedImg } from '@/lib/utils'
+import { proxiedImg } from '../../lib/utils.ts'
+import { wechatArticleDisplayImages } from '../../lib/wechat-article.mjs'
 
 interface LocalImageEntry {
   source_url?: string
   url?: string
 }
 
-interface RecordImageSource {
+interface RecordImageSource extends Record<string, unknown> {
   image_urls?: unknown
   image_local_urls?: unknown
   cover_local?: unknown
@@ -111,7 +112,8 @@ export function recordDisplayImageEntries(
   const seenUrls = new Set<string>()
   const seenRefs = new Set<string>()
   const seenSourceIdentities = new Set<string>()
-  return candidates
+  const displayCandidates = record.platform === 'wechat_articles' ? wechatArticleDisplayImages(record, candidates) : candidates
+  return displayCandidates
     .filter(item => {
       const identity = imageSourceIdentity(item.ref || item.url)
       if (
@@ -131,4 +133,25 @@ export function recordDisplayImages(
   record: RecordImageSource | null | undefined,
 ): string[] {
   return recordDisplayImageEntries(record).map(item => item.url)
+}
+
+/** Shared by list cards and detail headers, so a hidden separator cannot return as a fallback cover. */
+export function recordDisplayCover(record: RecordImageSource | null | undefined): string {
+  if (!record) return ''
+  if (record.platform === 'wechat_articles') {
+    const url = String(record.cover_local || record.cover_url || '').trim()
+    const ref = String(record.cover_url || '').trim() || url
+    if (url && wechatArticleDisplayImages(record, [{url, ref}]).length) return proxiedImg(url)
+    return recordDisplayImageEntries(record)[0]?.url || ''
+  }
+  let raw = ''
+  if (record.cover_local) raw = String(record.cover_local)
+  else if (record.cover_url) raw = String(record.cover_url)
+  else {
+    try {
+      const images = JSON.parse(String(record.image_urls || '[]'))
+      if (images.length) raw = typeof images[0] === 'string' ? images[0] : (images[0]?.url || '')
+    } catch { /* Preserve other platforms' legacy invalid-JSON fallback. */ }
+  }
+  return proxiedImg(raw)
 }

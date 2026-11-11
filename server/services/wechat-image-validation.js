@@ -136,13 +136,17 @@ function webpDimensions(bytes) {
   return actual && (!size || size.width === actual.width && size.height === actual.height) ? actual : null;
 }
 
-export function inspectWechatImage(bytes) {
+export function inspectWechatImage(bytes, onFailure) {
   if (!Buffer.isBuffer(bytes) || bytes.length < 12 || bytes.length > WECHAT_IMAGE_MAX_BYTES) return null;
   const candidates = [['image/png', pngDimensions], ['image/jpeg', jpegDimensions], ['image/gif', gifDimensions],
     ['image/bmp', bmpDimensions], ['image/webp', webpDimensions]];
   for (const [mime, inspect] of candidates) {
     const size = inspect(bytes);
-    if (size) return bytes.length > 10 * 1024 || size.width > 100 && size.height > 100 ? {mime, bytes: bytes.length, ...size} : null;
+    if (size) {
+      // Only a complete, recognized image can establish that this is a layout separator.
+      if (size.width < 16 || size.height < 16) { onFailure?.({code: 'decorative'}); return null; }
+      return bytes.length > 10 * 1024 || size.width > 100 && size.height > 100 ? {mime, bytes: bytes.length, ...size} : null;
+    }
   }
   return null;
 }

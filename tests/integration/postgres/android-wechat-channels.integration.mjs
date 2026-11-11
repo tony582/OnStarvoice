@@ -104,6 +104,83 @@ test('WeChat Channels on a shared phone: claim by platform, post upload, receipt
     assert.equal(douyin.task.comments, undefined);
   });
 
+  for (const scenario of [
+    {name: 'Channels capture', platform: 'wechat_channels', workflow: 'wechat_channels_mobile_capture', type: 'capture'},
+    {name: 'article capture', platform: 'wechat_articles', workflow: 'wechat_articles_mobile_capture', type: 'capture'},
+    {name: 'forward', platform: 'wechat_channels', workflow: 'wechat_channels_mobile_capture', type: 'wechat_forward'},
+  ]) {
+    await t.test(`${scenario.name} run details use the claimed child and current attempt; another tenant gets 404`, async st => {
+      const f = await fixture(st), other = await fixture(st);
+      const keyword = scenario.type === 'wechat_forward' ? '文件传输助手' : '安吉星 续费';
+      let parentId;
+      if (scenario.type === 'wechat_forward') {
+        const [record] = await query(`INSERT INTO records(tenant_id,external_id,platform,record_type,title,url)
+          VALUES($1,'wxc_run_detail','wechat_channels','keyword_notes','转发详情回归','https://weixin.qq.com/sph/AsvBQklNxh') RETURNING id`, [f.tenantId]);
+        await query(`INSERT INTO tenant_settings(tenant_id,key,value) VALUES($1,'wechat_forward_recipients',$2)`, [f.tenantId, keyword]);
+        const queued = await f.service.forward(f.tenantId, {recordId: record.id, recipients: [keyword]});
+        parentId = queued.forwards[0].id;
+      } else {
+        parentId = await elasticParent(f.tenantId, {platform: scenario.platform, eligibleAgentIds: [f.phone.id], keywords: [keyword]});
+      }
+      const {task} = await f.poll({platforms: [scenario.platform], features: ['wechat_articles', 'wechat_forward']});
+      assert.ok(task, 'use the real scheduler claim, not hand-written workflow metadata');
+      const runId = task.identity.taskId;
+      const [child] = await query('SELECT * FROM capture_tasks WHERE tenant_id=$1 AND id=$2', [f.tenantId, runId]);
+      assert.equal(child.metadata.workflow, scenario.workflow);
+      assert.equal(child.task_type, scenario.type);
+      assert.equal(child.parent_task_id, parentId);
+      assert.equal(task.identity.discoveryRunId, runId);
+      assert.notEqual(runId, parentId, 'details identify the execution child, not its orchestration parent');
+
+      const detail = await f.service.detail(f.tenantId, runId);
+      assert.equal(detail.run.id, runId);
+      assert.equal(detail.run.agentId, task.identity.agentId);
+      assert.equal(detail.run.deviceId, task.deviceId);
+      assert.equal(detail.run.status, 'running');
+      assert.deepEqual(detail.run.keywords, [keyword]);
+      assert.equal(detail.run.deadlineAt, task.deadlineAt);
+      assert.deepEqual(detail.run.progress, {total: 1, completed: 0, needsAction: 0});
+      assert.deepEqual(detail.run.candidateCounts, {total: 0, stored: 0, needsAction: 0});
+      assert.deepEqual(detail.items, [{id: task.identity.itemId, keyword, status: 'running', attemptCount: 1,
+        assignmentRevision: task.identity.assignmentRevision, reason: '', stats: null}]);
+      assert.equal(detail.recovery.state, 'working');
+      assert.equal(detail.recovery.deviceHeld, true);
+      assert.equal(detail.recovery.canResume, false);
+      // WeChat uploads whole posts; the Douyin discovery tables are legitimately empty.
+      assert.deepEqual(detail.candidates, []);
+      assert.deepEqual(detail.events, []);
+      assert.deepEqual((await f.service.runs(f.tenantId)).runs.map(run => run.id), [runId]);
+      assert.deepEqual((await other.service.runs(other.tenantId)).runs, []);
+      await assert.rejects(f.service.detail(f.tenantId, parentId), {code: 'MOBILE_RUN_NOT_FOUND', status: 404});
+      await assert.rejects(other.service.detail(other.tenantId, runId), {code: 'MOBILE_RUN_NOT_FOUND', status: 404});
+
+      const stats = {links: 1, cards: 2, keywordElapsedMs: 1200};
+      const reason = scenario.type === 'wechat_forward' ? 'forward_sent' : 'link_limit';
+      await f.complete(task, {reason, checkpoint: {stats}});
+      const completed = await f.service.detail(f.tenantId, runId);
+      assert.equal(completed.run.status, 'completed');
+      assert.deepEqual(completed.run.progress, {total: 1, completed: 1, needsAction: 0});
+      assert.deepEqual(completed.items, [{id: task.identity.itemId, keyword, status: 'completed', attemptCount: 1,
+        assignmentRevision: task.identity.assignmentRevision, reason, stats}]);
+      assert.equal(completed.recovery.deviceHeld, false);
+      assert.equal(completed.recovery.canResume, false);
+    });
+  }
+
+  await t.test('run details and lists still reject unknown or missing mobile workflows', async st => {
+    const f = await fixture(st);
+    await elasticParent(f.tenantId, {platform: 'wechat_channels', eligibleAgentIds: [f.phone.id], keywords: ['安吉星']});
+    const {task} = await f.poll({platforms: ['wechat_channels']});
+    await f.complete(task);
+    // wechat_forward is a task type, not a supported workflow. Do not permit arbitrary wechat_* values.
+    for (const workflow of ['wechat_forward', 'wechat_unknown_mobile_capture', null]) {
+      await query(`UPDATE capture_tasks SET metadata=jsonb_set(metadata,'{workflow}',$2::jsonb) WHERE id=$1`,
+        [task.identity.taskId, JSON.stringify(workflow)]);
+      await assert.rejects(f.service.detail(f.tenantId, task.identity.taskId), {code: 'MOBILE_RUN_NOT_FOUND', status: 404});
+      assert.deepEqual((await f.service.runs(f.tenantId)).runs, []);
+    }
+  });
+
   await t.test('uploaded posts become records bound to the attempt; replays return the stored receipt', async st => {
     const f = await fixture(st);
     await elasticParent(f.tenantId, {platform: 'wechat_channels', eligibleAgentIds: [f.phone.id], keywords: ['别克车机升级']});

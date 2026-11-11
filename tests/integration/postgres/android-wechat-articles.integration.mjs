@@ -466,6 +466,66 @@ test('WeChat articles: phone capability, records, nullable observations, comment
     await f.complete(fifth);
   });
 
+  await t.test('decorative separators do not inflate expected images or rewrite the captured observation', async st => {
+    const {ensureRecordImagesLocal, backfillRecentImages} = await import('../../../server/services/media-store.js');
+    const f = await fixture(st), urls = ['separator.png', 'photo.png'].map(name => `https://mmbiz.qpic.cn/offline-fixture/decorative/${name}`);
+    mockedImages.set(urls[0], () => new Response(pngFixture(1, 3), {headers: {'content-type': 'image/png'}}));
+    mockedImages.set(urls[1], () => new Response(pngFixture(), {headers: {'content-type': 'image/png'}}));
+    await parent(f);
+    const {task} = await f.poll(), event = eventFor(task);
+    Object.assign(event.article, {source: 'page_dom', images: urls.map(url => ({url, source: 'page_dom', stored: false})),
+      bodyBlocks: [{type: 'text', text: event.article.content}, ...urls.map(url => ({type: 'image', url}))]});
+    const receipt = (await send(f, event)).receipts[0];
+    assert.equal(receipt.status, 'accepted'); await settleBackground();
+    let [record] = await stored(f);
+    assert.deepEqual(record.image_urls, urls, 'original observed URLs remain evidence');
+    assert.deepEqual(record.image_local_urls.map(image => image.source_url), [urls[1]]);
+    assert.deepEqual(record.payload.wechatArticle.images[0].storageError, {code: 'decorative'});
+    assert.equal(record.payload.wechatArticle.images[0].stored, false);
+    assert.equal(record.payload.wechatArticle.images[1].stored, true);
+    assert.equal(record.payload.wechatArticle.evidence.originalImagesCaptured, true);
+    assert.deepEqual({...record.payload.wechatArticle.evidence.imageStorage, checkedAt: null}, {expected: 1, stored: 1, checkedAt: null});
+    const [observation] = await query(`SELECT o.* FROM record_observations o
+      JOIN capture_mobile_post_receipts r ON r.observation_id=o.id WHERE r.id=$1`, [receipt.receiptId]);
+    assert.equal(observation.payload.wechatArticle.images[0].storageError, undefined);
+    assert.equal(observation.payload.wechatArticle.evidence.originalImagesCaptured, false);
+    mockedImages.set(urls[0], () => new Response('', {status: 403}));
+    await ensureRecordImagesLocal(record.id, urls, 'wechat_articles');
+    [record] = await stored(f);
+    assert.equal(record.payload.wechatArticle.evidence.imageStorage.expected, 1, 'later unknown failures do not erase measured separator evidence');
+    assert.equal(record.payload.wechatArticle.evidence.originalImagesCaptured, true);
+    await f.complete(task);
+
+    const decorativeOnly = await imageRecord(f, [urls[0]]);
+    mockedImages.set(urls[0], () => new Response(pngFixture(1, 3), {headers: {'content-type': 'image/png'}}));
+    await ensureRecordImagesLocal(decorativeOnly.id, [urls[0]], 'wechat_articles');
+    const [empty] = await query('SELECT * FROM records WHERE id=$1', [decorativeOnly.id]);
+    assert.deepEqual(empty.image_local_urls, []);
+    assert.deepEqual({...empty.payload.wechatArticle.evidence.imageStorage, checkedAt: null}, {expected: 0, stored: 0, checkedAt: null});
+    assert.equal(empty.payload.wechatArticle.evidence.originalImagesCaptured, false, 'zero substantive images cannot claim stored originals');
+
+    const failedUrls = ['unknown.png', 'large.gif'].map(name => `https://mmbiz.qpic.cn/offline-fixture/decorative/${name}`);
+    mockedImages.set(failedUrls[0], () => new Response('', {status: 403}));
+    mockedImages.set(failedUrls[1], () => new Response('too large',
+      {headers: {'content-type': 'image/gif', 'content-length': String(9 * 1024 * 1024)}}));
+    const failed = await imageRecord(f, failedUrls);
+    await ensureRecordImagesLocal(failed.id, failedUrls, 'wechat_articles');
+    const beforeBackfill = fetchedImages.length;
+    await backfillRecentImages();
+    const retried = fetchedImages.slice(beforeBackfill).map(image => image.url);
+    assert.ok(!retried.some(url => urls.includes(url)), 'complete substantive images and decorative-only records need no repeated backfill');
+    assert.deepEqual(retried.filter(url => failedUrls.includes(url)), failedUrls, 'unknown and too-large failures remain eligible');
+
+    // A new body revision replaces storage metadata; the old 0/0 summary must not suppress revalidation.
+    await query(`UPDATE records SET payload=jsonb_set(payload,'{wechatArticle,images}',$2::jsonb) WHERE id=$1`,
+      [decorativeOnly.id, JSON.stringify([{url: urls[0], stored: false}])]);
+    mockedImages.set(urls[0], () => new Response(pngFixture(), {headers: {'content-type': 'image/png'}}));
+    await backfillRecentImages();
+    const [revised] = await query('SELECT payload FROM records WHERE id=$1', [decorativeOnly.id]);
+    assert.deepEqual({...revised.payload.wechatArticle.evidence.imageStorage, checkedAt: null}, {expected: 1, stored: 1, checkedAt: null});
+    assert.equal(revised.payload.wechatArticle.evidence.originalImagesCaptured, true);
+  });
+
   await t.test('WeChat image storage rejects placeholders, actual oversized streams and unsafe redirects, then revalidates reused files', async st => {
     const {ensureRecordImagesLocal} = await import('../../../server/services/media-store.js');
     const f = await fixture(st);

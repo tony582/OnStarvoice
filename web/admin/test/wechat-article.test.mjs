@@ -1,7 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { wechatArticleBodyBlocks, wechatArticleDetail, wechatArticleImageStorageError, wechatArticleMetric, wechatArticlePresentation } from '../src/lib/wechat-article.mjs'
+import { wechatArticleBodyBlocks, wechatArticleDetail, wechatArticleDisplayImages, wechatArticleImageStorageError, wechatArticleMetric, wechatArticlePresentation } from '../src/lib/wechat-article.mjs'
 import { proxiedImg } from '../src/lib/utils.ts'
+import { recordDisplayCover, recordDisplayImageEntries } from '../src/components/shared/record-images.ts'
 import { agentCreatePlatforms, mobileAgentPlatforms, mobileReadinessLabel } from '../src/pages/dispatch/cloud-tasks/lib.ts'
 import { wechatFilterSummary } from '../src/pages/dispatch/cloud-tasks/wechatFilters.ts'
 
@@ -110,6 +111,58 @@ test('article detail preserves validated image layers without inventing layers o
   assert.deepEqual(blocks.map(block=>block.layer),['visible','interactive',undefined,undefined,undefined])
   assert.ok(blocks.every(block=>block.ref===url&&block.url==='/media/images/layer.png'))
   assert.ok(blocks.slice(2).every(block=>!Object.hasOwn(block,'layer')))
+})
+
+test('decorative separators are hidden from ordered body and fallback gallery without missing-image wording', () => {
+  const separator='https://mmbiz.qpic.cn/separator.png', normal='https://mmbiz.qpic.cn/photo.png'
+  const decorative={url:separator,stored:false,storageError:{code:'decorative'}}
+  const record={metadata:{wechatArticle:{source:'page_dom',bodyStatus:'complete',images:[decorative,{url:normal,stored:true,localUrl:'/media/images/photo.png'}],
+    bodyBlocks:[{type:'image',url:separator},{type:'text',text:'正文'},{type:'image',url:normal},{type:'image',url:separator}],
+    evidence:{originalImagesCaptured:true,imageStorage:{expected:1,stored:1}}}}}
+  const gallery=[{url:'/api/img?separator',ref:separator},{url:'/media/images/photo.png',ref:normal}]
+  assert.deepEqual(wechatArticleBodyBlocks(record).map(block=>block.type),['text','image'])
+  assert.equal(wechatArticleBodyBlocks(record)[1].ref,normal)
+  assert.deepEqual(wechatArticleDisplayImages(record,gallery),[gallery[1]])
+  assert.equal(wechatArticleImageStorageError(record,separator),undefined)
+  assert.match(wechatArticlePresentation(record).bodyDescription,/已发现配图已保存 1\/1 张/)
+  assert.doesNotMatch(wechatArticlePresentation(record).bodyDescription,/尚未|未保存/)
+  record.metadata.wechatArticle.images=[decorative]
+  record.metadata.wechatArticle.bodyBlocks=[{type:'image',url:separator}]
+  record.metadata.wechatArticle.evidence={originalImagesCaptured:false,imageStorage:{expected:0,stored:0}}
+  assert.deepEqual(wechatArticleBodyBlocks(record),[])
+  assert.deepEqual(wechatArticleDisplayImages(record,[gallery[0]]),[])
+  assert.doesNotMatch(wechatArticlePresentation(record).bodyDescription,/尚未|未保存|配图已保存/)
+  // An ordinary unclassified download failure must stay visible and count as missing.
+  record.metadata.wechatArticle.images=[{url:separator,stored:false}]
+  record.metadata.wechatArticle.evidence={originalImagesCaptured:false,imageStorage:{expected:1,stored:0}}
+  assert.equal(wechatArticleBodyBlocks(record).length,1)
+  assert.deepEqual(wechatArticleDisplayImages(record,gallery),gallery)
+  assert.match(wechatArticlePresentation(record).bodyDescription,/已保存 0\/1 张/)
+})
+
+test('shared list and detail covers exclude decorative source and cached fallbacks while preserving other platforms', () => {
+  const separator='https://mmbiz.qpic.cn/separator.png', photo='https://mmbiz.qpic.cn/photo.png'
+  const images=[{url:separator,stored:false,storageError:{code:'decorative'}},{url:photo,stored:true,localUrl:'/media/images/photo.png'}]
+  const record={platform:'wechat_articles',cover_url:separator,cover_local:'/media/covers/old-separator.png',
+    image_urls:JSON.stringify([separator,photo]),image_local_urls:[
+      {source_url:separator,url:'/media/images/old-separator.png'}, {source_url:photo,url:'/media/images/photo.png'},
+    ],metadata:{wechatArticle:{images}}}
+  assert.deepEqual(recordDisplayImageEntries(record),[{url:'/media/images/photo.png',ref:photo}])
+  assert.equal(recordDisplayCover(record),'/media/images/photo.png')
+  const onlySeparator={...record,image_urls:[separator],image_local_urls:record.image_local_urls.slice(0,1)}
+  assert.equal(recordDisplayCover(onlySeparator),'')
+  assert.deepEqual(recordDisplayImageEntries(onlySeparator),[])
+  const noExplicitCover={...record,cover_local:'',cover_url:'',image_local_urls:[]}
+  assert.equal(recordDisplayCover(noExplicitCover),proxiedImg(photo),'array and JSON fallback candidates skip the separator')
+  assert.equal(recordDisplayCover({...noExplicitCover,image_urls:[separator,photo]}),proxiedImg(photo))
+  const articleFromDetail={...record,metadata:undefined,payload:JSON.stringify({wechatArticle:{images}})}
+  assert.equal(recordDisplayCover(articleFromDetail),'/media/images/photo.png')
+  const unclassified={...record,metadata:{wechatArticle:{images:[{url:separator,stored:false}]}}}
+  assert.equal(recordDisplayCover(unclassified),'/media/covers/old-separator.png','ordinary unsaved images remain visible')
+  const other={...record,platform:'wechat_channels'}
+  assert.equal(recordDisplayCover(other),'/media/covers/old-separator.png')
+  assert.equal(recordDisplayImageEntries(other).length,2,'article evidence must not filter another platform')
+  assert.equal(recordDisplayCover({...other,cover_local:'',cover_url:'',image_urls:'invalid json'}),'')
 })
 
 test('article oversized-image evidence reaches the body and fallback gallery without mislabeling ordinary failures',()=>{

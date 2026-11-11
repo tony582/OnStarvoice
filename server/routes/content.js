@@ -63,6 +63,10 @@ router.get('/hits', requireTenantAccess, async (req, res, next) => {
     if (platform) { params.push(platform); where += ` AND r.platform = $${params.length}`; }
     const rows = await queryAll(`
       SELECT r.id, r.platform, r.title, r.content, r.author_name, r.cover_url, r.url,
+        CASE WHEN r.platform='wechat_articles' THEN jsonb_build_object('wechatArticle',
+          jsonb_build_object('images', r.payload#>'{wechatArticle,images}')) ELSE '{}'::jsonb END AS metadata,
+        CASE WHEN r.platform='wechat_articles' THEN r.image_urls ELSE '[]'::jsonb END AS image_urls,
+        CASE WHEN r.platform='wechat_articles' THEN r.image_local_urls ELSE '[]'::jsonb END AS image_local_urls,
         r.likes, r.comments_count, r.collects, r.shares, r.tags, r.sentiment, r.category, r.last_seen_at,
         (r.likes + r.comments_count + r.collects + r.shares) AS interaction,
         (ha.id IS NOT NULL) AS analyzed

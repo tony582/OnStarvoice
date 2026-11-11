@@ -86,7 +86,7 @@ export async function downloadImage(url, key, platform, targetDir, publicDir, on
         done(received > WECHAT_IMAGE_MAX_BYTES ? new Error('wechat_image_too_large') : null, chunk);
       }});
       await pipeline(Readable.fromWeb(resp.body), bounded, createWriteStream(tempPath));
-      const verified = inspectWechatImage(await readFile(tempPath));
+      const verified = inspectWechatImage(await readFile(tempPath), onFailure);
       if (!verified || verified.mime !== (type === 'image/jpg' ? 'image/jpeg' : type)) return null;
     } else await pipeline(Readable.fromWeb(resp.body), createWriteStream(tempPath));
     await rename(tempPath, targetPath);
@@ -215,11 +215,12 @@ export async function verifiedArticleLocalImage(url, onFailure) {
       onFailure?.({code: 'too_large', maxBytes: WECHAT_IMAGE_MAX_BYTES, observedBytes: file.size, source: 'local_file'});
       return null;
     }
-    return inspectWechatImage(await readFile(path));
+    return inspectWechatImage(await readFile(path), onFailure);
   } catch { return null; }
 }
 
-function imageSizeFailure(value) {
+function articleImageFailure(value) {
+  if (value?.code === 'decorative') return {code: 'decorative'};
   return value?.code === 'too_large' && value.maxBytes === WECHAT_IMAGE_MAX_BYTES
     && Number.isSafeInteger(value.observedBytes) && value.observedBytes > value.maxBytes
     && ['content_length', 'stream', 'local_file'].includes(value.source)
@@ -228,8 +229,8 @@ function imageSizeFailure(value) {
 
 export function articleImageStorageResult(image, localUrl = '', failure) {
   const {storageError: previousError, ...currentImage} = image;
-  // A later timeout/403 does not disprove an earlier measured size. A verified successful save clears it.
-  const storageError = !localUrl ? imageSizeFailure(failure) || imageSizeFailure(previousError) : null;
+  // A later timeout/403 does not disprove a measured size or separator. A verified save clears it.
+  const storageError = !localUrl ? articleImageFailure(failure) || articleImageFailure(previousError) : null;
   return {...currentImage, stored: Boolean(localUrl), localUrl, ...(storageError ? {storageError} : {})};
 }
 
@@ -292,8 +293,10 @@ async function localizeRecordImages(recordId, imageUrls, platform) {
         const saved = new Map(localized.map(entry => [entry.source_url, entry.url]));
         const body = row.payload?.wechatArticle ?? {};
         const images = (body.images ?? []).map(image => articleImageStorageResult(image, saved.get(image.url) || '', failures.get(image.url)));
-        const evidence = {originalImagesCaptured: urls.length > 0 && localized.length === urls.length,
-          imageStorage: {expected: urls.length, stored: localized.length, checkedAt: new Date().toISOString()}};
+        const decorative = new Set(images.filter(image => image.storageError?.code === 'decorative').map(image => image.url));
+        const expected = urls.filter(url => !decorative.has(url)).length;
+        const evidence = {originalImagesCaptured: expected > 0 && localized.length === expected,
+          imageStorage: {expected, stored: localized.length, checkedAt: new Date().toISOString()}};
         await execute(`UPDATE records SET image_local_urls=$1::jsonb,
           payload=jsonb_set(jsonb_set(payload,'{wechatArticle,evidence}',
             COALESCE(payload#>'{wechatArticle,evidence}','{}'::jsonb)||$3::jsonb),'{wechatArticle,images}',$4::jsonb)
@@ -342,6 +345,14 @@ export async function backfillRecentImages(limit = 400) {
        WHERE image_urls <> '[]'::jsonb
          AND jsonb_array_length(COALESCE(image_local_urls, '[]'::jsonb))
              < jsonb_array_length(COALESCE(image_urls, '[]'::jsonb))
+               - CASE WHEN platform='wechat_articles' THEN (
+                 SELECT COUNT(DISTINCT image->>'url') FROM jsonb_array_elements(
+                   CASE WHEN jsonb_typeof(payload#>'{wechatArticle,images}')='array'
+                     THEN payload#>'{wechatArticle,images}' ELSE '[]'::jsonb END) AS image
+                 WHERE image#>>'{storageError,code}'='decorative'
+                   AND (image_urls @> jsonb_build_array(image->'url')
+                     OR image_urls @> jsonb_build_array(jsonb_build_object('url', image->'url')))
+               ) ELSE 0 END
          AND last_seen_at > now() - interval '24 hours'
        ORDER BY last_seen_at DESC LIMIT $1`,
       [limit],

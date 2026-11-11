@@ -435,6 +435,10 @@ export function normalizeRemoteTaskInput(input = {}) {
     1,
     Number.MAX_SAFE_INTEGER,
   );
+  const rawMobileKeywordMaxMinutes = read('mobileKeywordMaxMinutes');
+  const legacyMobileKeywordMaxMinutes = read('mobile_keyword_max_minutes');
+  const hasMobileKeywordMaxMinutes = rawMobileKeywordMaxMinutes !== undefined ||
+    legacyMobileKeywordMaxMinutes !== undefined;
   const enabled = has(request, 'enabled') || has(plan, 'enabled')
     ? Boolean(read('enabled'))
     : true;
@@ -538,6 +542,16 @@ export function normalizeRemoteTaskInput(input = {}) {
         ? String(read('manualStartTime')) : '',
     } : {}),
     ...(hasKeywordMaxDetectedItems ? {keywordMaxDetectedItems} : {}),
+    // Keep the orchestration's optional phone time fence through this second
+    // normalization pass. Omit the default to preserve existing snapshot hashes.
+    ...(hasMobileKeywordMaxMinutes ? {
+      mobileKeywordMaxMinutes: boundedInteger(
+        rawMobileKeywordMaxMinutes ?? legacyMobileKeywordMaxMinutes,
+        15,
+        1,
+        120,
+      ),
+    } : {}),
     autoLoop: maxRounds > 1,
     roundGapMin,
     maxRounds,

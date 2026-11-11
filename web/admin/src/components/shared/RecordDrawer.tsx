@@ -24,6 +24,7 @@ import {
   type FeishuTableNumberSaveResult,
 } from '@/components/shared/FeishuTableNumberControl'
 import {
+  recordDisplayCover,
   recordDisplayImageEntries,
   recordDisplayImages,
 } from '@/components/shared/record-images'
@@ -1301,16 +1302,7 @@ function InfoTile({ label, value, hint }: { label: string; value: string; hint?:
 }
 
 export function getCover(r: any): string {
-  let raw = ''
-  if (r.cover_local) raw = r.cover_local            // 本地化封面(/media),proxiedImg 原样放行
-  else if (r.cover_url) raw = r.cover_url
-  else {
-    try {
-      const imgs = JSON.parse(r.image_urls || '[]')
-      if (imgs.length) raw = typeof imgs[0] === 'string' ? imgs[0] : (imgs[0]?.url || '')
-    } catch { /* 忽略历史记录中无效的图片 JSON，继续使用空封面。 */ }
-  }
-  return proxiedImg(raw)                             // CDN 图走 /api/img 代理,防直连防盗链刷不出
+  return recordDisplayCover(r)
 }
 
 export function getImages(r: any): string[] {
