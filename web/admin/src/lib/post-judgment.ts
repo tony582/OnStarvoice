@@ -87,6 +87,7 @@ export function postJudgment(value: unknown) {
   const manualRelevance = relevance(manual.value) || relevance(overrides.relevance)
   const intent = normalizePostIntent('intent_display' in record ? record.intent_display : record.intent || ai.intent)
   const monitoring = object(ai.monitoringEvidence)
+  const monitoringStatus = text(record.monitoring_evidence_status) || text(monitoring.status)
   const aiRelevance = relevance(ai.relevance)
   const effectiveRelevance = manualRelevance || aiRelevance
   const relevanceLabel = POST_RELEVANCE_OPTIONS.find(option => option.value === effectiveRelevance)?.label || '未判断'
@@ -110,8 +111,8 @@ export function postJudgment(value: unknown) {
     relevanceLabel,
     relevanceTone: effectiveRelevance === 'relevant' ? 'positive' : effectiveRelevance === 'uncertain' ? 'pending' : 'muted',
     relevanceReason: manualRelevance ? text(manual.reason) || '人工判断，未填写依据' : text(ai.relevanceReason),
-    monitoringReason: text(monitoring.reason),
-    monitoringStatus: text(record.monitoring_evidence_status) || text(monitoring.status),
+    monitoringReason: monitoringStatus === 'not_applicable' ? '' : text(monitoring.reason),
+    monitoringStatus,
     manual: Boolean(manualRelevance),
     archived: Boolean(record.archived_at),
     confidence,

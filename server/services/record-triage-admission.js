@@ -5,6 +5,8 @@ import {
   findRecordMonitoringEvidence, isSentryEvidenceScope, normalizeMonitoringEvidence, normalizePostIntent, POST_INTENTS,
 } from './record-content-judgment.js';
 import { recordRelevanceExportFields } from './record-relevance-filter.js';
+import {getSentryScopeRetiredAt, parseSentryScopeRetiredAt, recordCreatedAfterSentryRetirement} from '../config/sentry-admission.js';
+import {withRecordTriageDisplay} from './record-triage-display.js';
 
 export const POST_INTENT_LABELS = { share: '分享', advertising: '广告/软文', other: '其他', complaint: '投诉/抱怨', inquiry: '咨询' };
 
@@ -49,8 +51,12 @@ function requestedTriageReview(record, relevance) {
     && !Array.isArray(request) && request.value === 'requested';
 }
 
-export function recordTriageAdmission(record = {}) {
-  const scoped = isSentryEvidenceScope(record);
+export function legacySentryAdmissionScope(record = {}, {retiredAt = getSentryScopeRetiredAt()} = {}) {
+  return !recordCreatedAfterSentryRetirement(record, retiredAt) && isSentryEvidenceScope(record);
+}
+
+export function recordTriageAdmission(record = {}, options = {}) {
+  const scoped = legacySentryAdmissionScope(record, options);
   const manual = manualRecordRelevance(record);
   const ai = object(record.ai_result);
   const relevance = manual || ai.relevance || 'uncertain';
@@ -88,6 +94,12 @@ export function recordSentryScopeSql(alias = 'r') {
   const pattern = literal(SENTRY_SCOPE_KEYWORDS.join('|'));
   const matches = text => `regexp_replace(normalize(COALESCE(${text}, ''), NFKC), '\\s+', '', 'g') ~ ${pattern}`;
   return `(${matches(`${a}.keyword`)} OR EXISTS (SELECT 1 FROM record_observations admission_observation WHERE admission_observation.tenant_id = ${a}.tenant_id AND admission_observation.record_id = ${a}.id AND ${matches('admission_observation.keyword')}))`;
+}
+
+export function legacySentryAdmissionScopeSql(alias = 'r', {retiredAt = getSentryScopeRetiredAt()} = {}) {
+  const a = aliasName(alias), cutoff = parseSentryScopeRetiredAt(retiredAt);
+  const scope = recordSentryScopeSql(a);
+  return cutoff ? `(NOT COALESCE(${a}.created_at >= ${literal(cutoff)}::timestamptz,false) AND ${scope})` : scope;
 }
 
 // Keep the candidate order identical to currentPostMediaUrl. JSON media entries
@@ -148,25 +160,25 @@ export function recordMainPostEvidenceSql(alias = 'r') {
   )`;
 }
 
-export function recordTriageAdmissionSql(alias = 'r') {
+export function recordTriageAdmissionSql(alias = 'r', options = {}) {
   const a = aliasName(alias);
   const reviewRequested = `COALESCE(${a}.manual_overrides->'triage_review'->>'value' = 'requested',false) AND ${recordEffectiveRelevanceSql(a)} = 'uncertain'`;
-  return `(COALESCE(${manualRecordAdmissionSql(a)},false) OR NOT ${recordSentryScopeSql(a)} OR (${reviewRequested}) OR CASE WHEN ${manualRecordRelevanceSql(a)} IS NOT NULL THEN ${manualRecordRelevanceSql(a)} = 'relevant' ELSE COALESCE(${a}.ai_result->>'relevance' = 'relevant',false) AND ${recordMainPostEvidenceSql(a)} END)`;
+  return `(COALESCE(${manualRecordAdmissionSql(a)},false) OR NOT ${legacySentryAdmissionScopeSql(a, options)} OR (${reviewRequested}) OR CASE WHEN ${manualRecordRelevanceSql(a)} IS NOT NULL THEN ${manualRecordRelevanceSql(a)} = 'relevant' ELSE COALESCE(${a}.ai_result->>'relevance' = 'relevant',false) AND ${recordMainPostEvidenceSql(a)} END)`;
 }
 
-export function recordAdmissionSelectSql(alias = 'r', { admitted = null } = {}) {
+export function recordAdmissionSelectSql(alias = 'r', { admitted = null, retiredAt = getSentryScopeRetiredAt() } = {}) {
   // Lists/exports have already evaluated admission before pagination. Reuse that
   // known result instead of re-reading long post evidence for every projection.
-  const allowed = typeof admitted === 'boolean' ? String(admitted) : recordTriageAdmissionSql(alias);
-  return `${recordSentryScopeSql(alias)} AS admission_scoped, ${allowed} AS admission_allowed`;
+  const allowed = typeof admitted === 'boolean' ? String(admitted) : recordTriageAdmissionSql(alias, {retiredAt});
+  return `${legacySentryAdmissionScopeSql(alias, {retiredAt})} AS admission_scoped, ${allowed} AS admission_allowed`;
 }
 
-export function withRecordAdmissionFields(record = {}) {
+export function withRecordAdmissionFields(record = {}, options = {}) {
   const { admission_scoped, admission_allowed, ...publicRecord } = record;
   const manual = manualRecordRelevance(record);
   const reviewRequested = requestedTriageReview(record, manual || object(record.ai_result).relevance || 'uncertain');
   const included = manualRecordAdmission(record) === 'included';
-  const computed = admission_scoped === undefined ? recordTriageAdmission(record) : {
+  const computed = admission_scoped === undefined ? recordTriageAdmission(record, options) : {
     scoped: admission_scoped,
     admitted: admission_allowed,
     monitoring_evidence_status: !admission_scoped ? 'not_applicable' : reviewRequested ? 'needs_review' : manual === 'relevant' ? 'manual_confirmed' : included ? 'customer_included' : admission_allowed ? 'confirmed' : 'needs_review',
@@ -189,8 +201,9 @@ export function withRecordAdmissionFields(record = {}) {
         : '结合主帖标题、正文与当前媒体，存在品牌或车型线索且整体判断相关',
     } };
   }
-  return { ...publicRecord, intent_display: normalizePostIntent(record.intent) || null,
-    monitoring_evidence_status: computed.monitoring_evidence_status };
+  return withRecordTriageDisplay({ ...publicRecord, intent_display: normalizePostIntent(record.intent) || null,
+    monitoring_evidence_status: computed.monitoring_evidence_status },
+  {...computed, relevance: manual || object(record.ai_result).relevance || 'uncertain', manualRelevance: manual});
 }
 
 export function recordJudgmentExportFields(record = {}) {

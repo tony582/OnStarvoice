@@ -13,6 +13,8 @@ import { api } from '@/lib/api'
 import { formatNumber, formatRecordMetric, formatDate, formatFullDateSec, LABELS, platformName, cn, identityLabel, friendlyError, proxiedImg } from '@/lib/utils'
 import { captureKeywordPresentation, publishTimePresentation } from '@/lib/publish-time.mjs'
 import { Button } from '@/components/ui/button'
+import { triageDisplay } from '@/lib/triage-display'
+import { RecordTriageStatus } from './RecordTriageStatus'
 import { StatusBadge, StatusDot, StatusPill } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { Tooltip } from '@/components/shared/Tooltip'
@@ -414,7 +416,8 @@ function RecordDrawerContent({
     { value: 'negative_cold', label: '负面-冷处理', icon: Bell },
     { value: 'negative_comment', label: '负面-评论区留言', icon: MessageCircle },
   ]
-  const currentModeLabel = LABELS.triage[triageStatus] || triageStatus || '待处理'
+  const statusDisplay = triageDisplay(r)
+  const currentModeLabel = statusDisplay.label
 
   return (
     <div ref={panelRef} style={{ width }} role="dialog" aria-label="舆情内容详情"
@@ -795,6 +798,7 @@ function RecordDrawerContent({
         </div>
 
         {/* Footer actions */}
+        {!canWrite && <div className="border-t border-border bg-card px-4 py-2.5" aria-label="处理状态"><RecordTriageStatus record={r} /></div>}
         {canWrite && (
           <div className="border-t border-border bg-card px-4 py-2.5 pb-[max(0.625rem,env(safe-area-inset-bottom))] shadow-[0_-12px_28px_-24px_rgba(15,23,42,0.5)]">
             {archived ? (
@@ -817,7 +821,7 @@ function RecordDrawerContent({
             ) : (
               <div className="flex w-full min-w-0 flex-wrap items-center gap-2" aria-label="内容处理操作">
                 <div className="flex shrink-0 flex-col items-start gap-1" aria-label="处理状态">
-                  {onSetStatus ? (
+                  {onSetStatus && statusDisplay.status === triageStatus ? (
                     <DropdownMenu.Root>
                       <DropdownMenu.Trigger asChild>
                         <button type="button" disabled={statusBusy || crossPostBusy || falsePositiveBusy}
@@ -852,7 +856,7 @@ function RecordDrawerContent({
                       </DropdownMenu.Portal>
                     </DropdownMenu.Root>
                   ) : (
-                    <StatusBadge tone={triageStatus}>{currentModeLabel}</StatusBadge>
+                    <RecordTriageStatus record={r} />
                   )}
                 </div>
 

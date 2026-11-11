@@ -38,6 +38,8 @@ import {
 } from '@/components/shared/FeishuTableNumberControl'
 import { RecordLabelChips } from '@/components/shared/RecordLabels'
 import { CrossPostBadge } from '@/components/shared/CrossPostBadge'
+import { triageDisplay } from '@/lib/triage-display'
+import { RecordTriageStatus } from '@/components/shared/RecordTriageStatus'
 import { crossPostDrawerRecord, crossPostSummary, type CrossPostMember } from '@/lib/cross-posts'
 import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
 import {
@@ -1775,7 +1777,7 @@ function MobileRecordCard({ record: r, canWrite, selected, outOfFilter, onToggle
           />
         )}
         {availabilityLabel && <StatusBadge tone="muted"><CircleOff className="h-3 w-3" />{availabilityLabel}</StatusBadge>}
-        {canWrite && !archived ? (
+        {canWrite && !archived && triageDisplay(r).status === (r.triage_status || 'unhandled') ? (
           <TriageStatusMenu
             status={r.triage_status || 'unhandled'}
             busy={modeBusy}
@@ -1783,7 +1785,7 @@ function MobileRecordCard({ record: r, canWrite, selected, outOfFilter, onToggle
             onChange={onChangeMode}
           />
         ) : (
-          <StatusBadge tone={r.triage_status || 'unhandled'}>{LABELS.triage[r.triage_status] || r.triage_status}</StatusBadge>
+          <RecordTriageStatus record={r} />
         )}
         {hasRiskSignals && <RiskSignals record={r} />}
         {mobileIdentity && <IdentityBadge sourceType={r.source_type} fans={r.author_fans} name={r.author_name} override={r.identity_override} />}
@@ -1894,7 +1896,7 @@ function RecordRow({ record: r, canWrite, open, selected, outOfFilter, onToggle,
   const accentBar = recordAccentClass(r)
   const tone = r.sentiment === 'negative' ? 'negative' : r.sentiment === 'positive' ? 'positive' : 'neutral'
   const triageStatus = r.triage_status || 'unhandled'
-  const triageLabel = LABELS.triage[triageStatus] || triageStatus
+  const statusDisplay = triageDisplay(r)
   const availabilityLabel = contentAvailabilityLabel(r)
   const displayTitle = recordDisplayTitle(r)
 
@@ -1986,7 +1988,7 @@ function RecordRow({ record: r, canWrite, open, selected, outOfFilter, onToggle,
         open || selected ? 'bg-accent' : 'bg-card group-hover:bg-accent',
       )} onClick={e => e.stopPropagation()}>
         <div className="grid grid-cols-[112px_48px] items-center gap-2">
-          {canWrite && !archived ? (
+          {canWrite && !archived && statusDisplay.status === triageStatus ? (
             <TriageStatusMenu
               status={triageStatus}
               busy={modeBusy}
@@ -1996,9 +1998,7 @@ function RecordRow({ record: r, canWrite, open, selected, outOfFilter, onToggle,
               onArchiveChange={onArchive}
             />
           ) : (
-            <StatusBadge tone={triageStatus} className={TRIAGE_MODE_BADGE_CLASS}>
-              <span className="min-w-0 truncate" title={triageLabel}>{triageLabel}</span>
-            </StatusBadge>
+            <RecordTriageStatus record={r} className={TRIAGE_MODE_BADGE_CLASS} />
           )}
           {canWrite && !archived ? <InlineRecordProgress record={r} onAdd={onAddNote} busy={noteBusy} /> : <button type="button" onClick={onOpenDetail} aria-label="查看内容详情" className="flex h-8 w-12 items-center justify-center rounded-md text-primary hover:bg-accent"><ChevronRight className="h-4 w-4" /></button>}
         </div>

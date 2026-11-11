@@ -11,7 +11,7 @@ import {
 } from '../services/comment-risk-attention.js';
 
 import { queryTriageAll, queryTriageOne } from '../services/record-triage-query.js';
-import { recordTriageAdmissionSql } from '../services/record-triage-admission.js';
+import { recordTriageAdmissionSql, recordAdmissionSelectSql, withRecordAdmissionFields } from '../services/record-triage-admission.js';
 import {
   createRateLimitedReporter,
   createSingleFlightReadCache,
@@ -276,6 +276,9 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
 
     const pendingRecords = await queryTriageAll(`
       SELECT r.id, r.platform, r.title, r.content, r.author_name, r.url, r.likes, r.comments_count,
+        r.business_visibility, r.record_type, r.ai_result, r.manual_overrides, r.created_at,
+        ${recordAdmissionSelectSql('r', {admitted: true})},
+        EXISTS(SELECT 1 FROM record_watchlist watched WHERE watched.tenant_id=r.tenant_id AND watched.record_id=r.id) AS is_watched,
         r.collects, r.shares, r.sentiment, r.category, r.last_seen_at,
         ${customTagsSelectSql('r')} AS custom_tags,
         COALESCE(rt.status, 'unhandled') AS triage_status,
@@ -284,11 +287,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       FROM records r
       LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
       WHERE r.tenant_id = $1
-        AND r.record_type NOT IN ('official_content', 'blogger_profile')
-        AND r.business_visibility = 'eligible'
-        AND (${recordTriageAdmissionSql('r')})
-        AND COALESCE(rt.status, 'unhandled') = 'unhandled'
-        AND rt.archived_at IS NULL
+        AND (${ACTIVE_QUEUE_CONDITION})
       ORDER BY
         CASE WHEN r.sentiment = 'negative' THEN 1 ELSE 2 END,
         (${knownInteractionSumSql('r')}) DESC NULLS LAST,
@@ -461,7 +460,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       },
       sentimentBreakdown,
       platformRisk,
-      pendingRecords,
+      pendingRecords: pendingRecords.map(withRecordAdmissionFields),
       latestContent,
       latestCommentLeads,
       latestMonitorHits: normalizedLatestMonitorHits,

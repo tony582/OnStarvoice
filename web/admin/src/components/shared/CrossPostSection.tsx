@@ -3,10 +3,10 @@ import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import { ChevronDown, Layers, Loader2 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { triageLoadError, withTriageReadDeadline } from '@/lib/triage-load'
-import { formatDate, LABELS, platformName } from '@/lib/utils'
+import { formatDate, platformName } from '@/lib/utils'
 import { crossPostSelectedIds, defaultCrossPostSelection, normalizeCrossPostGroup, type CrossPostGroup, type CrossPostMember } from '@/lib/cross-posts'
 import { CrossPostPlatformIcon } from './CrossPostBadge'
-import { StatusBadge } from '@/components/ui/badge'
+import { RecordTriageStatus } from './RecordTriageStatus'
 import { Button } from '@/components/ui/button'
 
 interface Props {
@@ -105,7 +105,7 @@ export function CrossPostSection({ record, canWrite, modes, onOpenRecord, onBatc
                   <CrossPostPlatformIcon platform={member.platform} /><span>{platformName(member.platform)}</span>
                   <span className="max-w-32 truncate">{member.author || '未知作者'}</span>
                   <span>{formatDate(member.published_at || member.created_at)}</span>
-                  <StatusBadge tone={member.triage_status || 'unhandled'}>{LABELS.triage[member.triage_status || 'unhandled'] || member.triage_status || '待处理'}</StatusBadge>
+                  <RecordTriageStatus record={member} />
                   {member.archived_at && <span>已归档</span>}
                 </div>
                 {current ? <p className="mt-1 text-[12px] leading-5">{title}<span className="ml-1.5 text-[10px] text-muted-foreground">当前内容</span></p>

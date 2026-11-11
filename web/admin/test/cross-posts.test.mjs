@@ -44,3 +44,13 @@ test('drawer switching keeps full body and the chosen member status and lifecycl
   assert.equal(next.archived_at, '2026-11-11')
   assert.equal(next.feishu_table_no, '42')
 })
+
+test('drawer switching preserves admission presentation and newer full-detail handling state', () => {
+  const outside = crossPostDrawerRecord({id:'b', triage_status:'unhandled', triage_display_status:'not_admitted',triage_display_reason:'AI 判定无关'},members[0])
+  assert.equal(outside.triage_display_status,'not_admitted')
+  assert.equal(outside.triage_display_reason,'AI 判定无关')
+  const updated = crossPostDrawerRecord({id:'b',triage_status:'reviewed'}, {...members[1],triage_status:'unhandled'})
+  assert.equal(updated.triage_status,'reviewed')
+  assert.equal(crossPostDrawerRecord({id:'b',archived_at:'2026-11-12'}, {...members[1],archived_at:null}).archived_at,'2026-11-12')
+  assert.equal(crossPostDrawerRecord({id:'b',archived_at:null}, {...members[1],archived_at:'2026-11-11'}).archived_at,null)
+})

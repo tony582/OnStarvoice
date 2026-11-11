@@ -1,5 +1,7 @@
 import {withTransaction} from '../../db/query.js';
 import {groupCrossPosts} from './matching.js';
+import {recordAdmissionSelectSql, recordEffectiveRelevanceSql, manualRecordRelevanceSql} from '../record-triage-admission.js';
+import {withRecordTriageDisplay} from '../record-triage-display.js';
 
 export const CROSS_POST_CURSOR = 'cross_posts_cursor_v1';
 export const CROSS_POST_FIELDS = `r.id, r.tenant_id, r.platform, r.record_type, r.author_name,
@@ -102,12 +104,20 @@ export async function getCrossPosts(tenantId,recordId) {
     if (!exists) throw Object.assign(new Error('内容不存在'),{status:404,code:'record_not_found'});
     const members=await tx.queryAll(`SELECT r.id,r.platform,r.author_name AS author,COALESCE(r.published_ts,r.created_at) AS published_at,
       r.created_at,left(COALESCE(NULLIF(r.title,''),r.content),40) AS title,cp.group_id,cp.score,cp.evidence,COALESCE(rt.status,'unhandled') AS triage_status,
+      r.business_visibility,r.record_type,${recordAdmissionSelectSql('r')},
+      EXISTS(SELECT 1 FROM record_watchlist watched WHERE watched.tenant_id=r.tenant_id AND watched.record_id=r.id) AS is_watched,
+      ${recordEffectiveRelevanceSql('r')} AS effective_relevance,${manualRecordRelevanceSql('r')} AS manual_relevance,
       rt.archived_at,COALESCE(rt.priority,'normal') AS triage_priority,COALESCE(rt.feishu_table_no,'') AS feishu_table_no
       FROM record_cross_posts current JOIN record_cross_posts cp ON cp.tenant_id=current.tenant_id AND cp.group_id=current.group_id
       JOIN records r ON r.tenant_id=cp.tenant_id AND r.id=cp.record_id
       LEFT JOIN record_triage rt ON rt.tenant_id=r.tenant_id AND rt.record_id=r.id
       WHERE current.tenant_id=$1 AND current.record_id=$2 ORDER BY r.created_at,r.id`,[tenantId,recordId]);
-    return {groupId:members.length>1?members[0].group_id:null,members:members.length>1?members:[]};
+    const displayed = members.map(({admission_scoped,admission_allowed,effective_relevance,manual_relevance,...record}) => {
+      const {business_visibility,record_type,...member} = withRecordTriageDisplay(record,{scoped:admission_scoped,admitted:admission_allowed,
+        relevance:effective_relevance,manualRelevance:manual_relevance});
+      return member;
+    });
+    return {groupId:members.length>1?members[0].group_id:null,members:members.length>1?displayed:[]};
   },READ);
 }
 

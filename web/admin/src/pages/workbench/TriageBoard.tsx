@@ -6,6 +6,8 @@ import { triageLoadError, withTriageReadDeadline } from '@/lib/triage-load'
 import { Button } from '@/components/ui/button'
 import { formatNumber, formatDate, LABELS, platformName, cn } from '@/lib/utils'
 import { StatusBadge } from '@/components/ui/badge'
+import { triageDisplay } from '@/lib/triage-display'
+import { RecordTriageStatus } from '@/components/shared/RecordTriageStatus'
 import { getCover } from '@/components/shared/RecordDrawer'
 import { PostIntentBadge, PostRelevanceBadge } from '@/components/shared/PostJudgment'
 import {
@@ -199,7 +201,8 @@ function BoardCard({ record: r, canWrite, dragging, onOpen, onSaveFeishuTableNo,
 }) {
   const cover = getCover(r)
   const tone = r.sentiment === 'negative' ? 'negative' : r.sentiment === 'positive' ? 'positive' : 'neutral'
-  const accent = r.triage_status === 'unhandled'
+  const outside = triageDisplay(r).status !== (r.triage_status || 'unhandled')
+  const accent = outside ? 'border-l-status-grey' : r.triage_status === 'unhandled'
     ? 'border-l-status-orange'
     : r.triage_status === 'replied' || r.triage_status === 'reviewed'
       ? 'border-l-status-green'
@@ -211,7 +214,7 @@ function BoardCard({ record: r, canWrite, dragging, onOpen, onSaveFeishuTableNo,
   return (
     <div
       data-record-detail-trigger
-      draggable={canWrite}
+      draggable={canWrite && !outside}
       onDragStart={onDragStart}
       onDragEnd={onDragEnd}
       onClick={onOpen}
@@ -224,6 +227,7 @@ function BoardCard({ record: r, canWrite, dragging, onOpen, onSaveFeishuTableNo,
       <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
         <StatusBadge tone={tone}>{tone === 'negative' ? '负面' : tone === 'positive' ? '正面' : '中性'}</StatusBadge>
         <PostIntentBadge record={r} />
+        {outside && <RecordTriageStatus record={r} />}
         <PostRelevanceBadge record={r} />
         {r.category && <StatusBadge tone="neutral">{LABELS.category[r.category] || r.category}</StatusBadge>}
         {canWrite && <GripVertical className="ml-auto h-3.5 w-3.5 cursor-grab text-muted-foreground/40 opacity-0 transition-opacity group-hover:opacity-100" />}

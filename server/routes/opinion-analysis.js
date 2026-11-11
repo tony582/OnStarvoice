@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import {recordAdmissionSelectSql, withRecordAdmissionFields} from '../services/record-triage-admission.js';
 import { queryAll, queryOne, execute } from '../db/init.js';
 import { requireTenantAccess, requireTenantWriter } from '../middleware/auth.js';
 import { formatPublishDate } from '../services/publish-date.js';
@@ -231,12 +232,16 @@ router.get('/records/:recordId', async (req, res, next) => {
 router.get('/records/:recordId/detail', async (req, res, next) => {
   try {
     const record = await queryOne(
-      `SELECT * FROM records WHERE id = $1 AND tenant_id = $2`,
+      `SELECT r.*, ${recordAdmissionSelectSql('r')}, COALESCE(rt.status,'unhandled') AS triage_status,
+        rt.archived_at, EXISTS(SELECT 1 FROM record_watchlist watched WHERE watched.tenant_id=r.tenant_id AND watched.record_id=r.id) AS is_watched,
+        COALESCE(rt.priority,'normal') AS triage_priority, COALESCE(rt.feishu_table_no,'') AS feishu_table_no
+       FROM records r LEFT JOIN record_triage rt ON rt.record_id=r.id AND rt.tenant_id=r.tenant_id
+       WHERE r.id = $1 AND r.tenant_id = $2`,
       [req.params.recordId, req.tenantId]
     );
     if (!record) return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
     record.publish_display = formatPublishDate(record.publish_time, record.created_at);
-    return res.json({ ok: true, record });
+    return res.json({ ok: true, record: withRecordAdmissionFields(record) });
   } catch (err) {
     return next(err);
   }

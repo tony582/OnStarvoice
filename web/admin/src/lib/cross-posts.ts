@@ -4,6 +4,8 @@ export interface CrossPostMember {
   author?: string
   published_at?: string | null
   created_at?: string
+  triage_display_status?: string
+  triage_display_reason?: string
   triage_status?: string
   triage_priority?: string
   feishu_table_no?: string
@@ -53,9 +55,11 @@ export function crossPostDrawerRecord(record: Record<string, unknown>, member: C
   return {
     ...record,
     id: member.id,
-    triage_status: member.triage_status || 'unhandled',
+    triage_status: String(record.triage_status || member.triage_status || 'unhandled'),
+    triage_display_status: String(record.triage_display_status || member.triage_display_status || ''),
+    triage_display_reason: String(record.triage_display_reason || member.triage_display_reason || ''),
     triage_priority: member.triage_priority || 'normal',
     feishu_table_no: member.feishu_table_no || '',
-    archived_at: member.archived_at || null,
+    archived_at: Object.prototype.hasOwnProperty.call(record, 'archived_at') ? record.archived_at as string | null : member.archived_at || null,
   }
 }
