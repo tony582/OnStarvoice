@@ -46,6 +46,7 @@ function quietLogger() {
 
 function safeJobs(overrides = {}) {
   return {
+    async processCrossPosts() { return []; },
     async compactOldCaptureTaskTechnicalHistory() {
       return {rootCount: 0, deletedSnapshotCount: 0};
     },
@@ -186,7 +187,7 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
 
   assert.deepEqual(
     fakeCron.registrations.map(item => item.expression),
-    ['17 3 * * *', '*/5 * * * *', '* * * * *', '* * * * *', '* * * * *', '* * * * *', '*/5 * * * * *', '*/5 * * * *', '*/5 * * * *'],
+    ['17 3 * * *', '*/5 * * * *', '* * * * *', '* * * * *', '* * * * *', '* * * * *', '*/5 * * * * *', '*/5 * * * *', '*/5 * * * *', '*/10 * * * *'],
   );
   assert.deepEqual(
     fakeCron.registrations.map(item => item.options.name),
@@ -200,6 +201,7 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
       'onstarvoice:customer-group-assistant',
       'onstarvoice:dead-attention-settlement',
       'onstarvoice:ops-control-observer',
+      'onstarvoice:cross-platform-posts',
     ],
   );
   assert.ok(fakeCron.registrations.every(item => item.options.noOverlap === true));
@@ -319,7 +321,7 @@ test('compatibility cron composes both groups without duplicate lifecycle calls'
     jobs: safeJobs(),
   });
 
-  assert.equal(fakeCron.registrations.length, 11);
+  assert.equal(fakeCron.registrations.length, 12);
   assert.deepEqual(runtime.runtimes.map(item => item.groupName), ['scheduler', 'ai']);
   assert.deepEqual(messages, ['[Cron] Scheduled jobs started']);
   assert.equal(runtime.stop(), true);
@@ -329,4 +331,14 @@ test('compatibility cron composes both groups without duplicate lifecycle calls'
   assert.equal(runtime.destroy(), true);
   assert.equal(runtime.destroy(), false);
   assert.ok(fakeCron.registrations.every(item => item.task.destroyCalls === 1));
+});
+
+
+test('cross-platform grouping runs only in its ten-minute scheduler job', async () => {
+  const fakeCron=createFakeCron(); let calls=0;
+  const runtime=startSchedulerCronJobs({cronModule:fakeCron,logger:quietLogger(),jobs:safeJobs({async processCrossPosts(){calls++;return [];}})});
+  const job=fakeCron.registrations.find(item=>item.options.name==='onstarvoice:cross-platform-posts');
+  assert.equal(job.expression,'*/10 * * * *'); assert.equal(job.options.noOverlap,true);
+  assert.equal(calls,0); await job.task.fire(); assert.equal(calls,1);
+  runtime.stop(); runtime.destroy();
 });

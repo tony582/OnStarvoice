@@ -1,3 +1,4 @@
+import {getCrossPosts, excludeCrossPost} from '../services/cross-posts/store.js';
 import { Router } from 'express';
 import { withTransaction } from '../db/init.js';
 import { queryTriageAll as queryAll, queryTriageOne as queryOne } from '../services/record-triage-query.js';
@@ -599,6 +600,20 @@ function appendWatchedFilter(where, rawValue) {
   };
 }
 
+router.get('/records/:id/cross-posts', requireTenantAccess, async (req,res,next)=>{
+  try {
+    if (!UUID_RE.test(req.params.id)) return res.status(400).json({ok:false,error:'invalid_id'});
+    return res.json({ok:true,...await getCrossPosts(req.tenantId,req.params.id)});
+  } catch (err) { if (err.status) return res.status(err.status).json({ok:false,error:err.code,message:err.message}); return next(err); }
+});
+router.post('/records/:id/cross-posts/exclude', requireTenantAccess, requireTenantWriter, async (req,res,next)=>{
+  try {
+    const otherId=String(req.body?.recordId || '').toLowerCase();
+    if (!UUID_RE.test(req.params.id) || !UUID_RE.test(otherId)) return res.status(400).json({ok:false,error:'invalid_id'});
+    return res.json(await excludeCrossPost(req.tenantId,req.params.id.toLowerCase(),otherId,req.user?.id || null));
+  } catch (err) { if (err.status) return res.status(err.status).json({ok:false,error:err.code,message:err.message}); return next(err); }
+});
+
 router.get('/records', requireTenantAccess, async (req, res, next) => {
   try {
     const {
@@ -669,6 +684,9 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       });
     }
     where = watchedFilter.where;
+    if (req.query.crossPlatform === 'true') where += ` AND EXISTS (SELECT 1 FROM record_cross_posts cp
+      WHERE cp.tenant_id=r.tenant_id AND cp.record_id=r.id AND EXISTS (SELECT 1 FROM record_cross_posts peer
+        WHERE peer.tenant_id=cp.tenant_id AND peer.group_id=cp.group_id AND peer.record_id<>cp.record_id))`;
 
     const readOptions = { clientGone: createClientGoneProbe(req, res) };
     const countParams = [...params];
@@ -785,6 +803,18 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       `, countParams, readOptions))?.total) || 0;
     }
 
+    // Enrich only the page: one row per record, no change to total/pagination.
+    const crossRows = records.length ? await queryAll(`SELECT cp.record_id,cp.group_id,
+      COUNT(*)::int AS member_count,array_agg(DISTINCT r.platform ORDER BY r.platform) AS platforms
+      FROM record_cross_posts cp JOIN record_cross_posts peer ON peer.tenant_id=cp.tenant_id AND peer.group_id=cp.group_id
+      JOIN records r ON r.tenant_id=peer.tenant_id AND r.id=peer.record_id
+      WHERE cp.tenant_id=$1 AND cp.record_id=ANY($2::uuid[])
+      GROUP BY cp.record_id,cp.group_id HAVING COUNT(*)>1`, [req.tenantId,records.map(r=>r.id)],readOptions) : [];
+    const crossMap = new Map(crossRows.map(row=>[row.record_id,row]));
+    for (const record of records) {
+      const cross=crossMap.get(record.id);
+      Object.assign(record,{cross_post_group_id:cross?.group_id || null,cross_post_count:cross?.member_count || 0,cross_post_platforms:cross?.platforms || []});
+    }
     const publicRecords = records.map(({ matched_total: _matchedTotal, ...record }) => redactXhsRecordNavigation(withRecordAdmissionFields({
       ...record,
       publish_display: formatPublishDate(record.publish_time, record.created_at),
@@ -985,28 +1015,18 @@ router.patch('/records/batch', requireTenantAccess, requireTenantWriter, async (
           req.actorName || '',
           status === 'negative_feishu' ? requestedFeishuTableNo : null,
         ]);
-        await tx.execute(`
-          INSERT INTO audit_logs (tenant_id, actor_type, actor_id, actor_user_id, action, target_type, target_id, metadata)
-          VALUES ($1, $2, $3, $4, 'record.triage_batch_updated', 'record', '', $5::jsonb)
-        `, [
-          req.tenantId,
-          req.actorType || 'system',
-          req.user?.id || req.authCode || '',
-          req.user?.id || null,
-          JSON.stringify({
-            recordIds: rows.map(row => row.record_id),
-            status,
-            priority,
-            note,
-            feishuTableNo: status === 'negative_feishu' ? requestedFeishuTableNo : '',
-            previous: Object.fromEntries(previousRows.map(row => [row.record_id, {
-              status: row.status,
-              priority: row.priority,
-              feishuTableNo: row.feishu_table_no,
-            }])),
-            updated: rows.length,
-          }),
-        ]);
+        // Keep the existing batch action/metadata contract, with one auditable transition per selected record.
+        const previous = new Map(previousRows.map(row=>[row.record_id,row]));
+        for (const row of rows) {
+          const before=previous.get(row.record_id);
+          await tx.execute(`INSERT INTO audit_logs(tenant_id,actor_type,actor_id,actor_user_id,action,target_type,target_id,metadata)
+            VALUES($1,$2,$3,$4,'record.triage_batch_updated','record',$5,$6::jsonb)`,[
+            req.tenantId,req.actorType || 'system',req.user?.id || req.authCode || '',req.user?.id || null,row.record_id,
+            JSON.stringify({recordIds:[row.record_id],status,priority,note,
+              feishuTableNo:status==='negative_feishu'?requestedFeishuTableNo:'',
+              previous:{[row.record_id]:{status:before?.status,priority:before?.priority,feishuTableNo:before?.feishu_table_no}},updated:1}),
+          ]);
+        }
         return {
           updatedIds: rows.map(row => String(row.record_id).toLowerCase()),
           archivedIds: [],
@@ -1456,6 +1476,9 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       });
     }
     where = watchedFilter.where;
+    if (req.query.crossPlatform === 'true') where += ` AND EXISTS (SELECT 1 FROM record_cross_posts cp
+      WHERE cp.tenant_id=r.tenant_id AND cp.record_id=r.id AND EXISTS (SELECT 1 FROM record_cross_posts peer
+        WHERE peer.tenant_id=cp.tenant_id AND peer.group_id=cp.group_id AND peer.record_id<>cp.record_id))`;
 
     const records = await queryAll(`
       SELECT

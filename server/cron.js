@@ -1,3 +1,4 @@
+import {processCrossPosts} from './services/cross-posts/store.js';
 /**
  * 定时任务调度
  */
@@ -27,6 +28,7 @@ import {
 import {createDrainController} from './runtime/drain-controller.js';
 
 const DEFAULT_JOBS = Object.freeze({
+  processCrossPosts,
   compactOldCaptureTaskTechnicalHistory,
   enqueueDueCaptureOrchestrations,
   enqueueDueProfilePatrolTasks,
@@ -307,6 +309,7 @@ function schedulerDefinitions(jobs, logger) {
         }
       },
     },
+    {name: 'cross-platform-posts', expression: '*/10 * * * *', run: () => jobs.processCrossPosts()},
   ];
 }
 

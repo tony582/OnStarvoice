@@ -3,6 +3,7 @@ import {startOpsControlWakeupRuntime} from '../services/ops-control-wakeup.js';
 
 export const SCHEDULER_RUNTIME_RESPONSIBILITIES = Object.freeze([
   'capture-task-retention',
+  'cross-platform-posts',
   'profile-patrol-scheduling',
   'capture-orchestration-recovery',
   'capture-attention-notifications',
