@@ -25,34 +25,38 @@ export function CrossPostSection({ record, canWrite, modes, onOpenRecord, onBatc
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const request = useRef(0)
-  const abort = useRef<AbortController | null>(null)
-  const load = useCallback(async (reset = false) => {
-    const seq = ++request.current
-    abort.current?.abort()
+  const request = useRef({ sequence: 0, controller: null as AbortController | null })
+  const load = useCallback((reset = false) => {
+    const pending = request.current
+    const seq = ++pending.sequence
+    pending.controller?.abort()
     const controller = new AbortController()
-    abort.current = controller
-    setLoading(true)
-    try {
-      const result = await withTriageReadDeadline(signal => api.request<CrossPostGroup>(
-        `/triage/records/${encodeURIComponent(record.id)}/cross-posts`, { signal },
-      ), controller)
-      if (seq !== request.current) return
+    pending.controller = controller
+    return withTriageReadDeadline(signal => api.request<CrossPostGroup>(
+      `/triage/records/${encodeURIComponent(record.id)}/cross-posts`, { signal },
+    ), controller).then(result => {
+      if (seq !== pending.sequence) return
       const next = normalizeCrossPostGroup(result)
       setGroup(next)
       setSelected(current => reset ? defaultCrossPostSelection(next.members, record.id) : crossPostSelectedIds(next.members, current))
       setError('')
-    } catch (err) {
-      if (seq === request.current) setError(triageLoadError(err))
-    } finally {
-      if (seq === request.current) setLoading(false)
-    }
+    }).catch(err => {
+      if (seq === pending.sequence) setError(triageLoadError(err))
+    }).finally(() => {
+      if (seq === pending.sequence) setLoading(false)
+    })
   }, [record.id])
 
   useEffect(() => {
+    const pending = request.current
     void load(true)
-    return () => { request.current++; abort.current?.abort() }
+    return () => { pending.sequence++; pending.controller?.abort() }
   }, [load])
+
+  const refresh = () => {
+    setLoading(true)
+    return load()
+  }
 
   const members = group.members.map(member => member.id === record.id
     ? { ...member, triage_status: record.triage_status || member.triage_status, archived_at: record.archived_at ?? member.archived_at }
@@ -69,11 +73,11 @@ export function CrossPostSection({ record, canWrite, modes, onOpenRecord, onBatc
   }
   const changeStatus = (status: string) => run(async () => {
     if (!onBatchStatus || !selectedIds.length) return
-    if (await onBatchStatus(selectedIds, status)) await load()
+    if (await onBatchStatus(selectedIds, status)) await refresh()
   })
   const exclude = (member: CrossPostMember) => run(async () => {
     await api.post(`/triage/records/${encodeURIComponent(record.id)}/cross-posts/exclude`, { recordId: member.id })
-    await load()
+    await refresh()
     await onGroupChanged?.()
   })
 
@@ -84,7 +88,7 @@ export function CrossPostSection({ record, canWrite, modes, onOpenRecord, onBatc
       <p className="mt-1 text-[11px] text-muted-foreground">处理状态各自独立；只修改勾选的内容。</p>
       {loading && <p role="status" className="mt-2 text-[11px] text-muted-foreground">正在读取同发内容…</p>}
       {error && <div role="alert" className="mt-2 text-[12px] text-destructive">{error}
-        <button type="button" disabled={busy || loading} className="ml-2 underline" onClick={() => void load()}>重试</button>
+        <button type="button" disabled={busy || loading} className="ml-2 underline" onClick={() => void refresh()}>重试</button>
       </div>}
       <ul className="mt-2 space-y-1.5">
         {members.map(member => {

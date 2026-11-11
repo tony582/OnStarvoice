@@ -5,7 +5,7 @@ import { NavProvider } from '../../src/lib/navigation'
 import { TriageQueue } from '../../src/pages/workbench/TriageQueue'
 import '../../src/index.css'
 
-function Fixture() {
+export function Fixture() {
   const { loading } = useAuth()
   return loading ? <p>正在载入离线测试</p> : <BadgesProvider><NavProvider><TriageQueue /></NavProvider></BadgesProvider>
 }
