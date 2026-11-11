@@ -8,8 +8,13 @@ export function registerOrchestrationParentProjector(fn) {
 }
 export async function refreshOrchestrationParent(tx, tenantId, child, agentId) {
   if (!child?.metadata?.orchestrationChild || !child.parent_task_id) return;
+  return refreshOrchestrationParentById(tx, tenantId, child.parent_task_id, agentId, child.id);
+}
+// Claim-time permanent refusals settle an item before a child exists. Project
+// that parent through the same registered projector, without inventing a child.
+export async function refreshOrchestrationParentById(tx, tenantId, parentTaskId, agentId, childTaskId = '') {
   if (typeof projector !== 'function') throw new Error('orchestration_parent_projector_unregistered');
   const at = new Date().toISOString();
-  await projector(tx, {tenantId, parentTaskId: child.parent_task_id, childTaskId: child.id,
+  return projector(tx, {tenantId, parentTaskId, childTaskId,
     actorType: 'system', actorName: '手机搜索发现', eventAgentId: agentId, snapshot: {heartbeatAt: at, updatedAt: at}});
 }

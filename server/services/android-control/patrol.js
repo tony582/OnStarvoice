@@ -25,8 +25,9 @@ export function patrolSearchQuery(target) {
 }
 
 /**
- * Lease one Channels negative_post item for this phone's new child. Returns the child metadata additions, or
- * null when the item cannot be patrolled now (it is skipped for this run unless the refusal is transient).
+ * Lease one negative_post item for this phone's new child. Distinguish a
+ * temporary refusal (whose state writes must be rolled back) from a permanent
+ * skipped item (whose parent must be projected before trying the next item).
  */
 export async function claimPhonePatrolItem(tx, {tenantId, parent, item, childId, revision}) {
   const record = await tx.queryOne(`SELECT r.id, r.platform, r.title, r.content, r.author_name, r.publish_time, r.url, triage.archived_at
@@ -36,17 +37,19 @@ export async function claimPhonePatrolItem(tx, {tenantId, parent, item, childId,
     await tx.execute(`UPDATE capture_task_items SET status = 'skipped', finished_at = now(), updated_at = now(),
       assignment_revision = assignment_revision + 1, metadata = metadata || jsonb_build_object('skipReason', $3::text)
       WHERE tenant_id = $1 AND id = $2`, [tenantId, item.id, reason]);
-    return null;
+    return {status: 'skipped', reason};
   };
   if (!record) return skip('record_missing');
   if (record.archived_at) return skip('archived');
   const claimed = await claimUnattendedNegativePatrolItem(tx, {...(parent.metadata?.negativePatrolRun || {}), tenantId,
     recordId: item.record_id, itemId: item.id, executionTaskId: childId, assignmentRevision: revision, now: new Date().toISOString()});
-  if (!claimed.claimed) return TRANSIENT.has(claimed.reason) ? null : skip(claimed.reason || 'no_longer_eligible');
+  if (!claimed.claimed) return TRANSIENT.has(claimed.reason)
+    ? {status: 'blocked', reason: claimed.reason} : skip(claimed.reason || 'no_longer_eligible');
   const target = {recordId: record.id, url: item.url_snapshot || record.url, title: record.title || '', content: record.content || '',
     author: record.author_name || '', createtime: beijingSeconds(record.publish_time)};
   if (record.platform === 'wechat_articles') target.platform = record.platform;
-  return {mode: 'patrol', patrolTarget: target, searchQuery: patrolSearchQuery(record.platform === 'wechat_articles' ? {...target, content: target.title} : target)};
+  return {status: 'claimed', metadata: {mode: 'patrol', patrolTarget: target,
+    searchQuery: patrolSearchQuery(record.platform === 'wechat_articles' ? {...target, content: target.title} : target)}};
 }
 
 /** Settle the rotation state when the phone reports the patrol attempt; returns the item status and outcome to keep. */

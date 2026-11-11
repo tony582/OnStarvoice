@@ -1,6 +1,6 @@
 import {randomUUID} from 'node:crypto';
 import {digest,fail,id,identity,LEASE_MS,text} from './validation.js';
-import {refreshOrchestrationParent} from './parent-refresh.js';
+import {refreshOrchestrationParent,refreshOrchestrationParentById} from './parent-refresh.js';
 import {claimPhonePatrolItem} from './patrol.js';
 import {FORWARD_ITEM_TYPE,forwardTarget,WECHAT_FORWARD_FEATURE} from './forward.js';
 import {heldItem,lockAgent,parentStopRequested,rollup,saveItemMetadata,taskRow} from './repository.js';
@@ -101,7 +101,7 @@ async function findAssignedCandidate(tx,tenantId,agentId,workflows) {
 // as in the browser elastic dispatch. Retries go to the fewest attempts first, so one failing keyword
 // cannot use up all of its retries while the others wait behind it.
 async function claimElasticItem(tx,principal,agent,now,platforms,wechatFilters=false,wechatForward=false) {
-  const item=await tx.queryOne(`SELECT item.* FROM capture_task_items item
+  const candidates=await tx.queryAll(`SELECT item.* FROM capture_task_items item
     JOIN capture_tasks parent ON parent.id=item.task_id AND parent.tenant_id=item.tenant_id
     WHERE item.tenant_id=$1
       AND parent.task_type='capture_orchestration'
@@ -140,23 +140,50 @@ async function claimElasticItem(tx,principal,agent,now,platforms,wechatFilters=f
         AND COALESCE(parent.metadata->'planSnapshot'->'searchFilters'->>'searchScope','all') NOT IN ('followed','viewed')))
     ORDER BY CASE WHEN item.item_type='wechat_forward' THEN 0 ELSE 1 END, CASE WHEN item.status='pending' THEN 0 ELSE 1 END,
       parent.created_at, item.attempt_count, item.ordinal, item.id
-    FOR UPDATE OF item SKIP LOCKED LIMIT 1`,
+    FOR UPDATE OF item SKIP LOCKED LIMIT 20`,
   [principal.tenantId,agent.id,MOBILE_ELASTIC_ATTEMPT_LIMIT,TERMINAL_EXECUTION_STATUSES,MOBILE_SAFETY_ERROR_CODES,platforms,wechatFilters,wechatForward]);
-  if (!item) return null;
+  for (const item of candidates) {
+    // Shared patrol eligibility may upsert rotation state before discovering a
+    // cooldown/lease. A temporary refusal must leave that candidate unchanged.
+    await tx.execute('SAVEPOINT android_elastic_candidate');
+    try {
+      const claimed=await claimElasticCandidate(tx,principal,agent,item);
+      if (!claimed) await tx.execute('ROLLBACK TO SAVEPOINT android_elastic_candidate');
+      await tx.execute('RELEASE SAVEPOINT android_elastic_candidate');
+      if (claimed?.item) return claimed;
+      // Permanent failed/skipped items have already projected their parent.
+    } catch (error) {
+      try {
+        await tx.execute('ROLLBACK TO SAVEPOINT android_elastic_candidate');
+        await tx.execute('RELEASE SAVEPOINT android_elastic_candidate');
+      } catch {}
+      throw error;
+    }
+  }
+  return null;
+}
+async function claimElasticCandidate(tx,principal,agent,item) {
   const parent=await tx.queryOne('SELECT * FROM capture_tasks WHERE id=$1 AND tenant_id=$2 FOR UPDATE',[item.task_id,principal.tenantId]);
+  if (!parent || !['pending','running','needs_action'].includes(parent.status) || parentStopRequested(parent.metadata)) return null;
   const planSnapshot=parent.metadata?.planSnapshot || {};
   if (mobilePlanBlockReason(planSnapshot,parent.platform)) return null;
   const childId=randomUUID(), revision=item.assignment_revision+1;
   // A Channels negative post: lease it in the shared rotation state first (same rules as browser patrol).
-  const patrol=item.item_type==='negative_post'
+  const patrolClaim=item.item_type==='negative_post'
     ? await claimPhonePatrolItem(tx,{tenantId:principal.tenantId,parent,item,childId,revision}) : null;
-  if (item.item_type==='negative_post' && !patrol) return null;
+  if (patrolClaim?.status==='blocked') return null;
+  if (patrolClaim?.status==='skipped') {
+    await refreshOrchestrationParentById(tx,principal.tenantId,parent.id,agent.id);
+    return {settled:true};
+  }
+  const patrol=patrolClaim?.metadata || null;
   // 「发到微信」: the post and the contact; a post whose link is gone fails at once instead of waiting.
   const forward=item.item_type===FORWARD_ITEM_TYPE ? await forwardTarget(tx,principal.tenantId,item) : null;
   if (item.item_type===FORWARD_ITEM_TYPE && !forward) {
     await tx.execute(`UPDATE capture_task_items SET status='failed',finished_at=now(),updated_at=now(),
       error=jsonb_build_object('code','RECORD_SHARE_LINK_MISSING') WHERE id=$1`,[item.id]);
-    return null;
+    await refreshOrchestrationParentById(tx,principal.tenantId,parent.id,agent.id);
+    return {settled:true};
   }
   const keywords=patrol ? [patrol.searchQuery] : [item.keyword];
   const workflow=mobileWorkflowFor(parent.platform);
