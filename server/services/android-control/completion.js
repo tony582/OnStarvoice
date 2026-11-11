@@ -4,6 +4,7 @@ import {refreshOrchestrationParent} from './parent-refresh.js';
 import {parentStopRequested,rollup,saveItemMetadata} from './repository.js';
 import {settlePhonePatrol} from './patrol.js';
 import {FORWARD_ITEM_TYPE,forwardItemStatus} from './forward.js';
+import {completionStats} from './completion-stats.js';
 async function parentMetadataFor(tx,principal,task) {
   if (!task.metadata?.orchestrationChild || !task.parent_task_id) return null;
   const row=await tx.queryOne('SELECT metadata FROM capture_tasks WHERE id=$1 AND tenant_id=$2',[task.parent_task_id,principal.tenantId]);
@@ -60,9 +61,13 @@ export async function complete(tx,principal,body) {
   if (forward) itemStatus=forwardItemStatus(status,payload.reason);
   const receipt={accepted:true,deviceHeld:!body.deviceIdle};
   const completion={requestId,hash,receipt};
+  // Hash the original bounded request above: a pre-upgrade completion replay keeps its existing idempotency key.
+  // Only persisted statistics are projected; titles/authors in unexpected stats never reach the stored checkpoint.
+  const checkpoint={...payload.checkpoint,...(Object.hasOwn(payload.checkpoint,'stats')
+    ? {stats:completionStats(payload.checkpoint.stats)} : {})};
   await tx.execute(`UPDATE capture_task_item_attempts SET status=$2,checkpoint=checkpoint||$3::jsonb,
     result=result||$4::jsonb,finished_at=now(),updated_at=now() WHERE id=$1`,
-  [attempt.id,status,{runner:payload.checkpoint},{completion,reason:payload.reason}]);
+  [attempt.id,status,{runner:checkpoint},{completion,reason:payload.reason}]);
   await saveItemMetadata(tx,item,{...item.metadata,deviceHeld:!body.deviceIdle,completion,...(patrolOutcome ? {patrolOutcome} : {}),
     reason:payload.reason,deviceClosedAt:body.deviceIdle?new Date().toISOString():null,
     resumeAuthorized:itemStatus==='retryable'?false:item.metadata.resumeAuthorized===true},itemStatus);

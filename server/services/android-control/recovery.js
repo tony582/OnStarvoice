@@ -41,6 +41,7 @@ export function receiptStats(checkpoint) {
   if (!source) return null;
   // prefilter*: cards the AI card prefilter skipped / judged / could not judge (opened anyway).
   return Object.fromEntries(['links', 'cards', 'swipes', 'skippedCards', 'keywordElapsedMs', 'batchElapsedMs',
-    'prefilterSkipped', 'prefilterJudged', 'prefilterUnjudged']
-    .filter(key => Number.isFinite(source[key]) && source[key] >= 0).map(key => [key, source[key]]));
+    'prefilterSkipped', 'prefilterJudged', 'prefilterUnjudged', 'cardsSeen', 'opened', 'outsideWindow', 'stopReason', 'screens']
+    .filter(key => Object.hasOwn(source,key) && Number.isFinite(source[key]) && source[key] >= 0
+      && (key !== 'stopReason' || Number.isSafeInteger(source[key]))).map(key => [key, source[key]]));
 }

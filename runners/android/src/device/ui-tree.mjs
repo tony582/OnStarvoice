@@ -3,6 +3,7 @@ import { DeviceError } from './bounded.mjs';
 // `diagnostic` names the rejected rule with sizes and code points, and since 0.3.2 the bounded text around the
 // failure (failureContext). It stays in the local diagnose notes (private state directory, never uploaded) and is
 // not an uploaded completion detail key: faultDetails in discovery-runner.mjs only copies whitelisted keys.
+// UiAutomator uses single quotes around values containing double quotes (the 2026-11-10 Buick ad), so accept both.
 const fail = (rule, facts = {}) => {
   throw new DeviceError('invalid_ui_source', 'UI source is not a bounded Android hierarchy',
     { diagnostic: { parser: rule, ...facts } });
@@ -56,7 +57,7 @@ export function parseUiTree(xml) {
   const at = (rule, facts = {}) => fail(rule, { bytes, nodes: nodes.length, depth: stack.length - 1, ...facts });
   // XML allows a raw `>` inside a quoted attribute value (a caption such as "A>B"), so a tag ends at
   // the first `>` outside quotes, not at the first `>`.
-  for (const match of source.matchAll(/<(?:[^>"]|"[^"]*")*>/gu)) {
+  for (const match of source.matchAll(/<(?:[^>"']|"[^"]*"|'[^']*')*>/gu)) {
     if (source.slice(offset, match.index).trim()) return at('stray_text', { context: failureContext(source, offset) });
     offset = match.index + match[0].length;
     const close = match[0].match(/^<\/([\p{L}_][\p{L}\p{N}_.:-]*)>$/u);
@@ -65,13 +66,13 @@ export function parseUiTree(xml) {
       stack.pop();
       continue;
     }
-    const open = match[0].match(/^<([\p{L}_][\p{L}\p{N}_.:-]*)(\s(?:[^<>"]|"[^"<]*")*?)?\s*(\/?)>$/u);
+    const open = match[0].match(/^<([\p{L}_][\p{L}\p{N}_.:-]*)(\s(?:[^<>"']|"[^"<]*"|'[^'<]*')*?)?\s*(\/?)>$/u);
     // The usual cause is a raw `<` inside a quoted value; show that value, else the start of the tag.
-    if (!open) return at('invalid_tag', { context: failureContext(match[0], Math.max(0, match[0].search(/"[^"<]*</u))) });
+    if (!open) return at('invalid_tag', { context: failureContext(match[0], (i => i < 0 ? 0 : i + 1)(match[0].search(/=(["'])(?:(?!\1)[^<])*</u))) });
     if (stack.length > 128) return at('too_deep');
     if (nodes.length >= 12000) return at('too_many_nodes');
     const attrs = open[2] ?? ''; const attributes = {}; let cursor = 0;
-    const regex = /\s+([\p{L}_][\p{L}\p{N}_.:-]*)="([^"<]*)"/guy;
+    const regex = /\s+([\p{L}_][\p{L}\p{N}_.:-]*)=(?:"([^"<]*)"|'([^'<]*)')/guy;
     while (cursor < attrs.length) {
       if (!attrs.slice(cursor).trim()) break;
       regex.lastIndex = cursor; const attribute = regex.exec(attrs);
@@ -82,9 +83,10 @@ export function parseUiTree(xml) {
           context: failureContext(attrs, cursor) });
       }
       if (Object.hasOwn(attributes, attribute[1])) return at('duplicate_attribute', { attribute: attribute[1] });
-      const bare = attribute[2].search(/&(?![^&;]+;)/u);
-      if (bare >= 0) return at('bare_ampersand', { attribute: attribute[1], context: failureContext(attribute[2], bare) });
-      attributes[attribute[1]] = decode(attribute[2], attribute[1]); cursor = regex.lastIndex;
+      const value = attribute[2] ?? attribute[3];
+      const bare = value.search(/&(?![^&;]+;)/u);
+      if (bare >= 0) return at('bare_ampersand', { attribute: attribute[1], context: failureContext(value, bare) });
+      attributes[attribute[1]] = decode(value, attribute[1]); cursor = regex.lastIndex;
     }
     const parent = stack.at(-1);
     if (open[1] === 'hierarchy' && parent !== document || open[1] !== 'hierarchy' && parent === document) return at('misplaced_root');
