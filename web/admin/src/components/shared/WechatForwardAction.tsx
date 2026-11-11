@@ -1,3 +1,4 @@
+import { usePolling } from '@/hooks/usePolling'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Loader2, Send } from 'lucide-react'
 import { api, ApiResponseError, isApiNetworkError } from '@/lib/api'
@@ -72,6 +73,7 @@ function WechatForwardContent({ recordId, canWrite, storageKey }: { recordId: st
   const [chosen, setChosen] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
   const [loading, setLoading] = useState(true)
+  const [initialized, setInitialized] = useState(false)
   const [loadError, setLoadError] = useState('')
   const [error, setError] = useState('')
   const inFlight = useRef(false)
@@ -82,44 +84,29 @@ function WechatForwardContent({ recordId, canWrite, storageKey }: { recordId: st
     return () => { mounted.current = false }
   }, [])
 
-  const fetchForwards = useCallback(() => api.get<ForwardsResponse>(
-    `/capture-cloud/android/wechat-forwards?recordId=${encodeURIComponent(recordId)}`), [recordId])
-  const apply = useCallback((result: ForwardsResponse) => {
-    setForwards(Array.isArray(result.forwards) ? result.forwards : [])
-    setRecipients(Array.isArray(result.recipients) ? result.recipients : [])
-    setLoadError('')
-  }, [])
-
-  useEffect(() => {
-    let current = true
-    void fetchForwards().then(result => { if (current) apply(result) }, () => {
-      if (current) setLoadError('暂时无法读取接收人和发送状态')
-    }).finally(() => { if (current) setLoading(false) })
-    return () => { current = false }
-  }, [fetchForwards, apply])
-
+  const readForwards = useCallback(async (signal: AbortSignal) => {
+    try {
+      const result = await api.get<ForwardsResponse>(
+        `/capture-cloud/android/wechat-forwards?recordId=${encodeURIComponent(recordId)}`, { signal })
+      if (signal.aborted) return
+      setForwards(Array.isArray(result.forwards) ? result.forwards : [])
+      setRecipients(Array.isArray(result.recipients) ? result.recipients : [])
+      setLoadError('')
+      setInitialized(true)
+    } catch (error) {
+      if (!signal.aborted) setLoadError('暂时无法读取接收人和发送状态')
+      throw error
+    } finally {
+      if (!signal.aborted) setLoading(false)
+    }
+  }, [recordId])
   const waiting = forwards.some(forward => forward.status === 'pending' || forward.status === 'running')
-  useEffect(() => {
-    if (!waiting) return
-    let current = true
-    const timer = window.setInterval(() => {
-      void fetchForwards().then(result => { if (current) apply(result) }, () => {
-        if (current) setLoadError('发送状态暂时未更新，请稍后刷新')
-      })
-    }, 5000)
-    return () => { current = false; window.clearInterval(timer) }
-  }, [waiting, fetchForwards, apply])
-
+  const { refresh: refreshForwards } = usePolling(readForwards, {
+    intervalMs: 5000, enabled: !initialized || waiting, resetKey: recordId,
+  })
   const refresh = async () => {
     setLoading(true)
-    try {
-      const result = await fetchForwards()
-      if (mounted.current) apply(result)
-    } catch {
-      if (mounted.current) setLoadError('暂时无法读取接收人和发送状态')
-    } finally {
-      if (mounted.current) setLoading(false)
-    }
+    await refreshForwards()
   }
   const open = () => {
     const remembered = rememberedChoice(storageKey).filter(name => recipients.includes(name))

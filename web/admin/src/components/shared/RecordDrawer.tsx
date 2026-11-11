@@ -1,3 +1,4 @@
+import { usePolling } from '@/hooks/usePolling'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import {
@@ -1337,7 +1338,6 @@ function hasVideo(r: any): boolean {
   return Boolean(r?.video_url) || r?.note_type === 'video'
 }
 
-const TRANSCRIPT_TERMINAL = ['done', 'failed', 'expired', 'no_media']
 const CONTENT_SECTION_TITLE = 'text-[13px] font-semibold text-foreground'
 const CONTENT_ACTION_BUTTON = 'inline-flex shrink-0 items-center gap-1 rounded-md border border-border bg-background px-2.5 py-1 text-xs font-semibold text-primary transition hover:bg-accent disabled:opacity-50'
 const TRANSCRIPT_CLAMP_CHARS = 240
@@ -1372,38 +1372,24 @@ function useRecordTranscript(record: TranscriptRecord, enabled: boolean) {
   const [analysis, setAnalysis] = useState<TranscriptAnalysis | null>(record.transcript_analysis || null)
   const [analyzing, setAnalyzing] = useState(false)
   const [analyzeError, setAnalyzeError] = useState('')
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
-
-  const stopPoll = () => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null } }
-
-  const startPoll = () => {
-    stopPoll()
-    pollRef.current = setInterval(async () => {
-      try {
-        const d = await api.get<TranscriptResponse>(`/records/${record.id}/transcript`)
-        setStatus(d.transcript_status || 'none')
-        setText(d.transcript || '')
-        setError(d.transcript_error || '')
-        if (TRANSCRIPT_TERMINAL.includes(String(d.transcript_status))) { stopPoll(); setBusy(false) }
-      } catch { /* 单次轮询失败,下个周期再试 */ }
-    }, 3500)
-  }
-
-  // 打开抽屉时主动从库里拉最新逐字稿 + AI 分析(列表行快照可能不含这些字段);在转写中则接着轮询
-  useEffect(() => {
-    if (!enabled) return
-    let cancelled = false
-    api.get<TranscriptResponse>(`/records/${record.id}/transcript`).then(d => {
-      if (cancelled) return
-      setStatus(d.transcript_status || 'none')
-      setText(d.transcript || '')
-      setError(d.transcript_error || '')
-      setAnalysis(d.transcript_analysis || null)
-      if (d.transcript_status === 'pending' || d.transcript_status === 'processing') { setBusy(true); startPoll() }
-    }).catch(() => { /* 拉取失败保持快照初值 */ })
-    return () => { cancelled = true; stopPoll() }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [enabled])
+  const [loadedId, setLoadedId] = useState<string | number | undefined>()
+  const readTranscript = useCallback(async (signal: AbortSignal) => {
+    if (!enabled || !record.id) return
+    const data = await api.get<TranscriptResponse>(`/records/${record.id}/transcript`, { signal })
+    if (signal.aborted) return
+    setStatus(data.transcript_status || 'none')
+    setText(data.transcript || '')
+    setError(data.transcript_error || '')
+    setAnalysis(data.transcript_analysis || null)
+    setLoadedId(record.id)
+    setBusy(data.transcript_status === 'pending' || data.transcript_status === 'processing')
+  }, [enabled, record.id])
+  // The first read and subsequent refreshes share one request lane.
+  const { refresh: refreshTranscript } = usePolling(readTranscript, {
+    intervalMs: 3500,
+    enabled: enabled && (loadedId !== record.id || status === 'pending' || status === 'processing'),
+    resetKey: record.id,
+  })
 
   const generate = async () => {
     setBusy(true); setError('')
@@ -1411,7 +1397,7 @@ function useRecordTranscript(record: TranscriptRecord, enabled: boolean) {
       const d = await api.post<{ status?: string }>(`/records/${record.id}/transcribe`, {})
       setStatus(d.status || 'pending')
       if (d.status === 'no_media') { setBusy(false); return }
-      startPoll()
+      await refreshTranscript()
     } catch (e) {
       setStatus('failed'); setError(e instanceof Error ? e.message : '触发失败'); setBusy(false)
     }

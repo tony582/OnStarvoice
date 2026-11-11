@@ -4,9 +4,9 @@ import {
   ListChecks, Loader2, Plus, RefreshCw,
 } from 'lucide-react'
 import { api } from '@/lib/api'
+import { usePolling } from '@/hooks/usePolling'
 import { useAuth } from '@/lib/auth'
 import {
-  overviewNextPollDelayMs,
   overviewReadOutcome,
   readWithBusyRetry,
 } from '@/lib/busy-retry.mjs'
@@ -63,7 +63,7 @@ function MobileDispatchMetric({ label, value, tone = 'text-foreground' }: { labe
 }
 
 export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'mobile' } = {}) {
-  const { canWrite } = useAuth()
+  const { canWrite, tenantId } = useAuth()
   const { params } = useNav()
   const mobile = surface === 'mobile'
   const [overview, setOverview] = useState<Overview | null>(null)
@@ -116,11 +116,7 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
   const [selectedResultTask, setSelectedResultTask] = useState<CloudTask | null>(null)
   const [historyRefreshKey, setHistoryRefreshKey] = useState(0)
   const [historyTotal, setHistoryTotal] = useState<number | null>(null)
-  const overviewLoadInFlight = useRef<Promise<void> | null>(null)
-  const overviewLoadFollowUp = useRef(false)
-  const overviewLoadWaiters = useRef<Array<() => void>>([])
   const overviewLoadFailureCount = useRef(0)
-  const overviewLoadBusy = useRef(false)
   const overviewLoaded = useRef(false)
   const orchestrationDetailDialogRef = useRef<HTMLDivElement | null>(null)
 
@@ -152,104 +148,44 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
     })
   }, [mobile])
 
-  const fetchOverview = useCallback(async (quiet = false) => {
-    if (quiet) setRefreshing(true)
+  const fetchOverview = useCallback(async (signal: AbortSignal) => {
+    if (overviewLoaded.current) setRefreshing(true)
     else setLoading(true)
     const previous = { loaded: overviewLoaded.current, failureCount: overviewLoadFailureCount.current }
     let outcome: OverviewReadOutcome
+    let failure: unknown
     try {
-      // 还没有任何数据时，服务繁忙先自动重试几次，不急着给出一个空看板。
       const data = await readWithBusyRetry(
-        () => api.get<Overview & { ok: boolean; stale?: boolean; staleAgeMs?: number }>('/capture-cloud/overview'),
-        { retries: previous.loaded ? 0 : 3 },
+        () => api.get<Overview & { ok: boolean; stale?: boolean; staleAgeMs?: number }>('/capture-cloud/overview', { signal }),
+        { retries: previous.loaded ? 0 : 3, signal },
       )
-      // 服务端读不成时给的是它最近一次完整结果（stale）：照常展示，由 outcome 决定说明和重试。
+      if (signal.aborted) return
       setOverview({ agents: data.agents || [], tasks: data.tasks || [], summary: data.summary })
       outcome = overviewReadOutcome(previous, { data })
+      if (data.stale) failure = new Error('任务看板暂未刷新')
     } catch (err) {
+      if (signal.aborted) return
       outcome = overviewReadOutcome(previous, { error: err })
+      failure = err
     } finally {
-      setLoading(false)
-      setRefreshing(false)
+      if (!signal.aborted) {
+        setLoading(false)
+        setRefreshing(false)
+      }
     }
     overviewLoaded.current = outcome.loaded
-    overviewLoadBusy.current = outcome.busy
     overviewLoadFailureCount.current = outcome.failureCount
     setRefreshNotice(outcome.notice)
     setError(outcome.error)
+    if (failure) throw failure
   }, [])
 
-  const load = useCallback((
-    quiet = false,
-    { queueIfBusy = true }: { queueIfBusy?: boolean } = {},
-  ): Promise<void> => {
-    const current = overviewLoadInFlight.current
-    if (current) {
-      if (!queueIfBusy) return current
-      overviewLoadFollowUp.current = true
-      return new Promise(resolve => {
-        overviewLoadWaiters.current.push(resolve)
-      })
-    }
-
-    const cycle = async () => {
-      let nextQuiet = quiet
-      do {
-        overviewLoadFollowUp.current = false
-        await fetchOverview(nextQuiet)
-        nextQuiet = true
-      } while (overviewLoadFollowUp.current)
-    }
-    const request = cycle().finally(() => {
-      overviewLoadInFlight.current = null
-      const waiters = overviewLoadWaiters.current.splice(0)
-      waiters.forEach(resolve => resolve())
-    })
-    overviewLoadInFlight.current = request
-    return request
-  }, [fetchOverview])
-
-  useEffect(() => {
-    let disposed = false
-    let timer: number | null = null
-
-    const clearTimer = () => {
-      if (timer !== null) window.clearTimeout(timer)
-      timer = null
-    }
-    const schedule = (delayMs: number, quiet = true) => {
-      if (disposed || document.hidden) return
-      clearTimer()
-      timer = window.setTimeout(() => {
-        timer = null
-        void run(quiet)
-      }, delayMs)
-    }
-    const run = async (quiet: boolean) => {
-      if (disposed || document.hidden) return
-      await load(quiet, { queueIfBusy: false })
-      if (disposed || document.hidden) return
-      schedule(overviewNextPollDelayMs({
-        failureCount: overviewLoadFailureCount.current,
-        busy: overviewLoadBusy.current,
-      }))
-    }
-    const handleVisibilityChange = () => {
-      if (document.hidden) {
-        clearTimer()
-        return
-      }
-      schedule(0)
-    }
-
-    document.addEventListener('visibilitychange', handleVisibilityChange)
-    schedule(0, false)
-    return () => {
-      disposed = true
-      clearTimer()
-      document.removeEventListener('visibilitychange', handleVisibilityChange)
-    }
-  }, [load])
+  const { refresh: refreshOverview } = usePolling(fetchOverview, { intervalMs: 15_000, resetKey: tenantId })
+  // Action-triggered refreshes share the same in-flight request as automatic polling.
+  const load = useCallback((quiet = false) => {
+    if (!quiet) setLoading(true)
+    return refreshOverview()
+  }, [refreshOverview])
 
   useEffect(() => {
     if (!selectedOrchestrationId && !selectedResultTask) return

@@ -6,6 +6,7 @@ type ApiRequestOptions = RequestInit & {
 type ApiCallOptions = {
   skipTenant?: boolean
   timeoutMs?: number
+  signal?: AbortSignal
 }
 
 export class ApiNetworkError extends Error {
@@ -71,51 +72,72 @@ class ApiClient {
       headers['x-tenant-id'] = this.tenantId
     }
 
-    const { timeoutMs, ...fetchOptions } = options
+    const { timeoutMs, signal: callerSignal, ...fetchOptions } = options
     delete fetchOptions.skipTenant
     const timeoutController =
       Number.isFinite(timeoutMs) &&
-      Number(timeoutMs) > 0 &&
-      !fetchOptions.signal
+      Number(timeoutMs) > 0
         ? new AbortController()
         : null
+    const signal = timeoutController?.signal ?? callerSignal
+    let timedOut = false
+    const forwardAbort = () => timeoutController?.abort(callerSignal?.reason)
+    if (callerSignal?.aborted) forwardAbort()
+    else if (timeoutController) callerSignal?.addEventListener('abort', forwardAbort, { once: true })
     const timeoutId = timeoutController
-      ? window.setTimeout(() => timeoutController.abort(), Number(timeoutMs))
+      ? setTimeout(() => {
+        if (timeoutController.signal.aborted) return
+        timedOut = true
+        timeoutController.abort()
+      }, Number(timeoutMs))
       : null
-
-    let resp: Response
-    try {
-      resp = await fetch(`/api${path}`, {
-        credentials: 'same-origin',
-        ...fetchOptions,
-        ...(timeoutController ? { signal: timeoutController.signal } : {}),
-        headers,
-      })
-    } catch (error) {
-      if (timeoutController?.signal.aborted) {
+    const abortError = (cause?: unknown) => {
+      if (timedOut) {
         const timeoutError = new Error(
           '请求超时，云端暂未完成分配。请检查网络后重试；系统会自动识别重复提交。',
         ) as Error & { cause?: unknown }
-        timeoutError.cause = error
-        throw timeoutError
+        timeoutError.cause = cause
+        return timeoutError
       }
-      throw new ApiNetworkError(undefined, error)
-    } finally {
-      if (timeoutId !== null) window.clearTimeout(timeoutId)
+      return signal?.reason ?? new DOMException('The request was aborted', 'AbortError')
     }
 
-    let data: unknown
     try {
-      data = await resp.json()
-    } catch {
-      data = { ok: false, message: '响应格式错误' }
-    }
+      if (signal?.aborted) throw abortError()
+      let resp: Response
+      try {
+        resp = await fetch(`/api${path}`, {
+          credentials: 'same-origin',
+          ...fetchOptions,
+          signal,
+          headers,
+        })
+      } catch (error) {
+        if (signal?.aborted) throw abortError(error)
+        throw new ApiNetworkError(undefined, error)
+      }
 
-    if (!resp.ok) {
-      throw new ApiResponseError(responseMessage(data, '请求失败'), resp.status, data)
-    }
+      let data: unknown
+      try {
+        data = await resp.json()
+      } catch (error) {
+        // Aborting while the response body is still arriving must reject the
+        // read, not turn into a successful "响应格式错误" payload.
+        if (signal?.aborted) throw abortError(error)
+        if (!(error instanceof SyntaxError)) throw new ApiNetworkError(undefined, error)
+        data = { ok: false, message: '响应格式错误' }
+      }
+      if (signal?.aborted) throw abortError()
+      if (!resp.ok) {
+        throw new ApiResponseError(responseMessage(data, '请求失败'), resp.status, data)
+      }
 
-    return data as T
+      return data as T
+    } finally {
+      // Keep cancellation and the timeout active through body consumption.
+      if (timeoutId !== null) clearTimeout(timeoutId)
+      if (timeoutController) callerSignal?.removeEventListener('abort', forwardAbort)
+    }
   }
 
   get<T = unknown>(path: string, opts?: ApiCallOptions) {

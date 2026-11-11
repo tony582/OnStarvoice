@@ -1,3 +1,4 @@
+import { usePolling } from '@/hooks/usePolling'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Activity,
@@ -217,11 +218,11 @@ export function SocialAccountsPage() {
   const [accountError, setAccountError] = useState('')
   const [referencesOpen, setReferencesOpen] = useState(false)
 
-  const load = useCallback(async (quiet = false) => {
-    if (quiet) setRefreshing(true)
-    else setLoading(true)
+  const readOverview = useCallback(async (signal: AbortSignal) => {
+    setRefreshing(true)
     try {
-      const data = await api.get<SocialAccountsOverview>('/social-accounts/overview?days=7')
+      const data = await api.get<SocialAccountsOverview>('/social-accounts/overview?days=7', { signal })
+      if (signal.aborted) return
       setOverview({
         ...data,
         accounts: Array.isArray(data.accounts) ? data.accounts : [],
@@ -243,22 +244,14 @@ export function SocialAccountsPage() {
       })
       setError('')
     } catch (loadError) {
-      setError(loadError instanceof Error ? loadError.message : 'Agent 今日运行数据读取失败')
+      if (!signal.aborted) setError(loadError instanceof Error ? loadError.message : 'Agent 今日运行数据读取失败')
+      throw loadError
     } finally {
-      setLoading(false)
-      setRefreshing(false)
+      if (!signal.aborted) { setLoading(false); setRefreshing(false) }
     }
   }, [])
 
-  useEffect(() => {
-    let active = true
-    queueMicrotask(() => { if (active) void load() })
-    const refreshTimer = window.setInterval(() => { if (active) void load(true) }, 60_000)
-    return () => {
-      active = false
-      window.clearInterval(refreshTimer)
-    }
-  }, [tenantId, load])
+  const { refresh: load } = usePolling(readOverview, { intervalMs: 60_000, resetKey: tenantId })
 
   useEffect(() => {
     if (!editingAgent && !editingAccount && !linkingAccount) return
@@ -330,7 +323,7 @@ export function SocialAccountsPage() {
       )
       setFeedback('账号信息已更新；Agent 用量统计不受绑定变化影响')
       setEditingAgent(null)
-      await load(true)
+      await load()
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : '更新账号信息失败')
     } finally {
@@ -367,7 +360,7 @@ export function SocialAccountsPage() {
         : await api.patch<{ account: SocialAccount }>(`/social-accounts/${editingAccount.id}`, body)
       setEditingAccount(null)
       setFeedback(creating ? '账号已创建，可以继续关联 Agent 节点。' : '账号资料已保存，以本次人工登记信息为准。')
-      await load(true)
+      await load()
       if (creating) { setLinkingAccount({ ...result.account, bindings: result.account.bindings || [] }); setSelectedAgentIds([]) }
     } catch (saveError) { setAccountError(saveError instanceof Error ? saveError.message : '账号保存失败，请重试') }
     finally { setSaving(false) }
@@ -378,7 +371,7 @@ export function SocialAccountsPage() {
     try {
       await api.put(`/social-accounts/${linkingAccount.id}/bindings`, { agentIds: selectedAgentIds, bindingMode: 'manual' })
       setLinkingAccount(null); setFeedback('Agent 关联已保存。')
-      await load(true)
+      await load()
     } catch (saveError) { setAccountError(saveError instanceof Error ? saveError.message : '账号已保留，节点关联失败，请重试') }
     finally { setSaving(false) }
   }
@@ -472,7 +465,7 @@ export function SocialAccountsPage() {
               <option value="offline">当前离线</option>
               <option value="unbound">未登记账号</option>
             </select>
-            <Button variant="outline" size="sm" onClick={() => void load(true)} disabled={refreshing} className="h-10">
+            <Button variant="outline" size="sm" onClick={() => void load()} disabled={refreshing} className="h-10">
               <RefreshCw className={cn('h-4 w-4', refreshing && 'animate-spin')} />刷新
             </Button>
           </div>

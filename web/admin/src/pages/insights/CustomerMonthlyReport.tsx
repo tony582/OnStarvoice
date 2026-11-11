@@ -1,3 +1,4 @@
+import { usePolling } from '@/hooks/usePolling'
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { AlertCircle, CheckCircle2, Download, ExternalLink, FileText, Loader2, Mail, Printer, RefreshCw, X } from 'lucide-react'
 import { api } from '@/lib/api'
@@ -71,6 +72,7 @@ function CustomerMonthlyReportWorkspace() {
 
   useEffect(() => {
     const sequence = ++requestSequence.current
+    const controller = new AbortController()
     async function load() {
       // Reset inside the async task rather than synchronously in the effect
       // body (react-hooks/set-state-in-effect); the sequence guard keeps a
@@ -78,40 +80,44 @@ function CustomerMonthlyReportWorkspace() {
       setLoading(true)
       setNotice(null)
       setDeliveryNotice(null)
+      setCurrent(null)
       try {
-        const data = await api.get<{ reports: MonthlyReport[] }>(`${MONTHLY_API}/?month=${encodeURIComponent(month)}`)
-        if (!mounted.current || sequence !== requestSequence.current) return
+        const data = await api.get<{ reports: MonthlyReport[] }>(`${MONTHLY_API}/?month=${encodeURIComponent(month)}`, { signal: controller.signal })
+        if (!mounted.current || controller.signal.aborted || sequence !== requestSequence.current) return
         setReports(data.reports)
         const selected = data.reports[0]
         if (!selected) { setCurrent(null); return }
-        const detail = await api.get<ReportResponse>(`${MONTHLY_API}/${encodeURIComponent(selected.id)}`)
-        if (!mounted.current || sequence !== requestSequence.current) return
+        const detail = await api.get<ReportResponse>(`${MONTHLY_API}/${encodeURIComponent(selected.id)}`, { signal: controller.signal })
+        if (!mounted.current || controller.signal.aborted || sequence !== requestSequence.current) return
         setCurrent(detail)
       } catch (error) {
-        if (mounted.current && sequence === requestSequence.current) { setCurrent(null); setNotice({ kind: 'error', text: dailyError(error, '月报暂时无法读取，请稍后刷新。') }) }
+        if (mounted.current && !controller.signal.aborted && sequence === requestSequence.current) { setCurrent(null); setNotice({ kind: 'error', text: dailyError(error, '月报暂时无法读取，请稍后刷新。') }) }
       } finally {
-        if (mounted.current && sequence === requestSequence.current) setLoading(false)
+        if (mounted.current && !controller.signal.aborted && sequence === requestSequence.current) setLoading(false)
       }
     }
     void load()
+    return () => controller.abort()
   }, [month, reload])
 
-  useEffect(() => {
-    if (!report || !emailProcessing) return
-    const id = report.id
-    const timer = window.setInterval(async () => {
-      try {
-        const detail = await api.get<ReportResponse>(`${MONTHLY_API}/${encodeURIComponent(id)}`)
-        if (!mounted.current) return
-        setPollError('')
-        setCurrent(value => value?.report.id === id ? detail : value)
-        setReports(items => items.map(item => item.id === id ? detail.report : item))
-      } catch (error) {
-        if (mounted.current) setPollError(dailyError(error, '发送状态暂时无法刷新。'))
-      }
-    }, 5000)
-    return () => window.clearInterval(timer)
-  }, [report, emailProcessing])
+  const pollReport = useCallback(async (signal: AbortSignal) => {
+    const id = report?.id
+    if (!id) return
+    try {
+      const detail = await api.get<ReportResponse>(`${MONTHLY_API}/${encodeURIComponent(id)}`, { signal })
+      if (signal.aborted) return
+      setPollError('')
+      setCurrent(value => value?.report.id === id ? detail : value)
+      setReports(items => items.map(item => item.id === id ? detail.report : item))
+    } catch (error) {
+      if (!signal.aborted) setPollError(dailyError(error, '发送状态暂时无法刷新，系统会继续查询。'))
+      throw error
+    }
+  }, [report?.id])
+  usePolling(pollReport, {
+    intervalMs: 5000, enabled: !!report?.id && emailProcessing && !loading && !busy,
+    immediate: false, resetKey: `${month}:${reload}:${report?.id || ''}:${busy}:${loading}`,
+  })
 
   function chooseMonth(value: string) {
     if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(value) || value > currentMonth || operation.current) return

@@ -81,7 +81,7 @@ test('admin waits visibly, retries one safety challenge across Agents, and escal
   assert.doesNotMatch(orchestration, /本地关闭证明/u)
   assert.doesNotMatch(orchestration, /recovery\.sourceAgentHoldUntil/u)
   assert.doesNotMatch(orchestration, /recovery\.nextEvaluationAt/u)
-  assert.match(orchestration, /window\.setInterval\(refreshWhenVisible, 5_000\)/u)
+  assert.match(orchestration, /usePolling\(fetchDetail, \{\s*intervalMs: 5_000/u)
   assert.doesNotMatch(orchestration, /handoffAttentionSource/u)
   assert.doesNotMatch(orchestration, /sourceExecutionTaskId: attentionContext\.sourceTaskId/u)
   assert.match(

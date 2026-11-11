@@ -1,6 +1,8 @@
-import { useEffect, useRef, useState } from 'react'
+import { usePolling } from '@/hooks/usePolling'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Loader2, CheckCircle2 } from 'lucide-react'
 import { api } from '@/lib/api'
+import { useAuth } from '@/lib/auth'
 import { formatNumber } from '@/lib/utils'
 
 const POLL_MS = 6000
@@ -11,36 +13,34 @@ const POLL_MS = 6000
  * 进度按「本次会话见到的峰值评论数」做分母,刷新页面会以当前值为新基线(只影响进度条观感)。
  */
 export function ProcessingBanner() {
+  const { tenantId } = useAuth()
   const [pendingPosts, setPendingPosts] = useState(0)
   const [pendingComments, setPendingComments] = useState(0)
   const [peakComments, setPeakComments] = useState(0)
   const [justDone, setJustDone] = useState(false)
   const wasPendingRef = useRef(false)
 
-  useEffect(() => {
-    let alive = true
-    let timer: ReturnType<typeof setTimeout>
-    const poll = async () => {
-      try {
-        const d = await api.get<any>('/workspace/processing')
-        if (!alive) return
-        const posts = Number(d.pendingPosts || 0)
-        const comments = Number(d.pendingComments || 0)
-        setPeakComments(previous => Math.max(previous, comments))
-        setPendingPosts(posts)
-        setPendingComments(comments)
-        if (posts === 0 && wasPendingRef.current) {
-          setJustDone(true)
-          setPeakComments(0)
-          setTimeout(() => { if (alive) setJustDone(false) }, 6000)
-        }
-        wasPendingRef.current = posts > 0
-      } catch { /* 静默:进度条非关键路径,失败不打扰用户 */ }
-      if (alive) timer = setTimeout(poll, POLL_MS)
+  const readProcessing = useCallback(async (signal: AbortSignal) => {
+    const data = await api.get<any>('/workspace/processing', { signal })
+    if (signal.aborted) return
+    const posts = Number(data.pendingPosts || 0)
+    const comments = Number(data.pendingComments || 0)
+    setPeakComments(previous => Math.max(previous, comments))
+    setPendingPosts(posts)
+    setPendingComments(comments)
+    if (posts === 0 && wasPendingRef.current) {
+      setJustDone(true)
+      setPeakComments(0)
     }
-    poll()
-    return () => { alive = false; clearTimeout(timer) }
+    wasPendingRef.current = posts > 0
   }, [])
+  usePolling(readProcessing, { intervalMs: POLL_MS, resetKey: tenantId })
+
+  useEffect(() => {
+    if (!justDone) return
+    const timer = window.setTimeout(() => setJustDone(false), 6000)
+    return () => window.clearTimeout(timer)
+  }, [justDone])
 
   if (pendingPosts > 0) {
     const peak = Math.max(peakComments, pendingComments, 1)

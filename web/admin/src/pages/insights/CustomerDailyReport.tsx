@@ -1,3 +1,4 @@
+import { usePolling } from '@/hooks/usePolling'
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { AlertCircle, CheckCircle2, Copy, Download, ExternalLink, FileText, Loader2, Mail, Pencil, Printer, RefreshCw, Save, Send, X } from 'lucide-react'
 import { api } from '@/lib/api'
@@ -127,6 +128,7 @@ function CustomerDailyReportWorkspace() {
 
   useEffect(() => {
     const sequence = ++requestSequence.current
+    const controller = new AbortController()
     let cancelled = false
     async function loadDate() {
       setLoading(true)
@@ -139,13 +141,13 @@ function CustomerDailyReportWorkspace() {
       setConfirmRegenerate(false)
       setReports([])
       try {
-        const data = await api.get<{ reports: DailyReport[] }>(`${DAILY_API}/?date=${encodeURIComponent(date)}`)
+        const data = await api.get<{ reports: DailyReport[] }>(`${DAILY_API}/?date=${encodeURIComponent(date)}`, { signal: controller.signal })
         if (cancelled || sequence !== requestSequence.current) return
         setReports(data.reports || [])
         const selected = data.reports?.find(item => item.id === versionToReload.current) || data.reports?.[0]
         versionToReload.current = null
         if (selected) {
-          const detail = await api.get<ReportResponse>(`${DAILY_API}/${encodeURIComponent(selected.id)}`)
+          const detail = await api.get<ReportResponse>(`${DAILY_API}/${encodeURIComponent(selected.id)}`, { signal: controller.signal })
           if (!cancelled && sequence === requestSequence.current) setCurrent(detail)
         }
       } catch (error) {
@@ -155,34 +157,27 @@ function CustomerDailyReportWorkspace() {
       }
     }
     void loadDate()
-    return () => { cancelled = true }
+    return () => { cancelled = true; controller.abort() }
   }, [date, reload])
 
-  useEffect(() => {
-    if (!report?.id || !anyProcessing) return
-    const id = report.id
-    let stopped = false
-    let timer: ReturnType<typeof setTimeout>
-    let failures = 0
-    async function poll() {
-      try {
-        const detail = await api.get<ReportResponse>(`${DAILY_API}/${encodeURIComponent(id)}`)
-        if (stopped) return
-        failures = 0
-        setPollError('')
-        setCurrent(value => value?.report.id === id ? detail : value)
-        setReports(value => value.map(item => item.id === id ? detail.report : item))
-        if (!pendingStatuses.has(detail.report.delivery?.status || 'none') && !['queued', 'working'].includes(detail.report.emailDelivery?.status || 'none')) return
-      } catch (error) {
-        if (stopped) return
-        failures += 1
-        setPollError(dailyError(error, '暂时无法更新发送状态，系统会继续查询。'))
-      }
-      timer = setTimeout(() => void poll(), Math.min(30000, 4000 * (failures + 1)))
+  const pollReport = useCallback(async (signal: AbortSignal) => {
+    const id = report?.id
+    if (!id) return
+    try {
+      const detail = await api.get<ReportResponse>(`${DAILY_API}/${encodeURIComponent(id)}`, { signal })
+      if (signal.aborted) return
+      setPollError('')
+      setCurrent(value => value?.report.id === id ? detail : value)
+      setReports(items => items.map(item => item.id === id ? detail.report : item))
+    } catch (error) {
+      if (!signal.aborted) setPollError(dailyError(error, '发送状态暂时无法刷新，系统会继续查询。'))
+      throw error
     }
-    timer = setTimeout(() => void poll(), 3000)
-    return () => { stopped = true; clearTimeout(timer) }
-  }, [report?.id, anyProcessing])
+  }, [report?.id])
+  usePolling(pollReport, {
+    intervalMs: 3000, enabled: !!report?.id && anyProcessing && !loading && !busy,
+    immediate: false, resetKey: `${date}:${reload}:${report?.id || ''}:${busy}:${loading}`,
+  })
 
   function chooseDate(value: string) {
     if (!value || value > today || operation.current || summaryDraft) return

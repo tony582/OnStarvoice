@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { usePolling } from '@/hooks/usePolling'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ArrowLeft, ArrowRight, ChevronDown, ChevronLeft, ChevronRight, Database, Download, ExternalLink, FileText,
   Filter, Image as ImageIcon, Layers3, Loader2, RefreshCw, Search, X,
@@ -1831,27 +1832,24 @@ function AttachmentDownloadCell({ row }: { row: any }) {
 }
 
 // 视频逐字稿单元:有结果显示文本;没结果给「生成逐字稿」按钮(异步转写 + 轮询)
-const TRANSCRIPT_TERMINAL = ['done', 'failed', 'expired', 'no_media']
+const TRANSCRIPT_TERMINAL = ['done', 'failed', 'expired', 'no_media', 'no_speech']
 function TranscriptCell({ row }: { row: any }) {
   const initialText = String(row?.transcript || videoTranscript(row) || '')
   const [status, setStatus] = useState<string>(row?.transcript_status || (initialText ? 'done' : 'none'))
   const [text, setText] = useState<string>(initialText)
   const [error, setError] = useState<string>(row?.transcript_error || '')
   const [busy, setBusy] = useState(false)
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  const stopPoll = () => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null } }
-  useEffect(() => stopPoll, [])
-
-  const startPoll = () => {
-    stopPoll()
-    pollRef.current = setInterval(async () => {
-      try {
-        const d: any = await api.get(`/records/${row.id}/transcript`)
-        setStatus(d.transcript_status || 'none'); setText(d.transcript || ''); setError(d.transcript_error || '')
-        if (TRANSCRIPT_TERMINAL.includes(d.transcript_status)) { stopPoll(); setBusy(false) }
-      } catch { /* 下个周期再试 */ }
-    }, 3500)
-  }
+  const readTranscript = useCallback(async (signal: AbortSignal) => {
+    const data: any = await api.get(`/records/${row.id}/transcript`, { signal })
+    if (signal.aborted) return
+    setStatus(data.transcript_status || 'none')
+    setText(data.transcript || '')
+    setError(data.transcript_error || '')
+    if (TRANSCRIPT_TERMINAL.includes(data.transcript_status)) setBusy(false)
+  }, [row.id])
+  const { refresh: refreshTranscript } = usePolling(readTranscript, {
+    intervalMs: 3500, enabled: status === 'pending' || status === 'processing', resetKey: row.id,
+  })
 
   const generate = async () => {
     if (!row?.id || busy) return
@@ -1860,8 +1858,8 @@ function TranscriptCell({ row }: { row: any }) {
       const d: any = await api.post(`/records/${row.id}/transcribe`, {})
       setStatus(d.status || 'pending')
       if (d.status === 'no_media') { setBusy(false); return }
-      if (d.status === 'pending' || d.status === 'processing') startPoll()
-      else setBusy(false)
+      if (d.status !== 'pending' && d.status !== 'processing') setBusy(false)
+      await refreshTranscript()
     } catch (e: any) {
       setStatus('failed'); setError(e?.message || '触发失败'); setBusy(false)
     }

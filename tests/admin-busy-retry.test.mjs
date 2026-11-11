@@ -196,24 +196,27 @@ test('failed responses keep their status, code and retry hint for the pages', ()
   assert.match(api, /this\.retryAfterMs = Number\.isFinite\(retryAfterMs\) && retryAfterMs > 0 \? retryAfterMs : null/u);
 });
 
-test('the dispatch page keeps its board through a busy server', () => {
+test('the dispatch page keeps its board through a busy server and shares abortable polling', () => {
   const page = source('web/admin/src/pages/dispatch/DispatchPage.tsx');
-  // What the page does with a read is decided by overviewReadOutcome (tested above); this pins the wiring.
-  assert.match(page, /const previous = \{ loaded: overviewLoaded\.current, failureCount: overviewLoadFailureCount\.current \}/u);
-  // No data yet: retry before showing an empty board. Data shown: one read per poll.
-  assert.match(page, /readWithBusyRetry\(\s*\(\) => api\.get<[^\n]+>\('\/capture-cloud\/overview'\),\s*\{ retries: previous\.loaded \? 0 : 3 \},\s*\)/u);
-  assert.match(page, /setOverview\(\{[^\n]+\}\)\s*outcome = overviewReadOutcome\(previous, \{ data \}\)\s*\} catch \(err\) \{\s*outcome = overviewReadOutcome\(previous, \{ error: err \}\)\s*\} finally \{\s*setLoading\(false\)\s*setRefreshing\(false\)\s*\}/u);
-  assert.match(page, /overviewLoaded\.current = outcome\.loaded\s*overviewLoadBusy\.current = outcome\.busy\s*overviewLoadFailureCount\.current = outcome\.failureCount\s*setRefreshNotice\(outcome\.notice\)\s*setError\(outcome\.error\)/u);
-  assert.match(page, /schedule\(overviewNextPollDelayMs\(\{\s*failureCount: overviewLoadFailureCount\.current,\s*busy: overviewLoadBusy\.current,\s*\}\)\)/u);
+  assert.match(page, /overviewReadOutcome\(previous, \{ data \}\)/u);
+  assert.match(page, /overviewReadOutcome\(previous, \{ error: err \}\)/u);
+  assert.match(page, /'\/capture-cloud\/overview', \{ signal \}/u);
+  assert.match(page, /retries: previous\.loaded \? 0 : 3, signal/u);
+  assert.match(page, /usePolling\(fetchOverview, \{ intervalMs: 15_000, resetKey: tenantId \}\)/u);
+  assert.match(page, /return refreshOverview\(\)/u);
+  assert.match(page, /if \(failure\) throw failure/u);
   assert.match(page, /\{!error && refreshNotice && <div role="status" aria-live="polite"/u);
-  assert.doesNotMatch(page, /15_000 \* retryMultiplier/u);
+  assert.doesNotMatch(page, /setInterval|overviewLoadInFlight/u);
 });
 
-test('sidebar counts ask for a recount only after the caller changed data', () => {
+test('sidebar counts serialize polling and preserve mutation recount intent', () => {
   const badges = source('web/admin/src/lib/badges.tsx');
   assert.match(badges, /fresh \? '\/workspace\/badges\?fresh=1' : '\/workspace\/badges'/u);
-  assert.match(badges, /const refresh = useCallback\(\(\) => read\(true\), \[read\]\)/u);
-  assert.match(badges, /read\(false\)\s+const timer = window\.setInterval\(\(\) => read\(false\), POLL_MS\)/u);
-  assert.match(badges, /if \(document\.visibilityState === 'visible'\) read\(false\)/u);
+  assert.match(badges, /usePolling\(read, \{/u);
+  assert.match(badges, /intervalMs: POLL_MS, enabled: !!badgeScope, resetKey: badgeScope/u);
+  assert.match(badges, /freshScopeRef\.current === freshRequest/u);
+  assert.match(badges, /revision: freshScopeRef\.current\.revision \+ 1/u);
+  assert.match(badges, /void refreshPolling\(\)/u);
+  assert.doesNotMatch(badges, /setInterval/u);
   assert.match(badges, /<BadgesContext\.Provider value=\{\{ badges, features, refresh \}\}>/u);
 });

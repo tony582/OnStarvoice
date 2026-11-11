@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react'
+import { usePolling } from '@/hooks/usePolling'
+import { useCallback, useEffect, useState } from 'react'
 import {
   AlertTriangle, ArrowLeft, ArrowRight, Check, ClipboardList, Copy, Loader2,
   MessageSquare, Plus, Quote, Radar, RotateCcw, ScanSearch, ShieldAlert,
@@ -56,15 +57,23 @@ function fmtDay(v?: string | null) {
 }
 
 export function OpinionAnalysisPage() {
-  const { canWrite } = useAuth()
+  const { canWrite, tenantId } = useAuth()
   const [items, setItems] = useState<TopicAnalysis[]>([])
   const [loading, setLoading] = useState(true)
+  const [listScope, setListScope] = useState<string | null>(null)
   const [creating, setCreating] = useState(false)
   const [selectedId, setSelectedId] = useState('')
   const [detail, setDetail] = useState<TopicAnalysis | null>(null)
   const [detailError, setDetailError] = useState('')
   const [drawerRecord, setDrawerRecord] = useState<any>(null)
   const [drawerBusy, setDrawerBusy] = useState(false)
+
+  // Every entry is a new read, including reopening the same completed analysis.
+  const selectAnalysis = useCallback((id: string) => {
+    setDetail(null)
+    setDetailError('')
+    setSelectedId(id)
+  }, [])
 
   // 证据回链页内下钻:按 recordId 薄取整行 → 打开 RecordDrawer(自带「深度剖析」tab)。
   const openRecord = async (recordId: string) => {
@@ -80,49 +89,45 @@ export function OpinionAnalysisPage() {
     }
   }
 
-  const loadList = () => api.get<any>('/opinion-analysis/topics')
-    .then(d => setItems(d.analyses || []))
-    .catch(console.error)
-
-  useEffect(() => { loadList().finally(() => setLoading(false)) }, [])
-
-  // 列表停留时对排队/运行中的行保持轮询,让状态徽章自己走到 done/failed
-  useEffect(() => {
-    if (selectedId || !items.some(x => x.status === 'pending' || x.status === 'running')) return
-    const timer = window.setTimeout(loadList, 2500)
-    return () => window.clearTimeout(timer)
-  }, [items, selectedId])
-
-  // 详情轮询:pending/running 每 2.5s 刷一次,done/failed 停
-  useEffect(() => {
-    let alive = true
-    if (!selectedId) {
-      queueMicrotask(() => { if (alive) setDetail(null) })
-      return () => { alive = false }
+  const readList = useCallback(async (signal: AbortSignal) => {
+    try {
+      const data = await api.get<any>('/opinion-analysis/topics', { signal })
+      if (!signal.aborted) { setItems(data.analyses || []); setListScope(tenantId) }
+    } finally {
+      if (!signal.aborted) setLoading(false)
     }
-    let timer: number | undefined
-    const tick = async () => {
-      try {
-        const d = await api.get<any>(`/opinion-analysis/topics/${selectedId}`)
-        if (!alive) return
-        const row = d.analysis
-        setDetail(row)
-        setDetailError('')
-        setItems(prev => prev.map(x => x.id === row.id ? { ...x, ...row, payload: undefined } : x))
-        if (row.status === 'pending' || row.status === 'running') timer = window.setTimeout(tick, 2500)
-      } catch (err) {
-        if (alive) setDetailError(err instanceof Error ? err.message : '加载剖析详情失败')
-      }
+  }, [tenantId])
+  usePolling(readList, {
+    intervalMs: 2500,
+    enabled: !selectedId && (listScope !== tenantId || items.some(item => item.status === 'pending' || item.status === 'running')),
+    resetKey: `${tenantId}:${selectedId}`,
+  })
+
+  const readDetail = useCallback(async (signal: AbortSignal) => {
+    if (!selectedId) return
+    try {
+      const data = await api.get<any>(`/opinion-analysis/topics/${selectedId}`, { signal })
+      if (signal.aborted) return
+      const row = data.analysis
+      setDetail(row)
+      setDetailError('')
+      setItems(previous => previous.map(item => item.id === row.id ? { ...item, ...row, payload: undefined } : item))
+    } catch (error) {
+      if (!signal.aborted) setDetailError(error instanceof Error ? error.message : '加载剖析详情失败')
+      throw error
     }
-    tick()
-    return () => { alive = false; if (timer) window.clearTimeout(timer) }
   }, [selectedId])
+  usePolling(readDetail, {
+    intervalMs: 2500,
+    enabled: !!selectedId && (detail?.id !== selectedId || detail?.status === 'pending' || detail?.status === 'running'),
+    resetKey: `${tenantId}:${selectedId}`,
+  })
 
   const rerun = async (id: string) => {
     try {
       const d = await api.post<any>(`/opinion-analysis/topics/${id}/rerun`)
       setItems(prev => [d.analysis, ...prev])
-      setSelectedId(d.analysis.id)
+      selectAnalysis(d.analysis.id)
     } catch (err) {
       window.alert(err instanceof Error ? err.message : '重跑失败')
     }
@@ -133,7 +138,7 @@ export function OpinionAnalysisPage() {
     try {
       await api.delete(`/opinion-analysis/topics/${id}`)
       setItems(prev => prev.filter(x => x.id !== id))
-      if (selectedId === id) setSelectedId('')
+      if (selectedId === id) selectAnalysis('')
     } catch (err) {
       window.alert(err instanceof Error ? err.message : '删除失败')
     }
@@ -145,7 +150,7 @@ export function OpinionAnalysisPage() {
     return (
       <>
         <DetailView detail={detail} error={detailError} canWrite={canWrite()}
-          onBack={() => setSelectedId('')} onRerun={() => rerun(selectedId)} onDelete={() => remove(selectedId)}
+          onBack={() => selectAnalysis('')} onRerun={() => rerun(selectedId)} onDelete={() => remove(selectedId)}
           onOpenRecord={openRecord} />
         {drawerRecord && (
           <RecordDrawer record={drawerRecord} onClose={() => setDrawerRecord(null)}
@@ -171,14 +176,14 @@ export function OpinionAnalysisPage() {
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
           {items.map(item => (
             <AnalysisCard key={item.id} item={item} canWrite={canWrite()}
-              onOpen={() => setSelectedId(item.id)} onRerun={() => rerun(item.id)} onDelete={() => remove(item.id)} />
+              onOpen={() => selectAnalysis(item.id)} onRerun={() => rerun(item.id)} onDelete={() => remove(item.id)} />
           ))}
         </div>
       )}
 
       {creating && (
         <CreateDrawer onClose={() => setCreating(false)}
-          onCreated={a => { setCreating(false); setItems(prev => [a, ...prev]); setSelectedId(a.id) }} />
+          onCreated={a => { setCreating(false); setItems(prev => [a, ...prev]); selectAnalysis(a.id) }} />
       )}
     </div>
   )

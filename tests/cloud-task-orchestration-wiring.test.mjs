@@ -315,7 +315,9 @@ test('API supports opt-in timeouts without changing every request', async () => 
   const api = await read('web/admin/src/lib/api.ts');
 
   assert.match(api, /timeoutMs\?: number/u);
-  assert.match(api, /!fetchOptions\.signal[\s\S]*new AbortController/u);
+  assert.match(api, /signal\?: AbortSignal/u);
+  assert.match(api, /callerSignal\?\.addEventListener\('abort', forwardAbort/u);
+  assert.match(api, /timeoutController\?\.abort\(callerSignal\?\.reason\)/u);
   assert.match(api, /timeoutController\.abort\(\)/u);
   assert.match(api, /请求超时，云端暂未完成分配/u);
   assert.doesNotMatch(api, /timeoutMs\s*=\s*\d+/u);

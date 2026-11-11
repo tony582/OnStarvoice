@@ -22,6 +22,7 @@ import {
   X,
 } from 'lucide-react'
 import { api } from '@/lib/api'
+import { usePolling } from '@/hooks/usePolling'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import type {
@@ -397,7 +398,6 @@ export function OrchestrationDetailWorkspace({
   const [actionError, setActionError] = useState('')
   const [error, setError] = useState('')
   const [nowMs, setNowMs] = useState(() => Date.now())
-  const loadGeneration = useRef(0)
   const pendingNegativeReassign = useRef<{
     fingerprint: string
     requestKey: string
@@ -408,26 +408,38 @@ export function OrchestrationDetailWorkspace({
   } | null>(null)
   const pendingScheduleRunNow = useRef<string | null>(null)
 
-  const load = useCallback(async (quiet = false, showRefreshIndicator = true) => {
+  const fetchDetail = useCallback(async (signal: AbortSignal) => {
     if (!orchestrationId) return
-    const generation = ++loadGeneration.current
-    if (!quiet) setLoading(true)
-    else if (showRefreshIndicator) setRefreshing(true)
     try {
-      const result = await api.get<OrchestrationDetailResponse>(`/capture-cloud/orchestrations/${orchestrationId}`)
-      if (generation !== loadGeneration.current) return
+      const result = await api.get<OrchestrationDetailResponse>(`/capture-cloud/orchestrations/${orchestrationId}`, { signal })
+      if (signal.aborted) return
       setDetail(result)
       setError('')
     } catch (err) {
-      if (generation !== loadGeneration.current) return
+      if (signal.aborted) return
       setError(err instanceof Error ? err.message : '读取编排任务详情失败')
+      throw err
     } finally {
-      if (generation === loadGeneration.current) {
-        if (!quiet) setLoading(false)
-        if (showRefreshIndicator) setRefreshing(false)
+      if (!signal.aborted) {
+        setLoading(false)
+        setRefreshing(false)
       }
     }
   }, [orchestrationId])
+
+  const detailFinal = detail?.orchestration.id === orchestrationId
+    && FINAL_ORCHESTRATION_STATUSES.has(String(detail?.orchestration.status || ''))
+  const { refresh: refreshDetail } = usePolling(fetchDetail, {
+    intervalMs: 5_000,
+    enabled: Boolean(orchestrationId) && !resultView && !detailFinal,
+    immediate: false,
+    resetKey: orchestrationId || '',
+  })
+  const load = useCallback((quiet = false) => {
+    if (!quiet) setLoading(true)
+    else setRefreshing(true)
+    return refreshDetail()
+  }, [refreshDetail])
 
   /* eslint-disable react-hooks/set-state-in-effect -- an id change intentionally replaces the displayed remote record */
   useEffect(() => {
@@ -441,12 +453,10 @@ export function OrchestrationDetailWorkspace({
     pendingNegativeReassign.current = null
     pendingKeywordRetry.current = null
     pendingScheduleRunNow.current = null
-    if (!orchestrationId) {
-      setLoading(false)
-      return
-    }
-    void load()
-  }, [load, orchestrationId, refreshKey])
+    setLoading(Boolean(orchestrationId))
+    setRefreshing(false)
+    if (orchestrationId) void refreshDetail()
+  }, [orchestrationId, refreshDetail, refreshKey])
   /* eslint-enable react-hooks/set-state-in-effect */
 
   const sortedItems = useMemo(
@@ -501,7 +511,6 @@ export function OrchestrationDetailWorkspace({
   const isScheduleTemplate =
     detail?.orchestration.metadata?.orchestrationTemplate === true
   const metadata = detail?.orchestration.metadata || {}
-  const detailFinal = FINAL_ORCHESTRATION_STATUSES.has(String(detail?.orchestration.status || ''))
   const elasticPool = metadata.distributionMode === 'elastic_pool'
     || detail?.schedule?.distribution_mode === 'elastic_pool'
   const eachAgentCoverage = objectRecord(metadata.planSnapshot).keywordCoverage === 'each_agent'
@@ -940,19 +949,6 @@ export function OrchestrationDetailWorkspace({
     agentsById, contentPatrol, detail, elasticPool, elasticPoolAgentIds, elasticRoundAgents,
     executionsById, isScheduleTemplate, nowMs, sortedItems, stopFencedAgentIds,
   ])
-
-  useEffect(() => {
-    if (!orchestrationId || resultView || detailFinal) return
-    const refreshWhenVisible = () => {
-      if (document.visibilityState === 'visible') void load(true, false)
-    }
-    const timer = window.setInterval(refreshWhenVisible, 5_000)
-    document.addEventListener('visibilitychange', refreshWhenVisible)
-    return () => {
-      window.clearInterval(timer)
-      document.removeEventListener('visibilitychange', refreshWhenVisible)
-    }
-  }, [detailFinal, load, orchestrationId, resultView])
 
   useEffect(() => {
     if (!orchestrationId || resultView || detailFinal) return

@@ -1,4 +1,5 @@
-import { createContext, useContext, useState, useEffect, useCallback, useRef, type ReactNode } from 'react'
+import { usePolling } from '@/hooks/usePolling'
+import { createContext, useContext, useState, useCallback, useRef, type ReactNode } from 'react'
 import { api } from './api'
 import { useAuth } from './auth'
 
@@ -53,49 +54,34 @@ export function BadgesProvider({ children }: { children: ReactNode }) {
   })
   const badges = badgeState.scope === badgeScope ? badgeState.badges : EMPTY
   const features = badgeState.scope === badgeScope ? badgeState.features : EMPTY_FEATURES
-  // 标识当前生效的拉取批次:租户切换/卸载时递增,丢弃在途的旧响应,避免计数串租户
-  const tokenRef = useRef(0)
-  const invalidatePending = useCallback(() => {
-    tokenRef.current += 1
-  }, [])
-
-  // fresh=1：调用方刚改过数据，服务端必须在这次请求之后重新计数；
-  // 定时与切回页面的读取不带它，可复用服务端 20 秒内的结果。
-  const read = useCallback((fresh: boolean) => {
+  // Mutation refreshes must bypass the server cache; keep that intent until a
+  // successful read so aborting a hidden tab cannot lose it.
+  const freshScopeRef = useRef({ scope: '', revision: 0 })
+  const read = useCallback(async (signal: AbortSignal) => {
     if (!user || !tenantId) return
-    const token = ++tokenRef.current
-    api.get<{ ok: boolean; badges: Badges; features?: Partial<WorkspaceFeatures> }>(
-      fresh ? '/workspace/badges?fresh=1' : '/workspace/badges',
+    const freshRequest = freshScopeRef.current
+    const fresh = freshRequest.scope === badgeScope
+    const data = await api.get<{ ok: boolean; badges: Badges; features?: Partial<WorkspaceFeatures> }>(
+      fresh ? '/workspace/badges?fresh=1' : '/workspace/badges', { signal },
     )
-      .then(data => {
-        if (token === tokenRef.current && data?.ok) {
-          const commentRiskAttentionEnabled = data.features?.commentRiskAttentionEnabled !== false
-          setBadgeState({
-            scope: badgeScope,
-            badges: { ...EMPTY, ...(data.badges || {}) },
-            features: {
-              loaded: true,
-              commentRiskAttentionEnabled,
-            },
-          })
-        }
-      })
-      .catch(() => {})
-  }, [badgeScope, user, tenantId])
-  const refresh = useCallback(() => read(true), [read])
-
-  useEffect(() => {
-    invalidatePending() // 租户变更立即作废在途请求
-    read(false)
-    const timer = window.setInterval(() => read(false), POLL_MS)
-    const onVisible = () => { if (document.visibilityState === 'visible') read(false) }
-    document.addEventListener('visibilitychange', onVisible)
-    return () => {
-      invalidatePending()
-      window.clearInterval(timer)
-      document.removeEventListener('visibilitychange', onVisible)
+    if (signal.aborted || !data?.ok) return
+    if (fresh && freshScopeRef.current === freshRequest) {
+      freshScopeRef.current = { scope: '', revision: freshRequest.revision }
     }
-  }, [invalidatePending, read])
+    const commentRiskAttentionEnabled = data.features?.commentRiskAttentionEnabled !== false
+    setBadgeState({
+      scope: badgeScope,
+      badges: { ...EMPTY, ...(data.badges || {}) },
+      features: { loaded: true, commentRiskAttentionEnabled },
+    })
+  }, [badgeScope, user, tenantId])
+  const { refresh: refreshPolling } = usePolling(read, {
+    intervalMs: POLL_MS, enabled: !!badgeScope, resetKey: badgeScope,
+  })
+  const refresh = useCallback(() => {
+    freshScopeRef.current = { scope: badgeScope, revision: freshScopeRef.current.revision + 1 }
+    void refreshPolling()
+  }, [badgeScope, refreshPolling])
 
   return (
     <BadgesContext.Provider value={{ badges, features, refresh }}>
