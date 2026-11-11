@@ -4,13 +4,14 @@ import {
   Filter, Image as ImageIcon, Layers3, Loader2, RefreshCw, Search, X,
 } from 'lucide-react'
 import { api } from '@/lib/api'
-import { formatDate, formatNumber, formatRecordMetric, platformName, friendlyError } from '@/lib/utils'
+import { formatDate, formatNumber, formatRecordMetric, platformName, friendlyError, proxiedImg } from '@/lib/utils'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { WorkbenchSelect, WorkbenchTableShell, WorkbenchTabs, WorkbenchToolbar } from '@/components/shared/Workbench'
 import { DateRangeFilter, type DateBasis } from '@/components/shared/DateRangeFilter'
+import { recordDisplayCover, recordDisplayAvatar } from '@/components/shared/record-images'
 import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
 import { useNav } from '@/lib/navigation'
 import { recordDisplayTitle, resolveRecordOriginalUrl } from '@/lib/record-display'
@@ -592,7 +593,7 @@ function MobileDataFilters({
 }
 
 function MobileRecordCard({ row, table, onOpen }: { row: any; table: TableKey; onOpen: () => void }) {
-  const cover = table === 'blogger_profiles' ? avatarUrl(row) : primaryImage(row)
+  const cover = table === 'blogger_profiles' ? displayAvatar(row) : displayCover(row)
   const title = mobileRecordTitle(row, table)
   const subtitle = mobileRecordSubtitle(row, table)
   const stats = mobileRecordStats(row, table)
@@ -607,7 +608,7 @@ function MobileRecordCard({ row, table, onOpen }: { row: any; table: TableKey; o
       <span className="absolute inset-y-3 left-0 w-1 rounded-r-full bg-primary/70" />
       <span className="flex items-start gap-3">
         {cover ? (
-          <img src={proxyImg(String(cover))} alt="" className="h-[74px] w-[62px] shrink-0 rounded-xl border border-border object-cover" loading="lazy" referrerPolicy="no-referrer" />
+          <img src={proxiedImg(String(cover))} alt="" className="h-[74px] w-[62px] shrink-0 rounded-xl border border-border object-cover" loading="lazy" referrerPolicy="no-referrer" />
         ) : (
           <span className="flex h-[74px] w-[62px] shrink-0 items-center justify-center rounded-xl border border-border bg-muted text-muted-foreground">
             {table === 'blogger_profiles' ? <Database className="h-5 w-5" /> : <FileText className="h-5 w-5" />}
@@ -701,8 +702,8 @@ function MobileRecordDetail({
       <main className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4">
         <div className="mb-4 overflow-hidden rounded-2xl border border-border bg-card">
           <div className="flex gap-3 p-4">
-            {primaryImage(row) && (
-              <img src={proxyImg(String(primaryImage(row)))} alt="" className="h-20 w-16 shrink-0 rounded-xl border border-border object-cover" referrerPolicy="no-referrer" />
+            {displayCover(row) && (
+              <img src={proxiedImg(displayCover(row))} alt="" className="h-20 w-16 shrink-0 rounded-xl border border-border object-cover" referrerPolicy="no-referrer" />
             )}
             <div className="min-w-0 flex-1">
               <p className="text-[15px] font-bold leading-6 text-foreground">{mobileRecordTitle(row, table)}</p>
@@ -905,7 +906,7 @@ function columnsForTable(table: TableKey, platform = ''): Column[] {
     col('account', '账号属性', r => textCell(r.blogger_account_type || value(r, 'payload.accountType'))),
     col('type', '笔记类型', r => textCell(noteTypeLabel(r))),
     col('coverLink', '封面链接', r => linkCell(primaryImage(r), '封面')),
-    col('cover', '封面图', r => imageCell(primaryImage(r), r.title)),
+    col('cover', '封面图', r => imageCell(displayCover(r), r.title)),
     col('title', '标题', (r, ctx) => longCell(recordDisplayTitle(r), 180, ctx)),
     col('content', '正文', (r, ctx) => longCell(r.content, 220, ctx)),
     col('tags', '话题标签', r => tagCell(r.tags)),
@@ -921,7 +922,7 @@ function keywordNoteColumns(platform: string): Column[] {
       col('author', '博主', r => textCell(r.author_name)),
       col('profile', '博主主页', r => linkCell(authorHomepage(r), '查看博主主页')),
       col('title', '标题', (r, ctx) => longCell(recordDisplayTitle(r), 180, ctx)),
-      col('cover', '封面图', r => imageCell(primaryImage(r), r.title)),
+      col('cover', '封面图', r => imageCell(displayCover(r), r.title)),
       col('likes', '点赞数', r => <span className="tabular-nums">{formatRecordMetric(r, 'likes')}</span>),
       col('collects', '收藏/推荐', r => <span className="tabular-nums">{formatRecordMetric(r, 'collects')}</span>),
       col('comments', '评论数', r => <span className="tabular-nums">{formatRecordMetric(r, 'comments_count')}</span>),
@@ -948,7 +949,7 @@ function keywordNoteColumns(platform: string): Column[] {
     col('title', '标题', (r, ctx) => longCell(recordDisplayTitle(r), 180, ctx)),
     col('content', '正文', (r, ctx) => longCell(r.content, 220, ctx)),
     col('tags', '话题标签', r => tagCell(r.tags)),
-    col('cover', '封面图', r => imageCell(primaryImage(r), r.title)),
+    col('cover', '封面图', r => imageCell(displayCover(r), r.title)),
     col('likes', '点赞数', r => <span className="tabular-nums">{formatRecordMetric(r, 'likes')}</span>),
     col('collects', '收藏/推荐', r => <span className="tabular-nums">{formatRecordMetric(r, 'collects')}</span>),
     col('comments', '评论数', r => <span className="tabular-nums">{formatRecordMetric(r, 'comments_count')}</span>),
@@ -977,7 +978,7 @@ function bloggerProfileColumns(platform: string): Column[] {
   columns.push(
     col('profile', '主页链接', r => linkCell(authorHomepage(r) || r.url, '查看博主主页')),
     col('avatarLink', '头像链接', r => linkCell(avatarUrl(r), '头像')),
-    col('avatar', '头像', r => imageCell(avatarUrl(r), r.author_name)),
+    col('avatar', '头像', r => imageCell(displayAvatar(r), r.author_name)),
     col('id', '小红书号', r => textCell(bloggerIdentifier(r))),
     col('desc', '简介', (r, ctx) => longCell(r.content || value(r, 'payload.description'), 180, ctx)),
     col('ip', 'IP属地', r => textCell(value(r, 'payload.ipLocation') || value(r, 'payload.region'))),
@@ -1001,7 +1002,7 @@ function bloggerNoteColumns(platform: string): Column[] {
       col('type', '笔记类型', r => textCell(noteTypeLabel(r))),
       col('title', '标题', (r, ctx) => longCell(recordDisplayTitle(r), 180, ctx)),
       col('coverLink', '封面链接', r => linkCell(primaryImage(r), '封面')),
-      col('cover', '封面图', r => imageCell(primaryImage(r), r.title)),
+      col('cover', '封面图', r => imageCell(displayCover(r), r.title)),
       col('likes', '点赞数', r => <span className="tabular-nums">{formatRecordMetric(r, 'likes')}</span>),
       col('collects', '收藏/推荐', r => <span className="tabular-nums">{formatRecordMetric(r, 'collects')}</span>),
       col('comments', '评论数', r => <span className="tabular-nums">{formatRecordMetric(r, 'comments_count')}</span>),
@@ -1027,7 +1028,7 @@ function bloggerNoteColumns(platform: string): Column[] {
     col('type', '笔记类型', r => textCell(noteTypeLabel(r))),
     col('title', '标题', (r, ctx) => longCell(recordDisplayTitle(r), 180, ctx)),
     col('coverLink', '封面链接', r => linkCell(primaryImage(r), '封面')),
-    col('cover', '封面图', r => imageCell(primaryImage(r), r.title)),
+    col('cover', '封面图', r => imageCell(displayCover(r), r.title)),
     col('likes', '点赞数', r => <span className="tabular-nums">{formatRecordMetric(r, 'likes')}</span>),
     col('collects', '收藏/推荐', r => <span className="tabular-nums">{formatRecordMetric(r, 'collects')}</span>),
     col('comments', '评论数', r => <span className="tabular-nums">{formatRecordMetric(r, 'comments_count')}</span>),
@@ -1047,7 +1048,7 @@ function monitorContentColumns(platform: string): Column[] {
     col('type', '笔记类型', r => textCell(noteTypeLabel(r))),
     col('url', '笔记链接', r => recordSourceCell(r)),
     col('coverLink', '封面链接', r => linkCell(primaryImage(r), '封面')),
-    col('cover', '封面图', r => imageCell(primaryImage(r), r.title)),
+    col('cover', '封面图', r => imageCell(displayCover(r), r.title)),
     col('likes', '点赞数', r => <span className="tabular-nums">{formatRecordMetric(r, 'likes')}</span>),
     col('collects', '收藏/推荐', r => <span className="tabular-nums">{formatRecordMetric(r, 'collects')}</span>),
     col('comments', '评论数', r => <span className="tabular-nums">{formatRecordMetric(r, 'comments_count')}</span>),
@@ -1122,7 +1123,7 @@ function singleNoteColumns(platform: string): Column[] {
       col('account', '账号属性', r => textCell(r.blogger_account_type || value(r, 'payload.accountType'))),
       col('type', '笔记类型', r => textCell(noteTypeLabel(r))),
       col('coverLink', '封面链接', r => linkCell(primaryImage(r), '封面')),
-      col('cover', '封面图', r => imageCell(primaryImage(r), r.title)),
+      col('cover', '封面图', r => imageCell(displayCover(r), r.title)),
       col('title', '标题', (r, ctx) => longCell(recordDisplayTitle(r), 180, ctx)),
       col('content', '正文', (r, ctx) => longCell(r.content, 220, ctx)),
       col('tags', '话题标签', r => tagCell(r.tags)),
@@ -1158,7 +1159,7 @@ function singleNoteColumns(platform: string): Column[] {
       col('liked', '点赞与收藏数', r => metricCell(bloggerLiked(r))),
       col('type', '笔记类型', r => textCell(noteTypeLabel(r))),
       col('coverLink', '封面链接', r => linkCell(primaryImage(r), '封面')),
-      col('cover', '封面图', r => imageCell(primaryImage(r), r.title)),
+      col('cover', '封面图', r => imageCell(displayCover(r), r.title)),
       col('title', '标题', (r, ctx) => longCell(recordDisplayTitle(r), 180, ctx)),
       col('likes', '点赞数', r => <span className="tabular-nums">{formatRecordMetric(r, 'likes')}</span>),
       col('collects', '收藏/推荐', r => <span className="tabular-nums">{formatRecordMetric(r, 'collects')}</span>),
@@ -1194,7 +1195,7 @@ function singleNoteColumns(platform: string): Column[] {
     col('account', '账号属性', r => textCell(r.blogger_account_type || value(r, 'payload.accountType'))),
     col('type', '笔记类型', r => textCell(noteTypeLabel(r))),
     col('coverLink', '封面链接', r => linkCell(primaryImage(r), '封面')),
-    col('cover', '封面图', r => imageCell(primaryImage(r), r.title)),
+    col('cover', '封面图', r => imageCell(displayCover(r), r.title)),
     col('title', '标题', (r, ctx) => longCell(recordDisplayTitle(r), 180, ctx)),
     col('content', '正文', (r, ctx) => longCell(r.content, 220, ctx)),
     col('tags', '话题标签', r => tagCell(r.tags)),
@@ -1368,6 +1369,16 @@ function primaryImage(row: any) {
     asArray(value(row, 'payload.imageUrls'))[0],
     asArray(value(row, 'payload.images'))[0],
   )
+}
+
+function displayCover(row: Record<string, unknown>) {
+  return row.platform === 'wechat_channels'
+    ? recordDisplayCover({ ...row, cover_url: primaryImage(row) })
+    : proxiedImg(String(primaryImage(row)))
+}
+
+function displayAvatar(row: Record<string, unknown>) {
+  return recordDisplayAvatar({ ...row, author_avatar: avatarUrl(row) })
 }
 
 function imageUrls(row: any) {
@@ -1928,24 +1939,8 @@ function linkListCell(urls: unknown, label: string) {
   )
 }
 
-// 小红书/微博/抖音 图片 CDN 有 Referer 防盗链,直接 <img> 引用会 403。
-// 经 /api/img 后端代理(带对应 Referer)取图。
-const PROXY_IMG_HOSTS = /(?:\.sinaimg\.(?:cn|com)|\.weiboimg\.(?:cn|com)|\.xhscdn\.com|\.xiaohongshu\.com|\.douyinpic\.com|\.douyinstatic\.com|\.pstatp\.com|\.byteimg\.com|\.bytecdn\.cn|\.bdxiguaimg\.com)$/i
-function proxyImg(url: string): string {
-  const s = String(url || '').trim()
-  if (!s) return s
-  try {
-    const u = new URL(s, window.location.origin)
-    if (u.protocol !== 'http:' && u.protocol !== 'https:') return s
-    if (PROXY_IMG_HOSTS.test(u.hostname)) return `/api/img?url=${encodeURIComponent(u.toString())}`
-  } catch {
-    /* 非法 URL,原样返回 */
-  }
-  return s
-}
-
 function thumb(url: string, alt: unknown) {
-  const proxied = proxyImg(url)
+  const proxied = proxiedImg(url)
   return (
     <a
       href={proxied}

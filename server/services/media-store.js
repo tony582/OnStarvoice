@@ -23,6 +23,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // server 在 /opt/onstarvoice/server,上两级 + media = /opt/onstarvoice/media(rsync 不碰)
 export const MEDIA_DIR = process.env.MEDIA_DIR || join(__dirname, '..', '..', 'media');
 const COVERS_DIR = join(MEDIA_DIR, 'covers');
+const AVATARS_DIR = join(MEDIA_DIR, 'avatars');
 const IMAGES_DIR = join(MEDIA_DIR, 'images');
 
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
@@ -32,6 +33,7 @@ const EXT_BY_TYPE = { 'image/webp': 'webp', 'image/jpeg': 'jpg', 'image/jpg': 'j
 export function ensureMediaDirs() {
   try {
     mkdirSync(COVERS_DIR, { recursive: true });
+    mkdirSync(AVATARS_DIR, { recursive: true });
     mkdirSync(IMAGES_DIR, { recursive: true });
   } catch { /* ignore */ }
 }
@@ -40,6 +42,8 @@ export function ensureMediaDirs() {
 export async function downloadImage(url, key, platform, targetDir, publicDir, onFailure) {
   if (!url || !/^https?:\/\//i.test(url) || !isAllowedMediaHost(url)) return null;
   const article = platform === 'wechat_articles';
+  const channels = platform === 'wechat_channels';
+  const guarded = article || channels;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 20000);
   let tempPath = '';
@@ -47,22 +51,26 @@ export async function downloadImage(url, key, platform, targetDir, publicDir, on
   try {
     let current = url, resp;
     for (let redirects = 0; redirects <= 3; redirects++) {
-      if (article) {
+      if (guarded) {
         const parsed = new URL(current);
         if (!['https:', 'http:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.port || !isAllowedMediaHost(current)) return null;
       }
       const referer = resolveReferer(current, platform);
       resp = await fetch(current, {
-        redirect: article ? 'manual' : 'follow', signal: controller.signal,
+        redirect: guarded ? 'manual' : 'follow', signal: controller.signal,
         headers: { 'User-Agent': BROWSER_UA, Accept: 'image/*,*/*', ...(referer ? { Referer: referer } : {}) },
       });
-      if (!article || resp.status < 300 || resp.status >= 400) break;
+      if (!guarded || resp.status < 300 || resp.status >= 400) break;
       const location = resp.headers.get('location');
       await resp.body?.cancel();
       if (!location || redirects === 3) return null;
       current = new URL(location, current).toString();
     }
-    if (!resp.ok || !resp.body) return null;
+    if (!resp.ok || !resp.body) {
+      if (channels && [400, 403].includes(resp.status)) onFailure?.({code: 'upstream_rejected', httpStatus: resp.status});
+      await resp.body?.cancel();
+      return null;
+    }
     const type = (resp.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
     const ext = EXT_BY_TYPE[type];
     if (!ext) return null; // 非图片(可能是 403 的 html 错误页)
@@ -77,8 +85,8 @@ export async function downloadImage(url, key, platform, targetDir, publicDir, on
     ensureMediaDirs();
     const filename = `${key}.${ext}`;
     const targetPath = join(targetDir, filename);
-    tempPath = `${targetPath}.${process.pid}.${article ? randomUUID() : Date.now()}.part`;
-    if (article) {
+    tempPath = `${targetPath}.${process.pid}.${guarded ? randomUUID() : Date.now()}.part`;
+    if (guarded) {
       let received = 0;
       const bounded = new Transform({transform(chunk, encoding, done) {
         received += chunk.length;
@@ -86,8 +94,10 @@ export async function downloadImage(url, key, platform, targetDir, publicDir, on
         done(received > WECHAT_IMAGE_MAX_BYTES ? new Error('wechat_image_too_large') : null, chunk);
       }});
       await pipeline(Readable.fromWeb(resp.body), bounded, createWriteStream(tempPath));
-      const verified = inspectWechatImage(await readFile(tempPath), onFailure);
-      if (!verified || verified.mime !== (type === 'image/jpg' ? 'image/jpeg' : type)) return null;
+      if (article) {
+        const verified = inspectWechatImage(await readFile(tempPath), onFailure);
+        if (!verified || verified.mime !== (type === 'image/jpg' ? 'image/jpeg' : type)) return null;
+      }
     } else await pipeline(Readable.fromWeb(resp.body), createWriteStream(tempPath));
     await rename(tempPath, targetPath);
     tempPath = '';
@@ -97,7 +107,7 @@ export async function downloadImage(url, key, platform, targetDir, publicDir, on
       observedBytes: overflowBytes, source: 'stream'});
     return null;
   } finally {
-    if (article) controller.abort();
+    if (guarded) controller.abort();
     if (tempPath) await unlink(tempPath).catch(() => {});
     clearTimeout(timer);
   }
@@ -114,8 +124,66 @@ const waiting = [];
 function acquire() { return new Promise((res) => { if (active < MAX_CONCURRENT) { active++; res(); } else waiting.push(res); }); }
 function release() { active--; const next = waiting.shift(); if (next) { active++; next(); } }
 
-// 确保某记录封面已落地(已落地则跳过);失败静默,等下次回填重试。
+// One signed URL has at most one in-process download. Database guards below keep
+// late old-URL results from changing a newer capture, including its local file.
+const channelMediaInFlight = new Map();
+const CHANNEL_MEDIA = {
+  cover: {source: 'cover_url', local: 'cover_local', error: 'cover_storage_error', directory: COVERS_DIR, publicDir: 'covers'},
+  avatar: {source: 'author_avatar', local: 'author_avatar_local', error: 'author_avatar_storage_error', directory: AVATARS_DIR, publicDir: 'avatars'},
+};
+
+async function ensureChannelMediaLocal(recordId, url, kind) {
+  if (!recordId || !url) return {status: 'missing'};
+  const key = `${kind}:${recordId}:${url}`;
+  if (channelMediaInFlight.has(key)) return channelMediaInFlight.get(key);
+  const work = (async () => {
+    const fields = CHANNEL_MEDIA[kind];
+    await acquire();
+    try {
+      const row = await queryOne(`SELECT ${fields.source} AS source, ${fields.local} AS local,
+        ${fields.error} AS error FROM records WHERE id=$1 AND platform='wechat_channels'`, [recordId]);
+      if (!row || row.source !== url) return {status: 'stale'};
+      if (String(row.local || '').trim()) return {status: 'existing'};
+      if (row.error?.sourceUrl === url && [400, 403].includes(row.error.httpStatus)) {
+        return {status: 'blocked', httpStatus: row.error.httpStatus};
+      }
+      if (row.error?.sourceUrl && row.error.sourceUrl !== url) {
+        await execute(`UPDATE records SET ${fields.error}='{}'::jsonb WHERE id=$1 AND ${fields.source}=$2
+          AND ${fields.error}->>'sourceUrl' IS DISTINCT FROM $2`, [recordId, url]);
+      }
+      let failure;
+      // Different signed URLs must never overwrite each other's file before the
+      // compare-and-set below. Keep the original URL in its original column.
+      const fileKey = `${recordId}-${createHash('sha256').update(url).digest('hex').slice(0, 24)}`;
+      const local = await downloadImage(url, fileKey, 'wechat_channels', fields.directory, fields.publicDir, value => {failure = value;});
+      if (local) {
+        const saved = await execute(`UPDATE records SET ${fields.local}=$1, ${fields.error}='{}'::jsonb
+          WHERE id=$2 AND ${fields.source}=$3 AND ${fields.local}=''`, [local, recordId, url]);
+        return {status: saved.changes ? 'saved' : 'stale'};
+      }
+      if (failure) {
+        const marked = await execute(`UPDATE records SET ${fields.error}=$1::jsonb
+          WHERE id=$2 AND ${fields.source}=$3 AND ${fields.local}=''`,
+        [JSON.stringify({...failure, sourceUrl: url, checkedAt: new Date().toISOString()}), recordId, url]);
+        return {status: marked.changes ? 'expired' : 'stale', httpStatus: failure.httpStatus};
+      }
+      return {status: 'failed'};
+    } catch { return {status: 'failed'}; }
+    finally { release(); }
+  })();
+  channelMediaInFlight.set(key, work);
+  try { return await work; }
+  finally { if (channelMediaInFlight.get(key) === work) channelMediaInFlight.delete(key); }
+}
+
+export async function ensureAvatarLocal(recordId, avatarUrl, platform) {
+  if (platform !== 'wechat_channels') return {status: 'unsupported'};
+  return ensureChannelMediaLocal(recordId, avatarUrl, 'avatar');
+}
+
+// Other platforms retain their existing localization and retry policy.
 export async function ensureCoverLocal(recordId, coverUrl, platform) {
+  if (platform === 'wechat_channels') return ensureChannelMediaLocal(recordId, coverUrl, 'cover');
   if (!recordId || !coverUrl) return;
   try {
     const row = await queryOne('SELECT cover_local FROM records WHERE id = $1', [recordId]);
@@ -131,9 +199,10 @@ export async function ensureCoverLocal(recordId, coverUrl, platform) {
 }
 
 // 非阻塞触发(入库后调用,不阻塞采集响应)
-export function queueCoverLocalization(recordId, coverUrl, platform) {
+export function queueCoverLocalization(recordId, coverUrl, platform, avatarUrl = '') {
   void runProcessBackgroundWork(
-    () => ensureCoverLocal(recordId, coverUrl, platform),
+    () => Promise.all([ensureCoverLocal(recordId, coverUrl, platform),
+      ...(platform === 'wechat_channels' ? [ensureAvatarLocal(recordId, avatarUrl, platform)] : [])]),
     { label: 'CoverLocalization' },
   );
 }
@@ -322,16 +391,48 @@ export function queueRecordImagesLocalization(recordId, imageUrls, platform) {
   );
 }
 
-// 启动回填:近 24h 采集、还没落地的图片(链接多半还有效)批量下载。过期的会下载失败、自动跳过。
-export async function backfillRecentCovers(limit = 800) {
+// Default runtime calls preserve the 24h/800-row contract. Explicit Channels
+// all-history mode walks every ID in bounded pages and returns actual outcomes.
+export async function backfillRecentCovers(limit = 800, {platform = '', allHistory = false, tenantId = null} = {}) {
+  if (allHistory && platform !== 'wechat_channels') throw new TypeError('All-history cover backfill requires wechat_channels');
+  if (platform === 'wechat_channels') {
+    const pageSize = Math.min(800, Math.max(1, Math.trunc(Number(limit)) || 800));
+    const counts = () => ({saved: 0, expired: 0, blocked: 0, failed: 0, existing: 0, stale: 0, missing: 0, http400: 0, http403: 0});
+    const result = {records: 0, cover: counts(), avatar: counts()};
+    let cursor = null;
+    do {
+      const rows = await queryAll(`SELECT id, cover_url, author_avatar, platform FROM records
+        WHERE platform='wechat_channels' AND ($1::uuid IS NULL OR tenant_id=$1)
+          AND ($2::boolean OR last_seen_at > now() - interval '24 hours')
+          AND ($3::uuid IS NULL OR id>$3) ORDER BY id LIMIT $4`, [tenantId, allHistory, cursor, pageSize]);
+      if (!rows.length) break;
+      result.records += rows.length;
+      await Promise.all(rows.map(async row => {
+        const outcomes = await Promise.all([ensureCoverLocal(row.id, row.cover_url, row.platform),
+          ensureAvatarLocal(row.id, row.author_avatar, row.platform)]);
+        for (const [index, kind] of ['cover', 'avatar'].entries()) {
+          const outcome = outcomes[index];
+          result[kind][outcome.status]++;
+          if ([400, 403].includes(outcome.httpStatus)) result[kind][`http${outcome.httpStatus}`]++;
+        }
+      }));
+      cursor = rows.at(-1).id;
+      if (!allHistory || rows.length < pageSize) break;
+    } while (true);
+    return result;
+  }
   try {
     const rows = await queryAll(
-      `SELECT id, cover_url, platform FROM records
-       WHERE cover_url <> '' AND COALESCE(cover_local, '') = '' AND last_seen_at > now() - interval '24 hours'
+      `SELECT id, cover_url, author_avatar, platform FROM records
+       WHERE ((cover_url <> '' AND COALESCE(cover_local, '') = '')
+         OR (platform='wechat_channels' AND author_avatar<>'' AND author_avatar_local=''))
+         AND last_seen_at > now() - interval '24 hours'
+         AND ($2='' OR platform=$2) AND ($3::uuid IS NULL OR tenant_id=$3)
        ORDER BY last_seen_at DESC LIMIT $1`,
-      [limit],
+      [limit, platform, tenantId],
     );
-    await Promise.all(rows.map((r) => ensureCoverLocal(r.id, r.cover_url, r.platform)));
+    await Promise.all(rows.map((r) => Promise.all([ensureCoverLocal(r.id, r.cover_url, r.platform),
+      ...(r.platform === 'wechat_channels' ? [ensureAvatarLocal(r.id, r.author_avatar, r.platform)] : [])])));
     return rows.length;
   } catch {
     return 0;

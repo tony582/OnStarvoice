@@ -1634,9 +1634,11 @@ export async function upsertCapturedRecord(record, context) {
   const __result = await retryCapturedRecordIdentityConflict(
     runUpsertTransaction,
   );
-  // 封面落地:入库后非阻塞把平台封面下载到本地(失败不影响入库,过期靠回填重试)
+  // 入库后共用媒体队列；视频号失效链接等后续采集的新 URL 再补，不阻塞采集响应。
   if (__result.businessVisibility === 'eligible') {
-    if (record.cover_url) queueCoverLocalization(__result.id, record.cover_url, record.platform);
+    if (record.cover_url || (record.platform === 'wechat_channels' && record.author_avatar)) {
+      queueCoverLocalization(__result.id, record.cover_url, record.platform, record.author_avatar);
+    }
     if (imageUrls !== '[]') queueRecordImagesLocalization(__result.id, imageUrls, record.platform);
   }
   return __result;

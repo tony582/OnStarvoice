@@ -155,3 +155,8 @@ export function recordDisplayCover(record: RecordImageSource | null | undefined)
   }
   return proxiedImg(raw)
 }
+
+/** Preserve the collected avatar URL while displaying its durable copy first. */
+export function recordDisplayAvatar(record: Record<string, unknown> | null | undefined): string {
+  return proxiedImg(String(record?.author_avatar_local || record?.author_avatar || ''))
+}

@@ -196,7 +196,7 @@ export function friendlyError(raw?: string | null): string {
 // 平台图片(小红书/抖音/微博 CDN)有 Referer 防盗链 + 签名时效,浏览器直连 <img> 有概率 403/刷不出。
 // 统一经服务端 /api/img 代理(带对应 Referer 取图);本站地址(/media 本地化封面、/api/img 等)与非白名单 URL 原样返回,不二次代理。
 // ⚠ 白名单需与 server/routes/image-proxy.js 的 HOST_RULES 保持一致。
-const PROXY_IMG_HOSTS = /(?:\.sinaimg\.(?:cn|com)|\.weiboimg\.(?:cn|com)|\.xhscdn\.com|\.xiaohongshu\.com|\.douyinpic\.com|\.douyinstatic\.com|\.pstatp\.com|\.byteimg\.com|\.bytecdn\.cn|\.bdxiguaimg\.com|(?:^|\.)qpic\.cn)$/i
+const PROXY_IMG_HOSTS = /(?:\.sinaimg\.(?:cn|com)|\.weiboimg\.(?:cn|com)|\.xhscdn\.com|\.xiaohongshu\.com|\.douyinpic\.com|\.douyinstatic\.com|\.pstatp\.com|\.byteimg\.com|\.bytecdn\.cn|\.bdxiguaimg\.com|(?:^|\.)qpic\.cn|(?:^|\.)(?:finder\.video\.qq\.com|findermp\.video\.qq\.com|wx\.qlogo\.cn))$/i
 export function proxiedImg(url?: string | null): string {
   const s = String(url || '').trim()
   if (!s) return s

@@ -8,6 +8,7 @@ import express from 'express';
 const router = express.Router();
 
 const HOST_RULES = [
+  { test: (h) => ['finder.video.qq.com', 'findermp.video.qq.com', 'wx.qlogo.cn'].some(s => h === s || h.endsWith(`.${s}`)), referer: 'https://channels.weixin.qq.com/' },
   { test: (h) => h === 'qpic.cn' || h.endsWith('.qpic.cn'), referer: 'https://mp.weixin.qq.com/' },
   { test: (h) => h.endsWith('.sinaimg.cn') || h.endsWith('.sinaimg.com') || h.endsWith('.weiboimg.cn') || h.endsWith('.weiboimg.com'), referer: 'https://weibo.com/' },
   { test: (h) => h.endsWith('.xhscdn.com') || h.endsWith('.xiaohongshu.com'), referer: 'https://www.xiaohongshu.com/' },
@@ -33,7 +34,7 @@ router.get('/', async (req, res) => {
   const host = parsed.hostname.toLowerCase();
   const rule = HOST_RULES.find((r) => r.test(host));
   if (!rule) return res.status(403).send('host not allowed');
-  const wechat = host === 'qpic.cn' || host.endsWith('.qpic.cn');
+  const wechat = ['qpic.cn', 'finder.video.qq.com', 'findermp.video.qq.com', 'wx.qlogo.cn'].some(s => host === s || host.endsWith(`.${s}`));
   if (wechat && (parsed.username || parsed.password || parsed.port)) return res.status(403).send('host not allowed');
 
   // 统一升级到 https,降低被拦概率
@@ -58,7 +59,7 @@ router.get('/', async (req, res) => {
         if (wechat) {
           const target = new URL(current);
           if (target.protocol !== 'https:' || target.username || target.password || target.port
-            || !(target.hostname === 'qpic.cn' || target.hostname.endsWith('.qpic.cn'))) return res.status(403).send('host not allowed');
+            || !rule.test(target.hostname.toLowerCase())) return res.status(403).send('host not allowed');
         }
         upstream = await fetch(current, options);
         if (!wechat || upstream.status < 300 || upstream.status >= 400) break;

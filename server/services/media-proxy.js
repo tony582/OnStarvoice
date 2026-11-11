@@ -19,6 +19,9 @@ const BROWSER_UA =
 const ALLOWED_HOST_SUFFIXES = [
   // 微信文章正文图片（不扩大到 qq.com）
   'qpic.cn',
+  'finder.video.qq.com',
+  'findermp.video.qq.com',
+  'wx.qlogo.cn',
   // 小红书
   'xhscdn.com',
   'xiaohongshu.com',
@@ -46,6 +49,7 @@ const ALLOWED_HOST_SUFFIXES = [
 
 // 按域名解析合适的 Referer，绕过防盗链
 const REFERER_RULES = [
+  { test: /(^|\.)(?:finder\.video\.qq\.com|findermp\.video\.qq\.com|wx\.qlogo\.cn)$/i, hostname: true, referer: 'https://channels.weixin.qq.com/' },
   { test: /(^|\.)qpic\.cn$/i, hostname: true, referer: 'https://mp.weixin.qq.com/' },
   { test: /xhscdn\.com|xiaohongshu\.com/i, referer: 'https://www.xiaohongshu.com/' },
   { test: /douyinvod\.com|douyinpic\.com|bytevod\.com|byteimg\.com|bytecdn\.cn|pstatp\.com|zjcdn\.com|amemv\.com|douyin/i, referer: 'https://www.douyin.com/' },
@@ -53,6 +57,7 @@ const REFERER_RULES = [
 ];
 
 const PLATFORM_REFERER = {
+  wechat_channels: 'https://channels.weixin.qq.com/',
   wechat_articles: 'https://mp.weixin.qq.com/',
   xiaohongshu: 'https://www.xiaohongshu.com/',
   douyin: 'https://www.douyin.com/',
