@@ -6,12 +6,14 @@ type ColorKey = 'green' | 'red' | 'darkred' | 'orange' | 'amber' | 'blue' | 'pur
 
 const TONE_TO_COLOR: Record<string, ColorKey> = {
   positive: 'green', active: 'green', resolved: 'green', sent: 'green',
-  negative: 'red', high: 'red', negative_feishu: 'red', negative_cold: 'red', negative_comment: 'red', privacy_unreachable: 'red',
+  negative: 'red', high: 'red', negative_feishu: 'red',
   urgent: 'darkred', critical: 'darkred',
   unhandled: 'orange', new: 'orange', open: 'orange',
   pending: 'amber', medium: 'amber',
   reviewing: 'purple', generated: 'purple',
   reviewed: 'green',
+  // 负面里只有「飞书表」用红色（客户 2026-11-11：其它负面也标红会干扰判断），其余负面统一用分诊里没占用的蓝色。
+  negative_cold: 'blue', negative_comment: 'blue', privacy_unreachable: 'blue',
   issue_linked: 'blue', ticketed: 'blue', following: 'blue', platform_admin: 'blue',
   official_responded: 'teal', replied: 'teal', internal_operator: 'teal',
   neutral: 'grey', muted: 'grey', low: 'grey', normal: 'grey',

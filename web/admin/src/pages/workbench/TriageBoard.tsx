@@ -22,10 +22,10 @@ const COLUMNS: BoardColumn[] = [
   { key: 'reviewed', label: '已复核', dot: 'bg-status-green', ring: 'ring-status-green/40 bg-status-green/[0.04]' },
   { key: 'reviewed_non_monitor', label: '已复核-非监控内容', dot: 'bg-status-grey', ring: 'ring-slate-300/50 bg-slate-50 dark:bg-slate-800/40' },
   { key: 'unavailable', label: '已不可见', dot: 'bg-status-grey', ring: 'ring-slate-300/50 bg-slate-50 dark:bg-slate-800/40' },
-  { key: 'privacy_unreachable', label: '负面–隐私设置无法触达', dot: 'bg-status-red', ring: 'ring-status-red/40 bg-status-red/[0.04]' },
+  { key: 'privacy_unreachable', label: '负面–隐私设置无法触达', dot: 'bg-status-blue', ring: 'ring-status-blue/40 bg-status-blue/[0.04]' },
   { key: 'negative_feishu', label: '负面-飞书表', dot: 'bg-status-red', ring: 'ring-status-red/40 bg-status-red/[0.04]' },
-  { key: 'negative_cold', label: '负面-冷处理', dot: 'bg-status-red', ring: 'ring-status-red/40 bg-status-red/[0.04]' },
-  { key: 'negative_comment', label: '负面-评论区留言', dot: 'bg-status-red', ring: 'ring-status-red/40 bg-status-red/[0.04]' },
+  { key: 'negative_cold', label: '负面-冷处理', dot: 'bg-status-blue', ring: 'ring-status-blue/40 bg-status-blue/[0.04]' },
+  { key: 'negative_comment', label: '负面-评论区留言', dot: 'bg-status-blue', ring: 'ring-status-blue/40 bg-status-blue/[0.04]' },
 ]
 
 const PER_COL = 60
@@ -203,9 +203,11 @@ function BoardCard({ record: r, canWrite, dragging, onOpen, onSaveFeishuTableNo,
     ? 'border-l-status-orange'
     : r.triage_status === 'replied' || r.triage_status === 'reviewed'
       ? 'border-l-status-green'
-      : r.triage_status === 'negative_feishu' || r.triage_status === 'negative_cold' || r.triage_status === 'negative_comment'
+      : r.triage_status === 'negative_feishu'
         ? 'border-l-status-red'
-        : 'border-l-status-grey'
+        : r.triage_status === 'negative_cold' || r.triage_status === 'negative_comment'
+          ? 'border-l-status-blue'
+          : 'border-l-status-grey'
   return (
     <div
       data-record-detail-trigger
