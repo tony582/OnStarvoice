@@ -1,3 +1,4 @@
+import { knownInteractionSumSql } from '../services/interaction-sql.js';
 import { Router } from 'express';
 import { queryAll, queryOne, execute } from '../db/init.js';
 import { requireTenantAccess } from '../middleware/auth.js';
@@ -68,7 +69,7 @@ router.get('/hits', requireTenantAccess, async (req, res, next) => {
         CASE WHEN r.platform='wechat_articles' THEN r.image_urls ELSE '[]'::jsonb END AS image_urls,
         CASE WHEN r.platform='wechat_articles' THEN r.image_local_urls ELSE '[]'::jsonb END AS image_local_urls,
         r.likes, r.comments_count, r.collects, r.shares, r.tags, r.sentiment, r.category, r.last_seen_at,
-        (r.likes + r.comments_count + r.collects + r.shares) AS interaction,
+        (${knownInteractionSumSql('r')}) AS interaction,
         (ha.id IS NOT NULL) AS analyzed
       FROM records r
       LEFT JOIN hit_analyses ha ON ha.record_id = r.id AND ha.tenant_id = r.tenant_id

@@ -854,7 +854,7 @@ export async function analyzeOpinionRecord({ tenantId, recordId, inputHash = nul
      WHERE tenant_id = $1 AND record_id = $2 AND is_official = false AND content <> ''
      ORDER BY is_negative DESC,
        CASE risk_level WHEN 'critical' THEN 5 WHEN 'high' THEN 4 WHEN 'medium' THEN 3 WHEN 'low' THEN 2 ELSE 1 END DESC,
-       like_count DESC, last_seen_at DESC
+       like_count DESC NULLS LAST, last_seen_at DESC
      LIMIT 50`,
     [tenantId, recordId]
   ) : [];

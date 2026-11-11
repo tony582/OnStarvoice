@@ -283,7 +283,7 @@ test('preview and create share current-sentiment qualification and tenant scope'
   assert.match(route, /r\.content ILIKE/u);
   assert.match(route, /r\.author_name ILIKE/u);
   assert.match(route, /r\.keyword ILIKE/u);
-  assert.match(route, /r\.likes \+ r\.comments_count \+ r\.collects \+ r\.shares/u);
+  assert.match(route, /knownInteractionSumSql\('r'\)/u);
   assert.match(route, /record_feedback feedback/u);
   assert.match(route, /feedback\.review_status = 'pending'/u);
   assert.equal(

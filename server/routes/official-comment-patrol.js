@@ -992,7 +992,7 @@ router.get(
             WHEN 'low' THEN 3
             ELSE 4
           END,
-          comment.like_count DESC,
+          comment.like_count DESC NULLS LAST,
           comment.last_seen_at DESC,
           comment.id
         LIMIT $3 OFFSET $4

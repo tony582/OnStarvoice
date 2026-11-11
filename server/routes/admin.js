@@ -1,3 +1,4 @@
+import { knownInteractionSumSql } from '../services/interaction-sql.js';
 import { Router } from 'express';
 import { queryAll, queryOne, execute, withTransaction, getAllSettings, setSettings, getDefaultTenantId } from '../db/init.js';
 import { requireAdmin, requirePlatformAdmin } from '../middleware/auth.js';
@@ -620,7 +621,7 @@ router.get('/records', async (req, res, next) => {
     params.push(limit, offset);
 
     const records = await queryAll(
-      `SELECT * FROM records${where} ORDER BY ${sortCol} ${sortOrder} LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      `SELECT * FROM records${where} ORDER BY ${sortCol} ${sortOrder} NULLS LAST LIMIT $${params.length - 1} OFFSET $${params.length}`,
       params
     );
 
@@ -672,7 +673,7 @@ router.get('/stats', async (req, res, next) => {
       `SELECT id, title, url, platform, likes, comments_count, collects, shares, sentiment, author_name
        FROM records
        WHERE created_at >= $1${tenantWhere}
-       ORDER BY (likes + comments_count + collects + shares) DESC
+       ORDER BY (${knownInteractionSumSql()}) DESC NULLS LAST
        LIMIT 10`,
       tenantParams
     );

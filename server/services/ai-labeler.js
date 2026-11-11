@@ -235,8 +235,8 @@ export function buildUserMessage(record) {
   }
   const transcript = getRecordEvidenceSources(record).find(source => source.source === 'transcript');
   if (transcript) text += `当前媒体已完成的逐字稿：${truncatePromptText(transcript.text, 6000)}\n`;
-  if (record.likes || record.comments_count || record.collects || record.shares) {
-    text += `互动：${record.likes}赞 ${record.comments_count}评论 ${record.collects}收藏 ${record.shares || 0}转发\n`;
+  if (['likes', 'comments_count', 'collects', 'shares'].some(key => record[key] != null)) {
+    text += `互动：${record.likes ?? '未知'}赞 ${record.comments_count ?? '未知'}评论 ${record.collects ?? '未知'}收藏 ${record.shares ?? '未知'}转发\n`;
   }
   return text || '(空内容)';
 }

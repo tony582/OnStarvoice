@@ -1,3 +1,4 @@
+import { knownInteractionSumSql } from '../services/interaction-sql.js';
 import crypto from 'node:crypto';
 import {Router} from 'express';
 import {
@@ -458,7 +459,7 @@ function candidateWhere(tenantId, filter, recordIds = []) {
         ($4::date::timestamp + INTERVAL '1 day')
           AT TIME ZONE 'Asia/Shanghai'
       )
-      AND (r.likes + r.comments_count + r.collects + r.shares) >= $5
+      AND (${knownInteractionSumSql('r')}) >= $5
       AND (
         (
           NOT (COALESCE(r.manual_overrides, '{}'::jsonb) ? 'sentiment')

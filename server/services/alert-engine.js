@@ -1,3 +1,4 @@
+import { knownInteractionSumSql } from './interaction-sql.js';
 /**
  * 预警引擎 — 检查新记录是否触发预警规则，并生成问题跟进单
  */
@@ -164,7 +165,7 @@ export async function checkAlerts(recordId) {
   let baselineP90 = 0;
   if (record.sentiment === 'negative') {
     const b = await queryOne(
-      `SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY (likes + comments_count + collects + shares)) AS p90,
+      `SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY (${knownInteractionSumSql()})) AS p90,
               COUNT(*) AS n
        FROM records
        WHERE tenant_id = $1

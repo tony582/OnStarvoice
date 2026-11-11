@@ -1,3 +1,4 @@
+import { knownInteractionSumSql } from '../services/interaction-sql.js';
 import { PLATFORM_LABELS as PLATFORM_CN } from '../services/platform-labels.js';
 import {getCrossPosts, excludeCrossPost} from '../services/cross-posts/store.js';
 import { Router } from 'express';
@@ -386,14 +387,14 @@ function riskOrderSql() {
   return `
     CASE
       WHEN r.negative_comment_count > 0 AND COALESCE(rt.status, 'unhandled') = 'unhandled' THEN 0
-      WHEN r.sentiment = 'negative' AND (r.likes + r.comments_count + r.collects + r.shares) >= 500 THEN 1
+      WHEN r.sentiment = 'negative' AND (${knownInteractionSumSql('r')}) >= 500 THEN 1
       WHEN r.sentiment = 'negative' THEN 2
       WHEN EXISTS (SELECT 1 FROM alerts a WHERE a.record_id = r.id) THEN 3
-      WHEN (r.likes + r.comments_count + r.collects + r.shares) >= 500 THEN 4
+      WHEN (${knownInteractionSumSql('r')}) >= 500 THEN 4
       ELSE 5
     END ASC,
     r.negative_comment_count DESC,
-    (r.likes + r.comments_count + r.collects + r.shares) DESC,
+    (${knownInteractionSumSql('r')}) DESC NULLS LAST,
     r.last_seen_at DESC
   `;
 }
@@ -402,7 +403,7 @@ function riskOrderSql() {
 function orderBySql(sort, dir) {
   const d = String(dir).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
   if (sort === 'publish') return `r.published_ts ${d} NULLS LAST, r.last_seen_at DESC`;
-  if (sort === 'interactions') return `(r.likes + r.comments_count + r.collects + r.shares) ${d} NULLS LAST, r.published_ts DESC NULLS LAST`;
+  if (sort === 'interactions') return `(${knownInteractionSumSql('r')}) ${d} NULLS LAST, r.published_ts DESC NULLS LAST`;
   if (sort === 'comments') return `r.comments_count ${d} NULLS LAST, r.published_ts DESC NULLS LAST`;
   if (sort === 'likes') return `r.likes ${d} NULLS LAST, r.published_ts DESC NULLS LAST`;
   if (sort === 'first_seen') return `r.first_seen_at ${d} NULLS LAST, r.last_seen_at DESC`;

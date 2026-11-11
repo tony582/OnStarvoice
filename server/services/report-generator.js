@@ -1,3 +1,4 @@
+import { knownInteractionSumSql } from './interaction-sql.js';
 /**
  * 报表生成器 - 企业舆情日报/周报/月报
  *
@@ -336,7 +337,7 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
      SELECT category,
        COUNT(*) as count,
        COUNT(*) FILTER (WHERE sentiment = 'negative') as negative_count,
-       SUM(likes + comments_count + collects + shares) as interaction_total
+       SUM(${knownInteractionSumSql()}) as interaction_total
      FROM observed
      WHERE category <> ''
      GROUP BY category
@@ -349,7 +350,7 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
      SELECT platform,
        COUNT(*) as count,
        COUNT(*) FILTER (WHERE sentiment = 'negative') as negative_count,
-       SUM(likes + comments_count + collects + shares) as interaction_total
+       SUM(${knownInteractionSumSql()}) as interaction_total
      FROM observed
      GROUP BY platform
      ORDER BY count DESC`,
@@ -372,11 +373,11 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
      SELECT keyword,
        COUNT(*) as count,
        COUNT(*) FILTER (WHERE sentiment = 'negative') as negative_count,
-       SUM(likes + comments_count + collects + shares) as interaction_total
+       SUM(${knownInteractionSumSql()}) as interaction_total
      FROM observed
      WHERE keyword <> ''
      GROUP BY keyword
-     ORDER BY count DESC, interaction_total DESC
+     ORDER BY count DESC, interaction_total DESC NULLS LAST
      LIMIT 10`,
     params
   ), ['count', 'negative_count', 'interaction_total']);
@@ -553,8 +554,8 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
      FROM observed
      WHERE sentiment <> ''
      ORDER BY (
-       comments_count * 3 + shares * 3 + likes + collects + ${negativeCommentWeightSql}
-     ) DESC, last_seen_at DESC
+       ${knownInteractionSumSql()} + 2 * COALESCE(comments_count, 0) + 2 * COALESCE(shares, 0) + ${negativeCommentWeightSql}
+     ) DESC NULLS LAST, last_seen_at DESC
      LIMIT 24`,
     params
   ), ['likes', 'comments_count', 'collects', 'shares', 'negative_comment_count', 'author_fans']);
@@ -565,8 +566,8 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
      FROM observed
      WHERE sentiment = 'negative'
      ORDER BY (
-       comments_count * 3 + shares * 3 + likes + collects + ${negativeCommentWeightSql}
-     ) DESC, last_seen_at DESC
+       ${knownInteractionSumSql()} + 2 * COALESCE(comments_count, 0) + 2 * COALESCE(shares, 0) + ${negativeCommentWeightSql}
+     ) DESC NULLS LAST, last_seen_at DESC
      LIMIT 8`,
     params
   ), ['likes', 'comments_count', 'collects', 'shares', 'negative_comment_count', 'author_fans']);
@@ -575,7 +576,7 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
     `${observedCte}
      SELECT *
      FROM observed
-     ORDER BY (likes + comments_count + collects + shares) DESC, last_seen_at DESC
+     ORDER BY (${knownInteractionSumSql()}) DESC NULLS LAST, last_seen_at DESC
      LIMIT 10`,
     params
   ), ['likes', 'comments_count', 'collects', 'shares', 'negative_comment_count', 'author_fans']);
@@ -611,11 +612,11 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
        MAX(author_fans) as author_fans,
        COUNT(*) as count,
        COUNT(*) FILTER (WHERE sentiment = 'negative') as negative_count,
-       SUM(likes + comments_count + collects + shares) as interaction_total
+       SUM(${knownInteractionSumSql()}) as interaction_total
      FROM observed
      WHERE author_name <> ''
      GROUP BY author_name
-     ORDER BY negative_count DESC, interaction_total DESC
+     ORDER BY negative_count DESC, interaction_total DESC NULLS LAST
      LIMIT 8`,
     params
   ), ['author_fans', 'count', 'negative_count', 'interaction_total']);
@@ -665,7 +666,7 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
      WHERE a.tenant_id = $1 AND a.created_at >= $2 AND a.created_at < $3
        AND (a.record_id IS NULL OR ${recordFilter})
      ORDER BY CASE a.level WHEN 'critical' THEN 3 WHEN 'warning' THEN 2 ELSE 1 END DESC,
-       a.interaction_total DESC, a.created_at DESC
+       a.interaction_total DESC NULLS LAST, a.created_at DESC
      LIMIT 6`,
     params
   ), ['interaction_total']);
@@ -697,7 +698,7 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
        AND rc.last_seen_at < $3
      ORDER BY
        CASE rc.risk_level WHEN 'critical' THEN 5 WHEN 'high' THEN 4 WHEN 'medium' THEN 3 WHEN 'low' THEN 2 ELSE 1 END DESC,
-       rc.like_count DESC,
+       rc.like_count DESC NULLS LAST,
        rc.last_seen_at DESC
      LIMIT 10`,
     params

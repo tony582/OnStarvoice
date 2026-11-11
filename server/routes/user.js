@@ -1,3 +1,4 @@
+import { knownInteractionSumSql } from '../services/interaction-sql.js';
 /**
  * 用户端 API — 激活码鉴权，仅查看自己的租户数据
  */
@@ -44,7 +45,7 @@ router.get('/stats', requireAuth, async (req, res, next) => {
       [req.tenantId, since]
     );
     const topInteraction = await queryAll(
-      'SELECT id, title, url, platform, likes, comments_count, collects, shares, sentiment, author_name, author_fans FROM records WHERE tenant_id = $1 AND created_at >= $2 ORDER BY (likes + comments_count + collects + shares) DESC LIMIT 10',
+      `SELECT id, title, url, platform, likes, comments_count, collects, shares, sentiment, author_name, author_fans FROM records WHERE tenant_id = $1 AND created_at >= $2 ORDER BY (${knownInteractionSumSql()}) DESC NULLS LAST LIMIT 10`,
       [req.tenantId, since]
     );
 
@@ -84,9 +85,9 @@ router.get('/records', requireAuth, async (req, res, next) => {
     const sortOptions = {
       newest: 'created_at DESC',
       oldest: 'created_at ASC',
-      likes: 'likes DESC',
-      shares: 'shares DESC',
-      interaction: '(likes + comments_count + collects + shares) DESC',
+      likes: 'likes DESC NULLS LAST',
+      shares: 'shares DESC NULLS LAST',
+      interaction: `(${knownInteractionSumSql()}) DESC NULLS LAST`,
     };
     const sortCol = sortOptions[sort] || 'created_at DESC';
 

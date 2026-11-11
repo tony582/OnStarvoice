@@ -1,3 +1,4 @@
+import { knownInteractionSumSql } from '../services/interaction-sql.js';
 import { Router } from 'express';
 import { queryAll, queryOne } from '../db/init.js';
 import { requireTenantAccess } from '../middleware/auth.js';
@@ -143,7 +144,7 @@ router.get('/events', requireTenantAccess, async (req, res, next) => {
       SELECT i.id, i.title, i.severity, i.status, i.summary,
         COUNT(r.id)::int AS record_count, i.owner_name,
         i.created_at, i.updated_at,
-        COALESCE(SUM(r.likes + r.comments_count + r.collects + r.shares), 0) AS reach,
+        COALESCE(SUM(${knownInteractionSumSql('r')}), 0) AS reach,
         COUNT(*) FILTER (WHERE r.sentiment = 'negative') AS negative_count,
         array_remove(array_agg(DISTINCT r.platform), NULL) AS platforms,
         MIN(r.first_seen_at) AS span_start,
@@ -183,7 +184,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
         COUNT(*) FILTER (WHERE created_at >= $3) AS today_new,
         COUNT(*) FILTER (WHERE sentiment = 'negative' AND created_at >= $2) AS negative_period,
         COUNT(*) FILTER (WHERE sentiment = '') AS pending_label,
-        COALESCE(SUM(likes + comments_count + collects + shares), 0) AS total_interaction
+        COALESCE(SUM(${knownInteractionSumSql()}), 0) AS total_interaction
       FROM records
       WHERE tenant_id = $1 AND business_visibility = 'eligible' AND (${recordTriageAdmissionSql('records')})
     `, [req.tenantId, since, todayStart.toISOString()]);
@@ -290,7 +291,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
         AND rt.archived_at IS NULL
       ORDER BY
         CASE WHEN r.sentiment = 'negative' THEN 1 ELSE 2 END,
-        (r.likes + r.comments_count + r.collects + r.shares) DESC,
+        (${knownInteractionSumSql('r')}) DESC NULLS LAST,
         r.last_seen_at DESC
       LIMIT 8
     `, [req.tenantId]);
