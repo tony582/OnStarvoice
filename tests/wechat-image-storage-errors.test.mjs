@@ -62,6 +62,22 @@ test('article size failures retain precise evidence using only mocked responses 
     assert.deepEqual(failures, []); assert.equal((await verifiedArticleLocalImage('/media/images/valid.png')).width, 120);
   });
 
+  await t.test('downloaded and cached separators have explicit decorative evidence and no saved image', async () => {
+    response = () => new Response(pngFixture(1, 3), {headers: {'content-type': 'image/png'}});
+    const downloaded = [];
+    assert.equal(await downloadImage(url, 'separator', 'wechat_articles', images, 'images', value => downloaded.push(value)), null);
+    assert.deepEqual(downloaded, [{code: 'decorative'}]);
+    assert.ok(!(await readdir(images)).some(name => name.startsWith('separator')));
+    await writeFile(join(images, 'cached-separator.png'), pngFixture(1, 3));
+    const cached = [];
+    assert.equal(await verifiedArticleLocalImage('/media/images/cached-separator.png', value => cached.push(value)), null);
+    assert.deepEqual(cached, [{code: 'decorative'}]);
+    const image = articleImageStorageResult({url, stored: false}, '', downloaded[0]);
+    assert.deepEqual(image.storageError, {code: 'decorative'});
+    assert.deepEqual(articleImageStorageResult(image).storageError, {code: 'decorative'});
+    assert.equal(Object.hasOwn(articleImageStorageResult(image, '/media/images/valid.png'), 'storageError'), false);
+  });
+
   await t.test('an existing oversized local cache is refused with measured file size', async () => {
     await writeFile(join(images, 'oversized.gif'), Buffer.alloc(oversized));
     const failures = [];

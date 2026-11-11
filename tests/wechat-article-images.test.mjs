@@ -37,6 +37,26 @@ test('header-only JPEG, GIF, WebP and BMP data cannot claim that an image was sa
   for (const bytes of [jpeg, gif, webp, bmp]) assert.equal(inspectWechatImage(bytes), null);
 });
 
+test('only complete images below either 16px dimension are decorative, even above the byte threshold', () => {
+  for (const bytes of [pngFixture(1, 3), pngFixture(15, 400, true), pngFixture(400, 15, true)]) {
+    const failures = [];
+    assert.equal(inspectWechatImage(bytes, failure => failures.push(failure)), null);
+    assert.deepEqual(failures, [{code: 'decorative'}]);
+  }
+  assert.ok(pngFixture(15, 400, true).length > 10 * 1024);
+  for (const bytes of [pngFixture(16, 400, true), pngFixture(400, 16, true)]) {
+    const failures = [];
+    assert.ok(inspectWechatImage(bytes, failure => failures.push(failure)));
+    assert.deepEqual(failures, []);
+  }
+  for (const bytes of [pngFixture(16, 16), pngFixture(1, 3).subarray(0, -1),
+    Buffer.concat([pngFixture(1, 3), Buffer.from('trailing junk')]), Buffer.from('<html>1x3</html>')]) {
+    const failures = [];
+    assert.equal(inspectWechatImage(bytes, failure => failures.push(failure)), null);
+    assert.deepEqual(failures, [], 'an unverified image or rejected 16px placeholder is not a measured separator');
+  }
+});
+
 test('qpic image proxy preserves original URL parameters and refuses redirects outside qpic using only mocked fetch', async t => {
   const fetches = [], previous = globalThis.fetch;
   const original = 'https://mmbiz.qpic.cn/mmbiz_png/asset/640?wx_fmt=png';

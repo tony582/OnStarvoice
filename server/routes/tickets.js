@@ -818,6 +818,8 @@ router.get('/:id/source', requireTenantAccess, async (req, res, next) => {
       record = await queryOne(
         `SELECT id, platform, record_type, title, content, author_name, author_fans, blogger_profile_url,
                 url, cover_url, cover_local, image_urls, image_local_urls, note_type, video_url,
+                CASE WHEN platform='wechat_articles' THEN jsonb_build_object('wechatArticle',
+                  jsonb_build_object('images', payload#>'{wechatArticle,images}')) ELSE '{}'::jsonb END AS metadata,
                 sentiment, category, source_type, identity_override, ai_summary, ai_result,
                 negative_comment_count, latest_negative_comment_at, official_response_status,
                 likes, comments_count, collects, shares, publish_time, publish_location, keyword,

@@ -588,3 +588,32 @@ swiftc -O "/absolute/runtime-0.5.1-<提交短号>/tools/ocr/StarVoiceOCR.swift" 
 证据：`mobile/queries/fix-new-video-plan-budget.sql`、`mobile/new-plan-budget-rehearsal.txt`、`mobile/new-plan-budget-applied.txt`、`mobile/final-plans-after-budget.json`、`mobile/final-plan-budget-verified.json`、`mobile/effective-video-budgets.json`。**后续若从后台再次编辑保存这条计划，该字段仍可能被旧归一化逻辑丢弃；应先修复该逻辑再编辑，当前修正没有宣称修好了通用产品缺陷。**
 
 本轮没有回滚服务端、后台或手机；正式版本为 **0.5.1 / 5f90a18**。报告收尾为纯文档提交，消息带 `[skip ci]`，不把文档提交描述为再次部署。
+
+---
+
+## 第十轮 T16：上线遗留三项修复（2026-11-11，本地候选，未发布）
+
+本轮从 `2eafba1` 继续开发，按用户要求只做一个本地提交，不 push、不部署、不连接生产、不操作手机，也没有修改线上已手工修好的安吉星 20:30 计划。提交号见 `output/wechat-articles/Codex完成报告-20261109.md` 的第十轮。以下为本轮新验证结果，不代表生产已修复。
+
+### 修复结果
+
+1. **装饰图**：服务端在完整图片容器校验通过后，宽或高小于 16 像素时记录 `storageError: {code: 'decorative'}`，下载及已缓存图片路径一致；不落入已存图片，不计入配图 expected/stored。1×3 PNG 加一张正常图的真实入库测试得到 **expected=1、stored=1、originalImagesCaptured=true**，后台文案为“已发现配图已保存 1/1 张”。原始 URL 与历史 observation 保留。只有装饰图时为 **0/0、false**，不声称保存了原图，也不提示缺图。小于 16 的长分隔条即使超过 10 KB 仍排除；16 像素边界沿用原有占位图规则，坏图或截断文件不会误标 decorative。
+   - 正文图片、共享图库、列表与详情封面、工单来源封面均过滤；相关列表仅补图片元数据，新增元数据不含文章正文或留言。
+   - 后台补图只排除当前 URL 对应的已确认装饰图，已完成记录不再被反复选中；普通失败、too_large 以及正文版本更新后待确认的图片仍可进入补图。
+2. **任务详情 404**：复用 `MOBILE_RUN_WORKFLOWS` 精确白名单，支持原抖音、视频号、文章。实际转发子任务的 workflow 也是 `wechat_channels_mobile_capture`，以 `task_type=wechat_forward` 区分。三类微信任务经过真实调度和领取后，运行中及完成后的详情均可读取，当前 attempt 统计正确；跨租户、父编排 ID、未知或缺失 workflow 仍返回 404。列表使用同一白名单。
+3. **每词时限保存**：`normalizeRemoteTaskInput` 保留 `mobileKeywordMaxMinutes`，沿用编排的 **1–120 分钟、缺省消费 15 分钟**和取整/别名规则。未设置时仍省略字段，旧请求哈希不变。新增 PG 用真实 HTTP 创建 **5** 分钟 → 启用 → 编辑 **9** → 再编辑 **5** → 调度 → 手机模拟领取，模板和计划均保留 5，领取值 **keywordMs=300000**；测试含两个词，其 **batchMs=900000**。没有手写计划快照代替保存链路。
+
+### 本轮验证
+
+| 检查 | 最终结果 | 本地日志 |
+| --- | --- | --- |
+| 服务端全量（含分支内 extension snapshot 检查） | **3601/3601**，0 失败、0 跳过 | `codex-validation-20261111/T16-server-full.log` |
+| 文章 PostgreSQL | **23/23**，0 失败、0 跳过 | `codex-validation-20261111/T16-articles-postgres-final.log` |
+| 视频号 PostgreSQL + 计划保存 PostgreSQL | **17/17**（视频号 16、计划 1），0 失败、0 跳过 | `codex-validation-20261111/T16-channels-plan-postgres.log` |
+| 后台文章与共享图片展示单测 | **21/21** | `codex-validation-20261111/T16-admin-article-tests.log` |
+| 后台 TypeScript + Vite 构建 | **通过** | `codex-validation-20261111/T16-admin-build.log` |
+| 差异空白检查 | **通过** | `git diff --check` |
+
+PG 只连接本机隔离库 `onstarvoice_test_wechat_articles_20261109`。文章图源均由本地响应模拟，没有真实下载；T11 两份历史事件再次离线重放，**2 个 attempt、4 条 record、6 条 observation、6 条 receipt、2 个重复链接、17 次离线图源拒绝、真实下载 0**，源文件哈希不变。这是历史事件重放，不是本轮真机采集。最初受限执行环境的本机数据库连接/路由监听报过 EPERM，使用正常本机测试权限后通过；没有掩盖应用断言失败。
+
+本轮未改采集器、未运行手机测试、未修改生产数据库或生产计划。旧数据的装饰图状态仍需未来部署后重新校验才能产生，本轮没有对生产记录回填。另在只读复核中发现既有恢复预览可能把失败转发标成可恢复；池任务界面没有该恢复按钮，本轮没有扩大到恢复策略修改。

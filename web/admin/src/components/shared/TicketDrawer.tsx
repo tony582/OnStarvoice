@@ -13,7 +13,7 @@ import { Button } from '@/components/ui/button'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { RecordImageGallery } from '@/components/shared/RecordImageGallery'
-import { recordDisplayImageEntries } from '@/components/shared/record-images'
+import { recordDisplayCover, recordDisplayImageEntries } from '@/components/shared/record-images'
 import { RecordPatrolPanel } from '@/components/shared/RecordDrawer'
 import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
 
@@ -736,6 +736,7 @@ function TicketTimeline({ items }: { items: TimelineItem[] }) {
 }
 
 function recordCover(record: any, ticket: any): string {
+  if (record?.platform === 'wechat_articles') return recordDisplayCover(record)
   return proxiedImg(record?.cover_local || record?.cover_url || ticket?.cover_url || '')
 }
 

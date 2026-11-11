@@ -692,6 +692,8 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
         page.matched_total,
         r.id, r.external_id, r.platform, r.title, r.content, r.author_name, r.author_avatar,
         r.author_fans, r.url, r.canonical_url, r.cover_url, r.cover_local, r.image_urls, r.image_local_urls, r.note_type,
+        CASE WHEN r.platform='wechat_articles' THEN jsonb_build_object('wechatArticle',
+          jsonb_build_object('images', r.payload#>'{wechatArticle,images}')) ELSE '{}'::jsonb END AS metadata,
         r.publish_time, r.published_ts, r.publish_location, r.blogger_profile_url,
         r.likes, r.comments_count, r.collects, r.shares,
         r.comments_capture_status, r.comments_total_captured,

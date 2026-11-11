@@ -1,4 +1,4 @@
-import {WORKFLOW,fail} from './validation.js';
+import {MOBILE_RUN_WORKFLOWS,fail} from './validation.js';
 import {deviceAvailability,holdState,recoveryView,receiptStats} from './recovery.js';
 function run(row) {
   const metadata=row.metadata;
@@ -14,7 +14,7 @@ const RUN_SQL=`SELECT task.*,agent.status AS agent_status,agent.capabilities AS 
   (SELECT jsonb_build_object('total',COUNT(*),'stored',COUNT(*) FILTER(WHERE demand_status='fulfilled'),
     'needsAction',COUNT(*) FILTER(WHERE demand_status='needs_action')) FROM capture_discovery_run_candidates WHERE run_id=task.id) AS candidate_counts
   FROM capture_tasks task LEFT JOIN capture_agents agent ON agent.id=task.assigned_agent_id AND agent.tenant_id=task.tenant_id
-  WHERE task.tenant_id=$1 AND task.metadata->>'workflow'=$2`;
+  WHERE task.tenant_id=$1 AND task.metadata->>'workflow'=ANY($2::text[])`;
 export async function listNodes(tx,tenantId) {
   const rows=await tx.queryAll(`SELECT agent.*,held.task_id AS active_run_id,held.metadata AS held_metadata,
     held.status AS held_status,held.task_metadata FROM capture_agents agent LEFT JOIN LATERAL
@@ -34,10 +34,11 @@ export async function listNodes(tx,tenantId) {
   })};
 }
 export async function listRuns(tx,tenantId) {
-  return {runs:(await tx.queryAll(`${RUN_SQL} ORDER BY task.created_at DESC LIMIT 50`,[tenantId,WORKFLOW])).map(run)};
+  return {runs:(await tx.queryAll(`${RUN_SQL} ORDER BY task.created_at DESC LIMIT 50`,[tenantId,MOBILE_RUN_WORKFLOWS])).map(run)};
 }
 export async function runView(tx,tenantId,taskId) {
-  const row=await tx.queryOne(`${RUN_SQL} AND task.id=$3`,[tenantId,WORKFLOW,taskId]);
+  // Forward children also use wechat_channels_mobile_capture; task_type distinguishes them from capture.
+  const row=await tx.queryOne(`${RUN_SQL} AND task.id=$3`,[tenantId,MOBILE_RUN_WORKFLOWS,taskId]);
   if (!row) fail('MOBILE_RUN_NOT_FOUND',404);
   const items=await tx.queryAll(`SELECT item.id,item.keyword,item.status,item.attempt_count,item.assignment_revision,item.metadata,item.error,
     attempt.checkpoint FROM capture_task_items item LEFT JOIN capture_task_item_attempts attempt

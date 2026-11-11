@@ -85,6 +85,14 @@ export function wechatArticleImageStorageError(record = {}, imageRef) {
   return imageStorageError(Array.isArray(images) ? images.find(image => image?.url === imageRef) : null)
 }
 
+/** Separators remain in capture evidence, but never appear as body images or failed gallery items. */
+export function wechatArticleDisplayImages(record = {}, displayImages = []) {
+  const images = wechatArticleData(record).images
+  const decorative = new Set((Array.isArray(images) ? images : [])
+    .filter(image => image?.storageError?.code === 'decorative').map(image => image.url))
+  return displayImages.filter(image => !decorative.has(image.ref))
+}
+
 /** Map by original source URL, never the gallery's reordered/local-first index. Repeats stay in place. */
 export function wechatArticleBodyBlocks(record = {}, displayImages = []) {
   const article = wechatArticleData(record)
@@ -97,6 +105,7 @@ export function wechatArticleBodyBlocks(record = {}, displayImages = []) {
     try { parsed = new URL(block.url) } catch { return [] }
     if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) return []
     const image = saved.get(block.url)
+    if (image?.storageError?.code === 'decorative') return []
     const storageError = imageStorageError(image)
     const local = image?.stored === true && typeof image.localUrl === 'string' && image.localUrl.startsWith('/media/') ? image.localUrl : ''
     const display = entries.get(block.url)
@@ -139,11 +148,13 @@ export function wechatArticlePresentation(record = {}, capturedComments = 0) {
         ? { label: '正文暂不可读取', description: '本次没有取得文章正文。' }
         : { label: '正文完整性未确认', description: '本次尚未确认已读取至正文末尾。' }
   const evidence = object(article.evidence), storage = object(evidence.imageStorage)
+  const onlyDecorative = Array.isArray(article.images) && article.images.length > 0
+    && article.images.every(image => image?.storageError?.code === 'decorative')
   if (Number.isSafeInteger(storage.expected) && storage.expected > 0 && Number.isSafeInteger(storage.stored)
     && storage.stored >= 0 && storage.stored <= storage.expected) {
     body.description += ` 已发现配图已保存 ${storage.stored}/${storage.expected} 张；此数量仅指已发现的配图。`
   } else if (evidence.originalImagesCaptured === true) body.description += ' 已发现配图已保存。'
-  else if (evidence.originalImagesCaptured === false) body.description += fromPage && article.images?.length
+  else if (evidence.originalImagesCaptured === false && !onlyDecorative) body.description += fromPage && article.images?.length
     ? ' 已记录配图链接，原始图片尚未确认保存。' : ' 原始图片尚未保存。'
   const latest = object(article.latestCapture)
   if (latest.bodyStatus && latest.bodyStatus !== bodyStatus && ['partial', 'unavailable'].includes(latest.bodyStatus)) {
