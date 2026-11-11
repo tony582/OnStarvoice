@@ -1,3 +1,4 @@
+import { PLATFORM_LABELS as PLATFORM_CN } from '../services/platform-labels.js';
 import { Router } from 'express';
 import { queryAll, queryOne } from '../db/init.js';
 import { requireTenantAccess, requireTenantWriter } from '../middleware/auth.js';
@@ -29,7 +30,6 @@ const LEAD_DETAIL_COLUMNS = `comment_leads.*,
   (SELECT t.status FROM tickets t WHERE t.source_type = 'comment' AND t.source_comment_id = comment_leads.id AND t.tenant_id = comment_leads.tenant_id ORDER BY (t.status <> 'closed') DESC, t.created_at DESC, t.id DESC LIMIT 1) AS ticket_status`;
 
 // 导出用中文标签映射(MAP[v]||v||'')
-const PLATFORM_CN = { xiaohongshu: '小红书', douyin: '抖音', weibo: '微博' };
 const PRIORITY_CN = { low: '低', normal: '普通', high: '高', urgent: '紧急' };
 const LEAD_STATUS_CN = { new: '新线索', following: '跟进中', ticketed: '已转工单', resolved: '已处理', ignored: '已忽略' };
 const LEAD_TYPE_CN = { complaint: '投诉维权', renewal_billing: '续费收费', app_issue: 'App故障', service_quality: '服务求助', safety_privacy: '安全隐私', brand_risk: '品牌风险', sales_intent: '购买意向', other: '其他' };

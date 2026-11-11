@@ -1,3 +1,4 @@
+import { PLATFORM_LABELS } from './platform-labels.js';
 import ExcelJS from 'exceljs';
 import { queryAll, queryOne } from '../db/init.js';
 import { PUBLISHED_RECORD_PERIOD_SQL, RELEVANT_RECORD_SQL } from './report-generator.js';
@@ -18,14 +19,7 @@ const COLORS = {
   amber: 'D97706',
 };
 
-const PLATFORM_LABELS = {
-  xiaohongshu: '小红书',
-  douyin: '抖音',
-  weibo: '微博',
-  wechat_channels: '视频号', wechat_articles: '微信文章',
-  unknown: '未知平台',
-  '': '未知平台',
-};
+
 const SENTIMENT_LABELS = { positive: '正面', neutral: '中性', negative: '负面', '': '待标注' };
 const CATEGORY_LABELS = {
   safety_rescue: '安全救援',
@@ -449,7 +443,7 @@ function addMonthlySummary(workbook, { periodLabel, periodStart, periodEnd, gene
     labels.forEach(label => { counts[label] = rows.filter(row => row[key] === label).length; });
     return counts;
   };
-  const platformLabels = ['小红书', '抖音', '微博', '未知平台'];
+  const platformLabels = [...new Set([...Object.values(PLATFORM_LABELS), ...rows.map(row => row.platform)])];
   const sentimentLabels = ['正面', '中性', '负面', '待标注'];
   const handlingLabels = Object.values(HANDLING_LABELS);
   addDistributionBlock(sheet, {

@@ -1,10 +1,11 @@
+import { CUSTOMER_ASSISTANT_PLATFORMS } from './platform-labels.js';
 import {queryOne,queryAll,execute,withTransaction} from '../db/init.js';
 import {customerDailyReports} from './customer-daily-reports.js';
 import {createCustomerAssistantEmailService} from './customer-assistant-email.js';
 
 const defaultDb = {queryOne,queryAll,execute,withTransaction};
 const DAY = 86400000;
-const PLATFORMS = new Set(['all','douyin','xiaohongshu','weibo','bilibili','zhihu']);
+const PLATFORMS = new Set(CUSTOMER_ASSISTANT_PLATFORMS);
 const fail = (code,message,status = 400) => Object.assign(new Error(message),{code,status,safeMessage:message});
 const localDate = date => new Date(new Date(date).getTime()+8*3600000).toISOString().slice(0,10);
 const iso = value => value && Number.isFinite(Date.parse(value)) ? new Date(value).toISOString() : null;

@@ -1,6 +1,6 @@
 import {isTriageHandlingSnapshot} from './customer-daily-triage-scope.js';
 
-const PLATFORMS = {xiaohongshu: '小红书', xhs: '小红书', douyin: '抖音', weibo: '微博', bilibili: '哔哩哔哩', wechat: '微信', wechat_channels: '视频号', wechat_articles: '微信文章', zhihu: '知乎', kuaishou: '快手', toutiao: '今日头条', unknown: '未知平台'};
+import { PLATFORM_LABELS as PLATFORMS } from './platform-labels.js';
 
 export const CUSTOMER_DAILY_SECTIONS = Object.freeze({
   summary: '一、监控汇总（本期新增）',

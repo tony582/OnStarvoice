@@ -70,7 +70,7 @@ function errorMessage(error: unknown) {
 }
 
 const SL: Record<string, string> = { positive: '正面', neutral: '中性', negative: '负面' }
-const PL: Record<string, string> = { xiaohongshu: '小红书', douyin: '抖音', weibo: '微博' }
+const PL: Record<string, string> = { xiaohongshu: '小红书', douyin: '抖音', weibo: '微博', wechat_channels: '视频号', wechat_articles: '微信文章' }
 const CL: Record<string, string> = {
   safety_rescue: '安全救援', feature_usage: '功能使用', renewal_billing: '续费收费',
   privacy: '隐私安全', app_issue: 'App问题', service_quality: '服务质量', brand_image: '品牌形象', other: '其他',
@@ -288,7 +288,7 @@ function DashboardView({ owner }: { owner: string }) {
         <div className="flex flex-wrap items-center gap-3">
           <select value={platform} onChange={e => setPlatform(e.target.value)} className="h-9 rounded-lg border border-input bg-card px-3 text-sm">
             <option value="">全部平台</option>
-            <option value="xiaohongshu">小红书</option><option value="douyin">抖音</option><option value="weibo">微博</option>
+            {Object.entries(PL).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
           </select>
           <select value={sentiment} onChange={e => setSentiment(e.target.value)} className="h-9 rounded-lg border border-input bg-card px-3 text-sm">
             <option value="">全部情感</option>

@@ -1,3 +1,4 @@
+import { PLATFORM_LABELS as PLATFORM_CN } from '../services/platform-labels.js';
 import { Router } from 'express';
 import { queryAll, queryOne, withTransaction } from '../db/init.js';
 import { requireTenantAccess, requireSessionUser, requireTenantWriter } from '../middleware/auth.js';
@@ -727,7 +728,6 @@ router.get('/export', requireTenantAccess, async (req, res, next) => {
     }
     const STATUS_CN = { pending: '待处理', doing: '处理中', done: '已处理', dismissed: '已忽略', closed: '已结案' };
     const PRIORITY_CN = { urgent: '紧急', high: '高', normal: '普通', low: '低' };
-    const PLATFORM_CN = { xiaohongshu: '小红书', douyin: '抖音', weibo: '微博' };
     const columns = [
       { header: '工单号码', key: 'externalTicketNo', width: 20 },
       { header: '类型', key: 'type', width: 8 },

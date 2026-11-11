@@ -1,5 +1,5 @@
+import { PLATFORM_LABELS, CUSTOMER_ASSISTANT_PLATFORMS as PLATFORMS } from './platform-labels.js';
 const LIMITS = Object.freeze({steps: 8, calls: 16, input: 4000, reply: 6000, reasoning: 24000, result: 12000, history: 100000, messages: 48});
-const PLATFORMS = ['all', 'douyin', 'xiaohongshu', 'weibo', 'bilibili', 'zhihu'];
 const dateProperty = {type: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}$', description: '上海时区 YYYY-MM-DD'};
 const objectSchema = properties => ({type: 'object', properties, additionalProperties: false});
 const TOOL_DEFINITIONS = Object.freeze([
@@ -125,13 +125,12 @@ function toolResult(value) {
   return {value: fallback, content: JSON.stringify(fallback)};
 }
 
-const PLATFORM_LABELS = {all: '全部平台', douyin: '抖音', xiaohongshu: '小红书', weibo: '微博', bilibili: '哔哩哔哩', zhihu: '知乎'};
 const TOOL_LABELS = {query_negative: '负面查询', get_daily_report: '日报查询', email_daily_report: '日报邮件'};
 const plainText = (value, max = 300) => typeof value === 'string' ? value.replace(/[\u0000-\u001f\u007f]/gu, ' ').trim().slice(0, max) : '';
 const knownCount = value => Number.isSafeInteger(value) && value >= 0;
 const countText = value => knownCount(value) ? String(value) : '待核实';
 const dateText = value => validDate(value) ? value : '日期待核实';
-const platformText = value => PLATFORM_LABELS[value] || '其他平台';
+const platformText = value => value === 'all' ? '全部平台' : PLATFORM_LABELS[value] || '其他平台';
 function receiptTime(value) {
   if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) return '';
   const parts = new Intl.DateTimeFormat('en-CA', {timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'}).formatToParts(new Date(value));

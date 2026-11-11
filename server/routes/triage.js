@@ -1,3 +1,4 @@
+import { PLATFORM_LABELS as PLATFORM_CN } from '../services/platform-labels.js';
 import {getCrossPosts, excludeCrossPost} from '../services/cross-posts/store.js';
 import { Router } from 'express';
 import { withTransaction } from '../db/init.js';
@@ -41,7 +42,6 @@ import {
 const router = Router();
 
 // 导出用中文标签映射(MAP[v]||v||'')
-const PLATFORM_CN = { xiaohongshu: '小红书', douyin: '抖音', weibo: '微博', wechat_channels: '视频号', wechat_articles: '微信文章' };
 const SENTIMENT_CN = { positive: '正面', neutral: '中性', negative: '负面' };
 const TRIAGE_STATUS_CN = {
   unhandled: '待处理',
@@ -63,7 +63,7 @@ const TRIAGE_STATUS_CN = {
 };
 const PRIORITY_CN = { low: '低', normal: '普通', high: '高', urgent: '紧急' };
 const CATEGORY_CN = { safety_rescue: '安全救援', feature_usage: '功能使用', renewal_billing: '续费收费', privacy: '隐私安全', app_issue: 'App问题', service_quality: '服务质量', brand_image: '品牌形象', other: '其他' };
-const NOTE_TYPE_CN = { image: '图文', video: '视频', normal: '图文' };
+const NOTE_TYPE_CN = { image: '图文', video: '视频', normal: '图文', article: '文章' };
 // 账号名带品牌/车型(全称·简称)= 品牌关联号(非真实车主)。⚠ 与 web/admin utils.ts 的同名正则保持一致。
 const BRAND_MODEL_RE = /(安吉星|onstar|别克|凯迪拉克|凯迪|雪佛兰|buick|cadillac|chevrolet|上汽通用|君越|君威|昂科威|昂科拉|昂科旗|gl8|gl6|英朗|威朗|凯越|微蓝|velite|阅朗|ct4|ct5|ct6|xt4|xt5|xt6|锐歌|lyriq|凯雷德|科鲁兹|科沃兹|迈锐宝|创酷|创界|探界者|开拓者|沃兰多|星迈罗|赛欧|畅巡|景程)/i;
 const DEALER_NAME_RE = /(4s|旗舰店|体验中心|服务中心|销售服务|特约|经销|汽贸)/i;

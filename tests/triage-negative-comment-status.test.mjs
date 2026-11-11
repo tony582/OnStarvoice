@@ -1,3 +1,4 @@
+import { PLATFORM_LABELS } from '../server/services/platform-labels.js';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {readFileSync} from 'node:fs';
@@ -138,7 +139,7 @@ test('monthly workbook includes the ninth status and keeps the explanation below
   const require = createRequire(new URL('../server/package.json', import.meta.url));
   const ExcelJS = require('exceljs');
   const context = vm.createContext({
-    ExcelJS,
+    ExcelJS, PLATFORM_LABELS,
     RELEVANT_RECORD_SQL: 'true', PUBLISHED_RECORD_PERIOD_SQL: 'r.published_ts >= $2 AND r.published_ts < $3',
     queryOne: async () => ({name: '测试租户'}),
     queryAll: async sql => {
@@ -155,7 +156,7 @@ test('monthly workbook includes the ninth status and keeps the explanation below
   assert.equal(sheet.getCell('J19').value.result, 1);
   assert.match(sheet.getCell('J19').value.formula, /COUNTIF\('内容分诊数据源'!.*I19\)/);
   assert.equal(sheet.getCell('I6').value.result, 1);
-  assert.match(sheet.getCell('A20').value, /^说明：/);
+  assert.match(sheet.getCell(`A${11 + Math.max(new Set(Object.values(PLATFORM_LABELS)).size, 9)}`).value, /^说明：/);
   assert.equal(sheet.getCell('I19').isMerged, false);
   const data = workbook.getWorksheet('内容分诊数据源');
   const header = data.getRow(1).values;
