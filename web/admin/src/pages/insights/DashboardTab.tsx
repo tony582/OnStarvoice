@@ -122,10 +122,10 @@ const HANDLING_STATUS_ROWS = [
   { key: 'reviewed', label: '已复核', color: '#059669' },
   { key: 'reviewed_non_monitor', label: '已复核-非监控内容', color: '#64748B' },
   { key: 'unavailable', label: '已不可见', color: '#64748B' },
-  { key: 'privacy_unreachable', label: '负面–隐私设置无法触达', color: '#DC2626' },
+  { key: 'privacy_unreachable', label: '负面–隐私设置无法触达', color: '#2563EB' },
   { key: 'negative_feishu', label: '负面-飞书表', color: '#DC2626' },
-  { key: 'negative_cold', label: '负面-冷处理', color: '#DC2626' },
-  { key: 'negative_comment', label: '负面-评论区留言', color: '#DC2626' },
+  { key: 'negative_cold', label: '负面-冷处理', color: '#2563EB' },
+  { key: 'negative_comment', label: '负面-评论区留言', color: '#2563EB' },
 ] as const
 
 const PLATFORM_COLOR: Record<string, string> = {

@@ -219,7 +219,8 @@ const FILTER_TRIGGER = 'w-full justify-between'
 const FILTER_TRIGGER_CELL = `${FILTER_CELL} justify-between`
 
 function recordAccentClass(record: Record<string, unknown>) {
-  if (record.triage_status === 'negative_feishu' || record.triage_status === 'negative_cold' || record.triage_status === 'negative_comment' || record.triage_status === 'privacy_unreachable') return 'bg-status-red'
+  if (record.triage_status === 'negative_feishu') return 'bg-status-red'
+  if (record.triage_status === 'negative_cold' || record.triage_status === 'negative_comment' || record.triage_status === 'privacy_unreachable') return 'bg-status-blue'
   if (record.triage_status === 'replied' || record.triage_status === 'reviewed') return 'bg-status-green'
   if (record.sentiment === 'negative') return 'bg-status-red'
   if (record.sentiment === 'positive') return 'bg-status-green'
