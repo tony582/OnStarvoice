@@ -198,6 +198,10 @@ export function assessCustomerDailyCaptureReadiness(task) {
   const workflow = metadata.promotedBusinessTaskType || metadata.businessTaskType || metadata.workflow || task.task_type || 'capture';
   if (PATROL_WORKFLOWS.has(workflow) || PATROL_WORKFLOWS.has(task.feature_key) || ['capture.comments', 'capture.enhancement', 'capture.shared_policy'].includes(task.feature_key)) return null;
   if (task.task_type === 'capture_orchestration') {
+    // Forwarding shares the orchestration lifecycle but does not collect posts.
+    // Count every item so mixed/empty batches cannot bypass capture readiness.
+    const totalItems = Number(task.total_item_count);
+    if (totalItems > 0 && Number(task.wechat_forward_item_count) === totalItems) return null;
     // A keyword plan can now contain a separate patrol module. Once all keyword
     // items have settled, that patrol must not delay a report of new posts.
     if (Number(task.keyword_item_count) > 0 && Number(task.unsettled_keyword_items) === 0) return null;
@@ -412,13 +416,17 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
         'streamingSyncRemainingCount', t.progress->'streamingSyncRemainingCount', 'streamingSyncFailedCount', t.progress->'streamingSyncFailedCount',
         'streamingSyncBlocked', t.progress->'streamingSyncBlocked', 'streamingSyncEnqueuedUniqueCount', t.progress->'streamingSyncEnqueuedUniqueCount',
         'streamingSyncSucceededUniqueCount', t.progress->'streamingSyncSucceededUniqueCount') AS progress,
+      keyword_items.total_item_count, keyword_items.wechat_forward_item_count,
       keyword_items.keyword_item_count, keyword_items.unsettled_keyword_items
     FROM capture_tasks t
     LEFT JOIN LATERAL (
-      SELECT COUNT(*)::int AS keyword_item_count,
-        COUNT(*) FILTER (WHERE i.status NOT IN ('completed', 'completed_with_warnings', 'skipped', 'canceled'))::int AS unsettled_keyword_items
+      SELECT COUNT(*)::int AS total_item_count,
+        COUNT(*) FILTER (WHERE i.item_type = 'wechat_forward')::int AS wechat_forward_item_count,
+        COUNT(*) FILTER (WHERE i.item_type = 'keyword')::int AS keyword_item_count,
+        COUNT(*) FILTER (WHERE i.item_type = 'keyword'
+          AND i.status NOT IN ('completed', 'completed_with_warnings', 'skipped', 'canceled'))::int AS unsettled_keyword_items
       FROM capture_task_items i WHERE t.task_type = 'capture_orchestration'
-        AND i.tenant_id = t.tenant_id AND i.task_id = t.id AND i.item_type = 'keyword'
+        AND i.tenant_id = t.tenant_id AND i.task_id = t.id
     ) keyword_items ON true
     WHERE t.tenant_id = $1 AND t.created_at >= $2::timestamptz AND t.created_at < $3::timestamptz
       AND t.task_type IN ('capture', 'keyword_capture', 'unattended_keyword_capture', 'capture_orchestration')`, [tenantId, collectionStart, collectionCutoff]);

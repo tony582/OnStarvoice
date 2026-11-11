@@ -123,6 +123,9 @@ export function mobileKeywordRetrySource(execution) {
 // retryable 关键词在弹性池里由自动接力负责（按领取闸门判断）；其余关键词要走
 // 「重试失败关键词」，按服务端人工重试闸门判断。
 export function keywordRetrySourceReleased({item, execution, elasticPool = false} = {}) {
+  // A forward is single-attempt even when its source is settled or the pool
+  // classifies it as retryable. It must never enter the keyword retry controls.
+  if (item?.item_type === 'wechat_forward') return false;
   if (!execution) return false;
   if (elasticPool && item?.status === 'retryable') {
     return ELASTIC_CLAIM_SOURCE_RELEASED_STATUSES.has(String(execution.status || ''));

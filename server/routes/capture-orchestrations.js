@@ -59,6 +59,7 @@ import {
   trimMobilePlanSnapshot,
 } from '../services/android-control/mobile-tasks.js';
 import {STOP_FENCE_OPERATOR_RELEASED_REASON} from '../services/capture-stop-fence.js';
+import {FORWARD_ITEM_TYPE} from '../services/android-control/forward.js';
 import {
   FILTER_VERIFICATION_SETTLEMENT_KEYS,
   elasticRoundRelaxAfterMs,
@@ -98,6 +99,12 @@ const REOPENED_FROM_HISTORY_MARKER_SQL = `CASE
 END`;
 export const RETRY_ITEMS_MOBILE_SOURCE_MESSAGE =
   '手机采集的关键词不能在原批次里重试（手机不接收重试任务）；需要重采请新建手机采集批次';
+function wechatForwardRetryFailure(items) {
+  const forwards = items.filter(item => item?.item_type === FORWARD_ITEM_TYPE);
+  return forwards.length ? requestError('retry_items_wechat_forward',
+    '发到微信每次请求只发送一次，不能重试；如需再次发送，请在内容详情重新发起',
+    409, {itemIds: forwards.map(item => item.id)}) : null;
+}
 const RETRY_AGENT_SLOT_BLOCKING_STATUSES = [
   'pending',
   'waiting_device',
@@ -5623,6 +5630,14 @@ router.post(
         if (negativePatrolUsesDedicatedPerItemQueue(parentPreview)) {
           return {failure: negativePatrolPerItemQueueFailure()};
         }
+        // Reject even an idempotent replay containing a forward. This read does
+        // not change the existing Agent -> source -> parent -> item lock order.
+        const selectedItems = await tx.queryAll(`
+          SELECT id, item_type FROM capture_task_items
+          WHERE tenant_id = $1 AND task_id = $2 AND id = ANY($3::uuid[])
+        `, [req.tenantId, orchestrationId, normalized.itemIds]);
+        const forwardFailure = wechatForwardRetryFailure(selectedItems);
+        if (forwardFailure) return {failure: forwardFailure};
         const existingTasks = await tx.queryAll(`
           SELECT id, parent_task_id, assigned_agent_id, status, metadata
           FROM capture_tasks
@@ -5823,6 +5838,8 @@ router.post(
             404,
           )};
         }
+        const lockedForwardFailure = wechatForwardRetryFailure(retryItems);
+        if (lockedForwardFailure) return {failure: lockedForwardFailure};
         const ineligible = retryItems.filter(item =>
           !RETRY_ITEM_STATUSES.has(String(item.status || ''))
         );
