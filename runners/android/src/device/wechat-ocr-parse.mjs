@@ -6,14 +6,14 @@ export {comparable, similarity} from '../shared/wechat-text-match.mjs';
 // calibrated 1080x2242 DE106 screen. Nothing here touches the phone.
 
 export const SCREEN = Object.freeze({width: 1080, height: 2242});
-// Two result columns (measured 2026-11-05): a card's duration row sits at the thumbnail's lower left.
+// Two result columns (measured on DE106): captions start near the edge, names follow the avatar.
 const COLUMNS = Object.freeze([{x0: 18, x1: 531}, {x0: 548, x1: 1061}]);
 // Below the search box, tabs and sort row nothing on the results page is a card.
 export const RESULTS_TOP = 480;
 // The comment input box at the bottom of the panel; no tap may land here.
 export const COMMENT_INPUT_TOP = 2100;
 
-const DURATION = /^\d{1,2}[:：]\d{2}(?:[:：]\d{2})?$/u;
+const DURATION = /^(?:\d{1,2}[:：-]\d{2}(?:[:：]\d{2})?|00)$/u;
 const FOLD = /[.。…·•]+$/u;
 const center = row => ({x: row.x + Math.round(row.w / 2), y: row.y + Math.round(row.h / 2)});
 const byPosition = (a, b) => a.y - b.y || a.x - b.x;
@@ -92,7 +92,7 @@ function splitAuthorTime(rows) {
     return {author: ordered.slice(0, -1).map(row => row.text).join(''), timeLabel: last.text};
   }
   const joined = ordered.map(row => row.text).join('');
-  const match = joined.match(/^(.*?)[.。…·\s]*((?:\d{1,4}\s*(?:分钟|小时|天|周|星期|个月|月|年))|刚刚|今天|昨天|前天|(?:\d{4}年)?\d{1,2}月\d{1,2}日)[^]*$/u);
+  const match = joined.match(/^(.*?)[.。…·\s]*((?:\d{1,4}\s*(?:分钟|小时|天|周|星期|个月|月|年)(?:\s*前)?)|刚刚|今天|昨天|前天|(?:\d{4}年)?\d{1,2}月\d{1,2}日)[^]*$/u);
   return match ? {author: match[1], timeLabel: match[2]} : {author: joined, timeLabel: ''};
 }
 // The avatar left of the name is sometimes read as a stray glyph or digit followed by a space.
@@ -100,34 +100,49 @@ const cleanAuthor = text => String(text).replace(/^[^\p{L}\p{N}]+/u, '').replace
   .replace(FOLD, '').trim();
 
 /**
- * Result cards fully visible on one results screenshot, in reading order. Each card carries its tap point on the
- * thumbnail (never on the text or the sound button), its duration anchor and the snippet/author/time lines.
+ * Result cards in reading order. The author/time row and caption locate a card; a washed-out duration cannot
+ * hide it. Duration is optional supporting evidence, never a second source of cards. Screen-bottom cards wait
+ * until their author row is fully visible after a scroll.
  */
 export function parseResultCards(rows, {now = Date.now()} = {}) {
-  const anchors = rows.filter(row => DURATION.test(row.text.replace(/\s+/gu, '')) && row.y > RESULTS_TOP)
-    .map(row => ({row, column: COLUMNS.findIndex(c => row.x >= c.x0 && row.x <= c.x0 + 80)}))
-    .filter(entry => entry.column >= 0);
   const cards = [];
-  for (const {row: anchor, column} of anchors) {
-    const {x0, x1} = COLUMNS[column];
-    const inColumn = row => row.x >= x0 && row.x < x1 && row !== anchor;
-    const captionRows = rows.filter(row => inColumn(row) && row.y > anchor.y + 50 && row.y < anchor.y + 175 && row.x <= x0 + 70)
-      .sort(byPosition);
-    const metaRows = rows.filter(row => inColumn(row) && row.y >= anchor.y + 175 && row.y < anchor.y + 265);
-    if (!captionRows.length || !metaRows.length || anchor.y + 265 > SCREEN.height) continue;
-    const likeRow = rows.find(row => inColumn(row) && Math.abs(row.y - anchor.y) < 20 && row.x > x0 + 250);
-    const {author, timeLabel} = splitAuthorTime(metaRows);
-    const snippet = captionRows.map(row => row.text).join('');
-    const tapY = Math.max(RESULTS_TOP + 60, anchor.y - 240);
-    if (tapY >= anchor.y) continue;
-    const card = {column, anchorY: anchor.y, snippet, author: cleanAuthor(author), timeLabel: timeLabel.trim(),
-      likeLabel: likeRow ? (likeRow.text.match(/\d[\d.,万wW]*/u)?.[0] ?? '') : '',
-      age: parseTimeLabel(timeLabel, now), tap: {x: Math.round((x0 + x1) / 2), y: tapY}};
-    card.cardKey = cardKey(card);
-    cards.push(card);
+  for (const [column, {x0, x1}] of COLUMNS.entries()) {
+    const inColumn = row => row.x >= x0 && row.x < x1;
+    const visible = rows.filter(row => inColumn(row) && row.y > RESULTS_TOP && row.y + row.h <= SCREEN.height);
+    const candidates = visible.filter(row => row.x <= x0 + 110 && row.h >= 25 && row.h <= 56).sort(byPosition);
+    const metadataYs = [];
+    for (const candidate of candidates) {
+      if (metadataYs.some(y => Math.abs(y - candidate.y) < 20)
+        || /^\d{1,2}[:：-]\d{2}/u.test(candidate.text.trim())) continue;
+      // Keep an avatar glyph to the left out of a name that has its own OCR box.
+      const metaRows = visible.filter(row => row.x >= candidate.x - 5 && Math.abs(row.y - candidate.y) < 20
+        && row.h >= 25 && row.h <= 60);
+      const {author, timeLabel} = splitAuthorTime(metaRows);
+      const name = cleanAuthor(author);
+      if (!name || !/[\p{L}\p{N}]/u.test(name)) continue;
+      // A merged name/time can start at the column edge. A name without readable time needs the avatar indent.
+      if (!timeLabel && candidate.x < x0 + 55) continue;
+      const captionRows = visible.filter(row => row.x <= x0 + 70 && row.y >= candidate.y - 150
+        && row.y <= candidate.y - 55 && row.h >= 25 && row.h <= 70).sort(byPosition);
+      if (!captionRows.length) continue;
+      const duration = visible.filter(row => row.x <= x0 + 80 && row.y >= candidate.y - 265
+        && row.y <= candidate.y - 160 && DURATION.test(row.text.replace(/\s+/gu, '')))
+        .sort((a, b) => Math.abs(candidate.y - a.y - 200) - Math.abs(candidate.y - b.y - 200))[0];
+      const anchorY = duration?.y ?? candidate.y - 185;
+      const likeRow = duration && visible.find(row => Math.abs(row.y - duration.y) < 20 && row.x > x0 + 250);
+      const tapY = Math.max(RESULTS_TOP + 60, candidate.y - 420);
+      if (tapY >= anchorY || tapY >= captionRows[0].y) continue;
+      const card = {column, anchorY, metadataY: candidate.y, durationLabel: duration?.text.trim() ?? '',
+        snippet: captionRows.map(row => row.text).join(''), author: name, timeLabel: timeLabel.trim(),
+        likeLabel: likeRow ? (likeRow.text.match(/\d[\d.,万wW]*/u)?.[0] ?? '') : '',
+        age: parseTimeLabel(timeLabel, now), tap: {x: Math.round((x0 + x1) / 2), y: tapY}};
+      card.cardKey = cardKey(card);
+      cards.push(card);
+      metadataYs.push(candidate.y);
+    }
   }
-  // One card row: the two duration anchors of a row can differ by a few pixels.
-  return cards.sort((a, b) => (Math.abs(a.anchorY - b.anchorY) < 40 ? 0 : a.anchorY - b.anchorY) || a.column - b.column);
+  // Names on the same two-column card row can differ by a few pixels.
+  return cards.sort((a, b) => (Math.abs(a.metadataY - b.metadataY) < 40 ? 0 : a.metadataY - b.metadataY) || a.column - b.column);
 }
 
 /** True when a card is the same work as one already seen (OCR differs slightly between screenshots). */

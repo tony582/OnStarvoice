@@ -9,6 +9,7 @@ import {recordDiagnostic} from '../core/diagnostics.mjs';
 import {acquireDeviceLock, inspectDeviceLock} from '../core/device-lock.mjs';
 import {createCloudClient} from '../cloud/client.mjs';
 import {createControlClient} from '../cloud/control-client.mjs';
+import {completionStats} from '../cloud/completion-stats.mjs';
 import {deliverPendingBatch, summarizeDelivery} from '../cloud/delivery.mjs';
 import {createSimulationDevice} from './simulation.mjs';
 import {assertSimulationOrigin, fixedLockRoot, readConfig, setCheckpoint, stateValue} from './state.mjs';
@@ -92,7 +93,7 @@ export class AndroidDaemon {
     const status = result.status === 'completed_with_warnings' ? 'completed' : result.status;
     const body = {requestId: randomUUID(), identity: active.task.identity, sessionId: active.sessionId,
       status, reason: result.reason, deviceIdle: result.deviceIdle === true,
-      checkpoint: {stats: result.stats ?? null, lastEventId: result.lastEventId ?? null,
+      checkpoint: {stats: completionStats(result.stats), lastEventId: result.lastEventId ?? null,
         originalStatus: result.status, pendingEvents: this.store.pendingCount(),
         ...(result.homePark ? {homePark: result.homePark} : {}),
         ...(result.details && Object.keys(result.details).length ? {failure: result.details} : {})}};

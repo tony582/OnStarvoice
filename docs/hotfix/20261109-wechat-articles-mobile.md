@@ -657,3 +657,32 @@ PG 只连接本机隔离库 `onstarvoice_test_wechat_articles_20261109`。文章
 内容分诊的列表记录仅带图片元数据，其抽屉不包含完整文章元数据；本次“已保存 1/1”验收使用调度任务入库结果的完整内容详情。未为此追加未审代码或扩大发布范围。
 
 本地完整证据：`output/wechat-articles/deploy-t16-20261111/`；远端保留 `release-report.md`、`final-verification.json`、`ui-acceptance.json`、`article-reprocess.log`、六轮 `observations/`、逐服务就绪证据及备份。此节为 `[skip ci]` 文档收尾提交，生产产品源版本仍是 `da41466`。
+
+
+## 第十一轮 T17：视频号漏卡、停采边界与本地证据（2026-11-11）
+
+候选版本 **0.5.3**。以 `0bba704` 的服务端/后台历史合入 `860668d`（0.5.2 单引号 UI 属性修复），本轮用一个合并提交保留两边历史；不 push、不部署，关键词与手机运行状态未改。真机复测交由 Claude。
+
+- 卡片主锚点改为作者/时间行与上方标题，时长仅作辅助；缺时长、`00`、`00-45`、合并作者时间行均可解析。底部作者缺失的半张卡继续跳过，sameCard/cardKey 未改。
+- 四份真实 OCR 原始 JSON 已复制到测试 fixtures，并校验 SHA-256；每屏首行左右两张均解析，包含甘肃卓润与 ishoug 好奇。真实读屏是离线回放，不冒充新真机验收。
+- 连续三张超出时间窗才提出停止，先处理完当前屏；本屏有窗内卡则继续。未知年龄清零。返回/恢复 OCR 漏掉待处理卡时补读一次，只用新读屏坐标；仍缺失则清零并翻页，留 `missing_on_reread`，不因丢失的新卡提前结束。
+- 最新排序记录点击前后截图 SHA-256 和 sortCheck。OCR 无法证明样式选中态，明确记 unavailable；少于三张可读年龄记 too_few_readable_ages。诊断失败不影响采集，不声称截图哈希证明已选中。
+- 独立本地 `diagnostics:cards` 环形记录上限 3000（普通 diagnostics 的 200 条不变），保留每次读屏原始行数、卡片数、列、作者、时间及去向。补充预算中止的 not_opened 和重读缺失状态。
+- 任务数字统计：cardsSeen 为不同候选卡数；opened 为成功打开次数；outsideWindow 包含列表与网页确认的超窗数；screens 为所有结果读屏次数（含返回/补读）；stopReason 为数字码。数字码：1 列表结束、2 时间窗结束、3 链接上限、4 卡片上限、5 翻页上限、6 关键词时限、7 批次时限、8 任务截止、9 停止、10 连接/租约、11 其它失败、0 其它完成。原 result.reason 仍可读。手机和服务端均按白名单过滤 stats，不上传作者/标题/截图诊断；旧完成请求的幂等哈希保持原语义。
+
+验证：采集器全量 **600/600**，0 失败、0 跳过；边界检查 **134 模块通过、最大 338 行**；完成回执和恢复针对性 **13/13**；diff --check 通过。首轮环境禁止本机监听造成 26 项 EPERM，正常授权本机测试后同套件全部通过；未使用生产或真机。日志存 `output/wechat-articles/t17/collector-full.log`。
+
+
+## 0.5.3 生产发布（2026-11-11）
+
+用户授权后推送源版本 `cbbb958ca52c79920b2242f84e908cfcb585cfe9`，[CI 42977420834](https://github.com/tony582/OnStarvoice/actions/runs/42977420834) **5/5** 作业全绿后发布。服务端基线为 T16 `da41466`，当天 11:41 的后台冷配色 `f893000` 保持原样。远端目录 `/opt/onstarvoice-private/releases/collector-053-cbbb958-20261111`。
+
+**15:22** 替换 2 个已有 JS、新增 `completion-stats.js`，总计 **3 个 JS**，没有迁移、后台或依赖更新。只重启 api，PID `1322618 → 1333527`，重启数 `26 → 27`；scheduler `1322729 / 5`、ai-media `1322849 / 6` 保持不变。连续 5 次 API ready 通过，15:30 再核对正常，实际公网 `voice.minilife.online` ready 通过。未回滚。
+
+**15:28** 手机再次确认空闲，正常停止 0.5.2；确认退出并释放锁后，完整备份状态目录：**566 文件、220256797 字节、4 符号链接**，逐文件 hash 一致，5 个 SQLite quick_check=ok。首次复制因跟随 Chromium 临时符号链接失败，保留失败目录；新备份正确保留符号链接并核验成功。
+
+**15:29** 在 Finder 双击 `runtime-0.5.3-cbbb958/launcher/StarVoice 手机采集.command`。新进程 PID `50269`，session `6025101d-0453-468a-b06f-6c7d66b0fab0`，父链 `node → zsh → login → Terminal → launchd`；脱离 Codex 工具执行会话托管。启动 OCR 预热 **625 ms**，ready=true、active=null、pendingEvents=0、completionPending=false，旧隔离事件 **64** 未清理。生产 **15:30:38** 心跳就绪，抖音、视频号、文章三个平台均 ready，3 个 runnerFeatures 未变。运行版本以包版本、精确源哈希、实际进程目录核对；未重新注册节点，因此生产注册 appVersion 不是本次升级证明。
+
+20:30 视频号计划仍 **最新一天、13 词、每词 5 分钟、revision 2**；22:00 抖音仍 **13 词、revision 2**。全部活跃计划的快照/修订/下次时间与升级前一致，未编辑关键词、未新建测试任务。
+
+今晚 20:30 正常计划用于冒烟，**本次发布时尚未发生**。明早仍需核对 13 词回执 `cardsSeen/opened/outsideWindow/screens` 与实际入库数，对比 11-10 的 **8 条**；不将部署就绪当作已通过夜间采集验收。完整证据和报告在 `output/wechat-articles/deploy-053-20261111/`，远端发布目录已留报告和 `applied` 标记。

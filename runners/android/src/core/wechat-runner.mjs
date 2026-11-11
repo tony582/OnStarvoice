@@ -8,6 +8,7 @@ import {wechatPostEvent, wechatWorkKey} from './wechat-evidence.mjs';
 import {sameCard} from '../device/wechat-ocr-parse.mjs';
 import {runWechatPatrol} from './wechat-patrol.mjs';
 import {runWechatForward} from './wechat-forward.mjs';
+import {createWechatCardTrace, WECHAT_STOP_CODES} from './wechat-card-diagnostics.mjs';
 
 export const DEFAULT_CLOCK = {wallNow: () => Date.now(), monotonicNow: () => performance.now()};
 const METHODS = ['inspect', 'search', 'readCards', 'openCard', 'copyLink', 'readComments', 'returnToResults', 'recoverResults', 'scroll'];
@@ -52,7 +53,8 @@ export const sleep = (ms, signal) => new Promise(resolve => {
 export async function runWechatTask({task, store, device, permit, preview, clock = DEFAULT_CLOCK, resumeAuthorized = false,
   deviceClosureVerified = null, actionTimeoutMs = 60_000, prefilter = null, random = Math.random, postPauseMs = POST_PAUSE_MS, preparationMs = 0}) {
   let ledger, gate, result, failure = null, lastEventId = null;
-  const stats = {posts: 0, previewFailed: 0, previewUnavailable: 0, outsideWindow: 0, comments: 0};
+  const stats = {posts: 0, previewFailed: 0, previewUnavailable: 0, outsideWindow: 0, comments: 0, opened: 0};
+  const trace = createWechatCardTrace({store, task, clock});
   const pending = [];
   const note = (event, error = null, extra = {}) => recordDiagnostic(store, {at: new Date(clock.wallNow()).toISOString(), event,
     runId: task?.identity?.discoveryRunId ?? null, itemId: task?.identity?.itemId ?? null, keyword: task?.keyword ?? null,
@@ -67,11 +69,15 @@ export async function runWechatTask({task, store, device, permit, preview, clock
     }
     throw last;
   };
-  const assemble = async ({card, rank, shareUrl, info, comments, capturedAt}) => {
+  const assemble = async ({card, rank, shareUrl, info, comments, capturedAt, screen}) => {
     let value;
     try { value = await info; } catch (error) { stats.previewFailed++; note('wechat_preview_failed', error); return; }
     if (value.unavailable) { stats.previewUnavailable++; return; }
-    if (windowHours !== null && (capturedAt / 1000 - value.createtime) / 3600 > windowHours) { stats.outsideWindow++; return; }
+    if (windowHours !== null && (capturedAt / 1000 - value.createtime) / 3600 > windowHours) {
+      stats.outsideWindow++;
+      trace.record(card, 'outside_window', {source: 'preview', publishedAt: value.createtime}, screen);
+      return;
+    }
     const event = wechatPostEvent({task, card, rank, shareUrl, info: value, comments: await comments, capturedAt});
     if (!store.getEvent(event.eventId)) { store.recordEvent(event); stats.posts++; stats.comments += event.comments.items.length; }
     lastEventId = event.eventId;
@@ -103,43 +109,74 @@ export async function runWechatTask({task, store, device, permit, preview, clock
       const sort = windowHours !== null ? 'latest' : (task.filters.sort ?? 'all');
       // The App's own 时长 / 范围 choices (0.4.5); absent means 不限.
       const searched = await call('search', {keyword: task.keyword, sort,
-        duration: task.filters.duration ?? 'all', scope: task.filters.scope ?? 'all'});
+        duration: task.filters.duration ?? 'all', scope: task.filters.scope ?? 'all',
+        onDiagnostic: entry => note(entry.event, null, entry)});
       requireEvidence(searched?.verified === true, 'search_context_unverified');
       const seen = [];
-      let cards = searched.cards, emptyPages = 0, older = 0, skips = 0, rank = 0;
+      let pageCards = [], pageRechecked = false;
+      const observePage = (next, source) => {
+        for (const card of next) if (!pageCards.some(other => sameCard(other, card))) pageCards.push(card);
+        return trace.observe(next, source);
+      };
+      let cards = observePage(searched.cards, 'search'), emptyPages = 0, older = 0, skips = 0, rank = 0;
+      // Returning from a post rereads the same viewport. Only a scroll starts a new page for this guard.
+      let pageHasInWindow = false;
       const decide = cardPrefilter(prefilter, task, permit, clock, ledger);
       while (!result) {
         const fresh = cards.filter(card => !seen.some(other => sameCard(other, card)));
         if (!fresh.length) {
+          // A return/recovery OCR can omit a card seen earlier on this viewport. Its old tap is no longer safe.
+          const missing = pageCards.filter(card => !seen.some(other => sameCard(other, card)));
+          if (missing.length && !pageRechecked) {
+            pageRechecked = true;
+            cards = observePage(await call('readCards'), 'reread');
+            continue;
+          }
+          for (const card of missing) trace.record(card, 'missing_on_reread');
+          // A threshold reached in the middle of a screen is only a proposal to stop. Finish that screen first.
+          if (pageHasInWindow || missing.length) older = 0;
+          if (windowHours !== null && older >= 3) { result = {status: 'completed', reason: 'publish_window_end'}; break; }
           emptyPages++;
           if (emptyPages >= 2) { result = {status: 'completed', reason: 'results_end'}; break; }
           ledger.beforeSwipe();
           await call('scroll');
-          cards = await call('readCards');
+          pageHasInWindow = false; pageCards = []; pageRechecked = false;
+          cards = observePage(await call('readCards'), 'scroll');
           continue;
         }
         emptyPages = 0;
         const skip = await decide(fresh);
         const card = fresh[0];
+        const screen = trace.screens;
         seen.push(card);
         rank++;
         if (windowHours !== null && card.age && card.age.minHours > windowHours) {
           older++;
-          if (older >= 2) { result = {status: 'completed', reason: 'publish_window_end'}; break; }
+          stats.outsideWindow++;
+          trace.record(card, 'old_card', {source: 'list'}, screen);
           continue;
         }
-        if (card.age) older = 0;
-        if (skip.has(card.cardKey)) continue;
+        // Unknown list age must break an old-card streak too. A confirmed preview may start a new streak.
+        const precedingOlder = card.age ? older : 0;
+        older = 0;
+        if (skip.has(card.cardKey)) {
+          if (card.age) pageHasInWindow = true;
+          trace.record(card, 'prefilter_skip', {}, screen);
+          continue;
+        }
         ledger.beforeCard();
         let shareUrl;
         try {
           await call('openCard', {card});
+          stats.opened++;
+          trace.record(card, 'opened', {}, screen);
           ({shareUrl} = await call('copyLink'));
         } catch (error) {
+          trace.record(card, 'open_failed', {reason: error.code ?? 'device_failure'}, screen);
           if (!RECOVERABLE.has(error.code) || error.deviceSettled !== true || skips >= MAX_CONSECUTIVE_SKIPS) throw error;
           note('wechat_card_skipped', error);
           skips++;
-          try { cards = await call('recoverResults'); }
+          try { cards = observePage(await call('recoverResults'), 'recover'); }
           catch (recovery) {
             if (['user_stop', 'remote_stop', 'lease_expired', 'aborted'].includes(recovery.code)) throw recovery;
             throw new RunnerFault(error.code, `${error.message}; safe return failed (${recovery.code})`, {...faultDetails(error), recovery: recovery.code});
@@ -160,11 +197,12 @@ export async function runWechatTask({task, store, device, permit, preview, clock
             note('wechat_comments_unread', error);
           }
         }
-        pending.push(assemble({card, rank, shareUrl, info, comments, capturedAt}));
+        pending.push(assemble({card, rank, shareUrl, info, comments, capturedAt, screen}));
         ledger.noteLink(early ? wechatWorkKey(early) : `card:${card.cardKey}`);
         skips = 0;
-        cards = await call('returnToResults');
-        if (outside && sort === 'latest') { older++; if (older >= 2) { result = {status: 'completed', reason: 'publish_window_end'}; break; } }
+        cards = observePage(await call('returnToResults'), 'return');
+        if (outside && sort === 'latest') older = precedingOlder + 1;
+        else if (early && !early.unavailable && windowHours !== null) pageHasInWindow = true;
         const [low, high] = postPauseMs;
         await sleep(low + Math.round(random() * (high - low)), permit.signal);
         permit.assertAllowed();
@@ -175,10 +213,14 @@ export async function runWechatTask({task, store, device, permit, preview, clock
     result = {...outcome(error), message: error.message, details: faultDetails(error)};
   }
   await Promise.allSettled(pending);
+  stats.cardsSeen = trace.cardsSeen;
+  stats.screens = trace.screens;
   if (ledger) {
     try { ledger.finish(result.status, result.reason); }
     catch (error) { failure = error; result = {...outcome(error), message: error.message, details: faultDetails(error)}; }
   }
+  stats.stopReason = WECHAT_STOP_CODES[result.reason] ?? (result.status === 'completed' ? 0 : 11);
+  trace.finish(result.reason);
   note('task_finished', failure, {status: result.status, reason: result.reason, stats: {...ledger?.summary(), ...stats}});
   const deviceClosure = task?.deviceId ? readDeviceClosure(store, task.deviceId) : null;
   const deviceIdle = !deviceClosure?.required && (gate ? gate.deviceIdle : true);
