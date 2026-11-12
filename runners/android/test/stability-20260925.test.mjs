@@ -232,6 +232,7 @@ test('the one-click window warns when the phone may sleep and prints finished ke
     appiumLaunch: {node: 'node', entry: '/tool/main.js', args: [], env: {}}}));
   const out = []; let daemon; let finish;
   const deps = {
+    checkHostPower: async () => {},
     adb: {startServer: async () => {}, stayOnWhilePluggedIn: async () => 0},
     ensureAppium: async () => ({started: false, child: null}), stopAppium: async () => {},
     createDaemon: () => (daemon = {ready: false, deviceReason: 'device_asleep', blocked: null, lastOutcome: null,

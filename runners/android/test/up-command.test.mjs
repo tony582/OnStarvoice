@@ -72,6 +72,7 @@ test('up ensures adb, starts Appium with the stored descriptor and stops it afte
   const out = []; const child = {tag: 'appium-child'};
   const events = {adb: 0, stopped: null}; let ensured; let daemon;
   const deps = {
+    checkHostPower: async () => {},
     adb: {startServer: async () => { events.adb++; }, listDevices: async () => [{serial: 'PHONE-1', state: 'device'}]},
     ensureAppium: async options => { ensured = options; return {started: true, child}; },
     stopAppium: async c => { events.stopped = c; },
@@ -95,6 +96,7 @@ test('up registers on first use, prompting for cloud URL and code without loggin
   t.after(() => rmSync(dir, {recursive: true, force: true}));
   const out = []; const answers = ['', 'SECRET-CODE-123']; let setupArgs; let daemon;
   const deps = {
+    checkHostPower: async () => {},
     adb: {startServer: async () => {}, listDevices: async () => [{serial: 'ONLYPHONE', state: 'device'}]},
     ensureAppium: async () => ({started: false, child: null}),
     stopAppium: async () => {},
@@ -119,6 +121,7 @@ test('up prints the device list and refuses to guess when adb has no single onli
   t.after(() => rmSync(dir, {recursive: true, force: true}));
   const out = []; let setupCalled = false;
   const deps = {
+    checkHostPower: async () => {},
     adb: {startServer: async () => {}, listDevices: async () => [{serial: 'A', state: 'device'}, {serial: 'B', state: 'device'}]},
     setup: async () => { setupCalled = true; }, prompt: async () => 'code',
     ensureAppium: async () => ({started: false, child: null}), stopAppium: async () => {},

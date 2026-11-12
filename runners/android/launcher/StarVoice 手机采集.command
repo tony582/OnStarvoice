@@ -31,4 +31,5 @@ fi
 
 echo "StarVoice 手机采集 — 状态目录：$STATE_DIR"
 echo "（请保持手机解锁常亮、抖音已登录；首次运行会提示输入激活码，激活码不会被保存）"
-exec node cli.mjs up --state-dir "$STATE_DIR"
+# Keep the assertion alive only while the foreground runner is alive; no system settings are changed.
+exec caffeinate -is node cli.mjs up --state-dir "$STATE_DIR"

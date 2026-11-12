@@ -7,10 +7,12 @@ import {AndroidDaemon} from '../daemon/runtime.mjs';
 import {readConfig} from '../daemon/state.mjs';
 import {confirmDeviceClosure, daemonStatus, requestLocalStop} from '../daemon/local-control.mjs';
 import {diagnoseRunner} from '../daemon/diagnose.mjs';
+import {warnWhenHostOnBattery} from './host-power.mjs';
 
 export async function startRunner({stateDir, durationMs, stdout = console.log}) {
   const config = readConfig(stateDir);
   const daemon = new AndroidDaemon({stateDir,config,actionTimeoutMs:config.deviceProfile || config.wechat ? 60000 : 10000});
+  if (!config.simulation) await warnWhenHostOnBattery({store: daemon.store, stdout});
   const stop = () => daemon.requestStop('user_stop');
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);

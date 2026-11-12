@@ -11,6 +11,7 @@ import {ensureAppium, stopAppium, wait} from '../daemon/appium-process.mjs';
 import {createAdbClient} from '../device/adb.mjs';
 import {DOUYIN_P0_PROFILE} from '../device/douyin-profile.mjs';
 import {describeMemory} from '../device/douyin-memory.mjs';
+import {warnWhenHostOnBattery} from './host-power.mjs';
 
 // Plain-language readiness reasons, matching the admin node rail wording.
 const REASON_TEXT = Object.freeze({
@@ -192,7 +193,8 @@ async function firstRunSetup({stateDir, values, env, stdout, adb, setup, prompt}
 export async function runUp(values, {env = process.env, stdout = console.log, deps = {}} = {}) {
   const {ensureAppium: ensureAppiumDep = ensureAppium, stopAppium: stopAppiumDep = stopAppium,
     createDaemon = options => new AndroidDaemon(options), setup = setupRunner, resolveLaunch = resolveAppiumLaunch,
-    prompt = defaultPrompt(), sleep = wait, onSignals = defaultOnSignals, watchMs = 500} = deps;
+    prompt = defaultPrompt(), sleep = wait, onSignals = defaultOnSignals, watchMs = 500,
+    checkHostPower = warnWhenHostOnBattery} = deps;
   const stateDir = resolve(values['state-dir']);
   const adb = deps.adb ?? createAdbClient({adbPath: values['adb-path']});
   await adb.startServer();
@@ -207,6 +209,7 @@ export async function runUp(values, {env = process.env, stdout = console.log, de
   }
   if (!config.simulation && config.deviceProfile) await warnWhenScreenCanSleep({adb, serial: config.deviceId, stdout});
   const daemon = createDaemon({stateDir, config, actionTimeoutMs: config.deviceProfile || config.wechat ? 60000 : 10000});
+  if (!config.simulation) await checkHostPower({store: daemon.store, stdout});
   const cleanup = onSignals(() => daemon.requestStop('user_stop'));
   const watch = new AbortController();
   const watcher = watchReadiness(daemon, {stdout, sleep, signal: watch.signal, watchMs});
