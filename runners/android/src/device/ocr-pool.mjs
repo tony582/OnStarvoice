@@ -10,6 +10,9 @@ import {DeviceError} from './bounded.mjs';
 // and answers requests concurrently. Screenshots are written to a private directory only for the moment the
 // helper reads them and are deleted with the reply; neither images nor recognized text are kept.
 export const OCR_REQUEST_TIMEOUT_MS = 15_000;
+export const OCR_FAST_FAILURE_MS = 1000;
+export const OCR_FAST_FAILURE_LIMIT = 3;
+export const OCR_RECYCLE_COOLDOWN_MS = 120_000;
 const MAX_RESTARTS = 3;
 const STDERR_BYTES = 2048;
 
@@ -21,8 +24,9 @@ export function ocrHelperAvailable(binaryPath) {
 export function createOcrPool({binaryPath, tmpDir, concurrency = 3, spawnImpl = spawn,
   requestTimeoutMs = OCR_REQUEST_TIMEOUT_MS, now = Date.now} = {}) {
   if (typeof tmpDir !== 'string' || !tmpDir) throw new DeviceError('ocr_unavailable', 'OCR scratch directory is required');
-  let child = null, restarts = 0, closed = false, lastSuccessAt = null;
+  let child = null, restarts = 0, closed = false, lastSuccessAt = null, lastRecycleAt = null, needsWarmup = false;
   const pending = new Map();
+  const recycleListeners = new Set();
   const details = (worker, extra = {}) => {
     let stderr = worker.stderr.toString('utf8');
     // Decoding a partial UTF-8 boundary can add replacement bytes; retain the same byte ceiling.
@@ -68,7 +72,7 @@ export function createOcrPool({binaryPath, tmpDir, concurrency = 3, spawnImpl = 
         message: String(cause?.message ?? cause).slice(0, 512), stderr: '',
       }});
     }
-    const worker = {proc, stderr: Buffer.alloc(0), retired: false};
+    const worker = {proc, stderr: Buffer.alloc(0), retired: false, fastFailures: 0};
     child = worker;
     proc.stderr?.on('data', chunk => {
       worker.stderr = Buffer.from(Buffer.concat([worker.stderr, Buffer.from(chunk)]).subarray(-STDERR_BYTES));
@@ -81,12 +85,29 @@ export function createOcrPool({binaryPath, tmpDir, concurrency = 3, spawnImpl = 
       const entry = pending.get(reply?.id);
       if (!entry || entry.worker !== worker) return;
       if (reply.ok !== true || !Array.isArray(reply.rows)) {
-        settle(reply.id, error(worker, 'ocr_failed', 'Text recognition failed', {
+        const elapsedMs = now() - entry.startedAt;
+        const fastFailure = reply.error === 'recognition_failed' && elapsedMs >= 0 && elapsedMs < OCR_FAST_FAILURE_MS;
+        worker.fastFailures = fastFailure ? Math.min(OCR_FAST_FAILURE_LIMIT, worker.fastFailures + 1) : 0;
+        const failure = error(worker, 'ocr_failed', 'Text recognition failed', {
           error: typeof reply.error === 'string' ? reply.error.slice(0, 256) : 'invalid_reply',
           ...(typeof reply.domain === 'string' ? {domain: reply.domain.slice(0, 256)} : {}),
           ...(Number.isSafeInteger(reply.code) ? {code: reply.code} : {}),
-        }));
+        });
+        settle(reply.id, failure);
+        if (worker.fastFailures >= OCR_FAST_FAILURE_LIMIT && child === worker && !worker.exited && !closed
+          && (lastRecycleAt === null || now() - lastRecycleAt >= OCR_RECYCLE_COOLDOWN_MS)) {
+          lastRecycleAt = now(); needsWarmup = true;
+          const event = {event: 'ocr_helper_recycled', reason: 'recognition_failed', failures: worker.fastFailures,
+            elapsedMs, cooldownMs: OCR_RECYCLE_COOLDOWN_MS, details: failure.details};
+          // An intentional recycle is not an unexpected helper exit and must not consume its crash budget.
+          retire(worker, 'ocr_unavailable', 'The local OCR helper was recycled after repeated fast recognition failures',
+            {error: 'recognition_failed', reason: 'ocr_helper_recycled'});
+          try { start(); } catch { /* Readiness's warmup reports the new helper's startup failure. */ }
+          for (const listener of recycleListeners) { try { listener(event); } catch { /* Recovery observers cannot break the pool. */ } }
+        }
       } else {
+        worker.fastFailures = 0;
+        if (entry.warmup && child === worker && !worker.exited) needsWarmup = false;
         if (child === worker && !worker.exited) lastSuccessAt = now();
         settle(reply.id, null, {rows: reply.rows.map(normalizeRow).filter(Boolean), width: reply.width, height: reply.height, ms: reply.ms});
       }
@@ -108,10 +129,14 @@ export function createOcrPool({binaryPath, tmpDir, concurrency = 3, spawnImpl = 
   };
   return {
     /** Recognize one PNG screenshot (Buffer). `roi` = [x, y, w, h] in pixels limits the work to one area. */
-    async recognize(png, {roi = null, signal, timeoutMs = requestTimeoutMs} = {}) {
+    async recognize(png, {roi = null, signal, timeoutMs = requestTimeoutMs, warmup = false} = {}) {
       if (!Buffer.isBuffer(png) || png.length < 8) return Promise.reject(new DeviceError('ocr_failed', 'Screenshot is empty'));
       if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) throw new DeviceError('invalid_timeout', 'OCR timeout must be between 1 and 120000 ms');
       if (signal?.aborted) throw new DeviceError('aborted', 'Text recognition was canceled');
+      if (closed) throw new DeviceError('ocr_unavailable', 'OCR helper was closed');
+      // Do not let an active task's 15-second retry kill the replacement while its 120-second cold warmup runs.
+      if (needsWarmup && warmup !== true) throw new DeviceError('ocr_unavailable', 'The replacement OCR helper is warming up',
+        {details: {error: 'ocr_warming', reason: 'ocr_helper_recycled'}});
       const worker = start();
       const id = randomUUID();
       const path = join(tmpDir, `${id}.png`);
@@ -127,7 +152,7 @@ export function createOcrPool({binaryPath, tmpDir, concurrency = 3, spawnImpl = 
           settle(id, error(worker, 'aborted', 'Text recognition was canceled'));
           retire(worker, 'ocr_unavailable', 'The local OCR helper was restarted after cancellation', {error: 'request_aborted'});
         };
-        pending.set(id, {resolve, reject, timer, path, worker, signal, onAbort});
+        pending.set(id, {resolve, reject, timer, path, worker, signal, onAbort, startedAt: now(), warmup: warmup === true});
         signal?.addEventListener('abort', onAbort, {once: true});
         if (signal?.aborted) { onAbort(); return; }
         try {
@@ -139,8 +164,14 @@ export function createOcrPool({binaryPath, tmpDir, concurrency = 3, spawnImpl = 
     },
     get pending() { return pending.size; },
     get lastSuccessAt() { return lastSuccessAt; },
+    onRecycled(listener) {
+      if (typeof listener !== 'function') throw new TypeError('OCR recycle listener must be a function');
+      if (!closed) recycleListeners.add(listener);
+      return () => recycleListeners.delete(listener);
+    },
     close() {
       closed = true;
+      recycleListeners.clear();
       if (child) retire(child, 'aborted', 'OCR helper closed');
       lastSuccessAt = null;
     },

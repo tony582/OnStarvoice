@@ -5,7 +5,7 @@ import {PassThrough} from 'node:stream';
 import {mkdtempSync, readdirSync, rmSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
-import {createOcrPool, OCR_REQUEST_TIMEOUT_MS} from '../src/device/ocr-pool.mjs';
+import {createOcrPool, OCR_REQUEST_TIMEOUT_MS, OCR_FAST_FAILURE_MS, OCR_RECYCLE_COOLDOWN_MS} from '../src/device/ocr-pool.mjs';
 
 const png = Buffer.from('89504e470d0a1a0a', 'hex');
 function fixture(t, options = {}) {
@@ -183,4 +183,97 @@ test('a process error cannot leave stale warmth or unhandled pending requests', 
   assert.equal(pool.pending, 0);
   assert.equal(pool.lastSuccessAt, null);
   assert.deepEqual(readdirSync(directory), []);
+});
+
+test('three fast recognition failures recycle the helper, settle concurrent work and gate ordinary retries until warm', async t => {
+  let clock = 0;
+  const {pool, workers, directory} = fixture(t, {now: () => clock});
+  const events = [];
+  pool.onRecycled(event => events.push(event));
+  pool.onRecycled(() => { throw new Error('diagnostic sink unavailable'); });
+  for (let i = 0; i < 2; i++) {
+    const request = pool.recognize(png);
+    clock += 20;
+    workers[0].reply({ok: false, error: 'recognition_failed'}, i);
+    await assert.rejects(request, {code: 'ocr_failed'});
+  }
+  assert.equal(workers.length, 1);
+  const third = pool.recognize(png), concurrent = pool.recognize(png);
+  const concurrentCheck = assert.rejects(concurrent, failure => failure.code === 'ocr_unavailable' && failure.details.reason === 'ocr_helper_recycled');
+  clock += 50;
+  workers[0].stderr.write('Vision detail');
+  workers[0].reply({ok: false, error: 'recognition_failed', domain: 'Vision', code: 9}, 2);
+  await assert.rejects(third, {code: 'ocr_failed'});await concurrentCheck;
+  assert.equal(workers.length, 2);assert.deepEqual(workers[0].signals, ['SIGTERM']);
+  assert.equal(pool.lastSuccessAt, null);assert.equal(pool.pending, 0);assert.deepEqual(readdirSync(directory), []);
+  assert.deepEqual(events, [{event: 'ocr_helper_recycled', reason: 'recognition_failed', failures: 3, elapsedMs: 50,
+    cooldownMs: 120_000, details: {error: 'recognition_failed', domain: 'Vision', code: 9, stderr: 'Vision detail'}}]);
+  await assert.rejects(pool.recognize(png), failure => failure.code === 'ocr_unavailable' && failure.details.error === 'ocr_warming');
+  assert.equal(workers[1].requests.length, 0);
+  const warmup = pool.recognize(png, {warmup: true, timeoutMs: 120_000});
+  workers[1].reply({ok: true, rows: []});await warmup;
+  // Delayed termination events from the intentionally retired process cannot invalidate its replacement.
+  workers[0].emit('exit', 0, 'SIGTERM');workers[0].emit('close', 0, 'SIGTERM');
+  assert.equal(pool.lastSuccessAt, clock);
+  const normal = pool.recognize(png);workers[1].reply({ok: true, rows: []}, 1);await normal;
+});
+
+test('success, a different error, and a failure taking exactly one second each break the rapid-failure streak', async t => {
+  let clock = 0;
+  const {pool, workers} = fixture(t, {now: () => clock});
+  async function reply({elapsed = 20, ok = false, error = 'recognition_failed'} = {}) {
+    const request = pool.recognize(png), worker = workers.at(-1), index = worker.requests.length - 1;
+    clock += elapsed;
+    worker.reply({ok, rows: [], error, ms: 1}, index); // Trust local elapsed time, not helper-reported milliseconds.
+    if (ok) await request;else await assert.rejects(request, {code: 'ocr_failed'});
+  }
+  for (const breaker of [{ok: true}, {error: 'image_unreadable'}, {elapsed: OCR_FAST_FAILURE_MS}]) {
+    await reply();await reply();await reply(breaker);
+    assert.equal(workers.length, 1);
+  }
+  await reply();await reply();
+  assert.equal(workers.length, 1);
+  await reply({elapsed: OCR_FAST_FAILURE_MS - 1});
+  assert.equal(workers.length, 2);
+});
+
+test('intentional recycling has a shared two-minute cooldown across helper generations', async t => {
+  let clock = 0;
+  const {pool, workers} = fixture(t, {now: () => clock});
+  const events = [];pool.onRecycled(event => events.push(event));
+  async function fail() {
+    const request = pool.recognize(png, {warmup: true, timeoutMs: 120_000}), worker = workers.at(-1);
+    worker.reply({ok: false, error: 'recognition_failed'}, worker.requests.length - 1);
+    await assert.rejects(request, {code: 'ocr_failed'});
+  }
+  await fail();await fail();await fail();assert.equal(workers.length, 2);
+  await fail();await fail();await fail();assert.equal(workers.length, 2);
+  clock = OCR_RECYCLE_COOLDOWN_MS - 1;await fail();assert.equal(workers.length, 2);
+  clock++;await fail();assert.equal(workers.length, 3);assert.equal(events.length, 2);
+});
+
+test('intentional recycling never consumes or resets the independent unexpected-exit budget', async t => {
+  let clock = 0;
+  const {pool, workers} = fixture(t, {now: () => clock});
+  for (let crash = 0; crash < 2; crash++) {
+    const request = pool.recognize(png);workers.at(-1).emit('close', 9, 'SIGKILL');
+    await assert.rejects(request, {code: 'ocr_unavailable'});
+  }
+  for (let cycle = 0; cycle < 5; cycle++) {
+    for (let failure = 0; failure < 3; failure++) {
+      const request = pool.recognize(png), worker = workers.at(-1);
+      worker.reply({ok: false, error: 'recognition_failed'}, worker.requests.length - 1);
+      await assert.rejects(request, {code: 'ocr_failed'});
+    }
+    const retired = workers.at(-2);retired.emit('close', 0, 'SIGTERM');
+    const warmup = pool.recognize(png, {warmup: true, timeoutMs: 120_000});
+    workers.at(-1).reply({ok: true, rows: []});await warmup;
+    clock += OCR_RECYCLE_COOLDOWN_MS;
+  }
+  assert.equal(workers.length, 8, 'more than MAX_RESTARTS healthy intentional replacements are allowed');
+  for (let crash = 0; crash < 2; crash++) {
+    const request = pool.recognize(png);workers.at(-1).emit('close', 9, 'SIGKILL');
+    await assert.rejects(request, {code: 'ocr_unavailable'});
+  }
+  await assert.rejects(pool.recognize(png), error => error.code === 'ocr_unavailable' && error.message.includes('keeps stopping'));
 });

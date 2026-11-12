@@ -11,7 +11,7 @@ const WARMUP_IMAGE = new URL('../../tools/ocr/warmup.png', import.meta.url);
 export function createOcrReadiness({ocr, now = Date.now, loadImage = () => readFileSync(WARMUP_IMAGE),
   onDiagnostic = () => {}}) {
   let closed = false, busy = false, timer = null, flight = null, failure = null, retryAt = 0;
-  let lastWarmupMs = null;
+  let lastWarmupMs = null, recyclePending = false;
   const fresh = () => Number.isFinite(ocr.lastSuccessAt) && now() >= ocr.lastSuccessAt
     && now() - ocr.lastSuccessAt < OCR_FRESHNESS_MS;
   const note = entry => { try { onDiagnostic(entry); } catch { /* Diagnostics never affect readiness. */ } };
@@ -31,7 +31,7 @@ export function createOcrReadiness({ocr, now = Date.now, loadImage = () => readF
     flight = current;
     current.promise = Promise.resolve().then(() => {
       if (controller.signal.aborted) throw new DeviceError('aborted', 'OCR warmup canceled');
-      return ocr.recognize(loadImage(), {timeoutMs: OCR_WARMUP_TIMEOUT_MS, signal: controller.signal});
+      return ocr.recognize(loadImage(), {timeoutMs: OCR_WARMUP_TIMEOUT_MS, signal: controller.signal, warmup: true});
     }).then(() => {
       if (controller.signal.aborted || closed) throw new DeviceError('aborted', 'OCR warmup canceled');
       failure = null; retryAt = 0; lastWarmupMs = Math.max(0, now() - started);
@@ -40,6 +40,13 @@ export function createOcrReadiness({ocr, now = Date.now, loadImage = () => readF
       failure = error; retryAt = now() + OCR_WARMUP_RETRY_MS;
       note({event: 'ocr_warmup_failed', code: error.code ?? 'ocr_failed',
         elapsedMs: Math.max(0, now() - started), details: error.details ?? null});
+      if (recyclePending && !closed && !controller.signal.aborted) {
+        recyclePending = false; failure = null; retryAt = 0;
+        if (flight === current) flight = null;
+        // Existing task preparation joins the replacement warmup instead of starting a second request.
+        return startWarmup();
+      }
+      recyclePending = false;
       throw new DeviceError('ocr_unavailable', 'OCR warmup did not complete',
         {details: {...error.details, cause: error.code ?? 'ocr_failed'}});
     }).finally(() => {
@@ -77,6 +84,12 @@ export function createOcrReadiness({ocr, now = Date.now, loadImage = () => readF
     try { await Promise.race([promise, aborted]); }
     finally { signal.removeEventListener('abort', cancel); }
   }
+  const unsubscribe = ocr.onRecycled?.(event => {
+    if (closed) return;
+    note(event); failure = null; retryAt = 0;
+    if (flight) recyclePending = true;
+    else startWarmup(); // A real task may be active; its failed helper still needs a full cold warmup.
+  });
   return {
     start: maintain,
     maintain,
@@ -92,6 +105,6 @@ export function createOcrReadiness({ocr, now = Date.now, loadImage = () => readF
         reason: readyForSearch ? null : closed || (!flight && failure) ? 'ocr_unavailable' : 'ocr_warming',
         lastSuccessAt: ocr.lastSuccessAt ?? null, lastWarmupMs};
     },
-    close() { closed = true; stopTimer(); flight?.controller.abort(); },
+    close() { closed = true; unsubscribe?.(); stopTimer(); flight?.controller.abort(); },
   };
 }
