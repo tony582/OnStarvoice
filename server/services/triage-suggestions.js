@@ -6,7 +6,7 @@ import {
 } from '../../shared/triage-suggestions.mjs';
 
 // Same aliases and criteria as the current unhandled work list, shared by its API and backfill.
-export const TRIAGE_SUGGESTION_ACTIVE_SQL = `
+export const triageSuggestionActiveSql = () => `
   r.record_type NOT IN ('official_content', 'blogger_profile')
   AND r.business_visibility = 'eligible'
   AND (${recordTriageAdmissionSql('r')})
@@ -14,6 +14,7 @@ export const TRIAGE_SUGGESTION_ACTIVE_SQL = `
   AND COALESCE(rt.status, 'unhandled') = 'unhandled'
   AND rt.archived_at IS NULL
 `;
+export const TRIAGE_SUGGESTION_ACTIVE_SQL = triageSuggestionActiveSql();
 const RETURNING = 'record_id, suggestion, rule_version, reason, created_at::text AS created_at, resolved_at::text AS resolved_at, resolution, resolved_by';
 
 export async function isTriageSuggestionEnabled(tx, tenantId) {
@@ -27,7 +28,7 @@ async function refreshInTransaction(tx, {tenantId, recordId}) {
   const record = await tx.queryOne('SELECT * FROM records WHERE tenant_id=$1 AND id=$2 FOR UPDATE', [tenantId, recordId]);
   if (!record) return {status: 'not_found', suggestion: null};
   if (!await isTriageSuggestionEnabled(tx, tenantId)) return {status: 'disabled', suggestion: null};
-  const eligibility = await tx.queryOne(`SELECT (${TRIAGE_SUGGESTION_ACTIVE_SQL}) AS active
+  const eligibility = await tx.queryOne(`SELECT (${triageSuggestionActiveSql()}) AS active
     FROM records r LEFT JOIN record_triage rt ON rt.tenant_id=r.tenant_id AND rt.record_id=r.id
     WHERE r.tenant_id=$1 AND r.id=$2`, [tenantId, recordId]);
   const reason = eligibility?.active ? evaluateNonMonitorSuggestion(record) : null;
@@ -66,7 +67,7 @@ export async function reopenTriageSuggestions(tx, {tenantId, resolutions}) {
   if (!snapshots.length) return [];
   const ids = [...new Set(snapshots.map(row => row.record_id))];
   const records = await tx.queryAll(`SELECT r.*,COALESCE(rt.status,'unhandled') AS triage_status,rt.archived_at,
-      (${TRIAGE_SUGGESTION_ACTIVE_SQL}) AS suggestion_active
+      (${triageSuggestionActiveSql()}) AS suggestion_active
     FROM records r LEFT JOIN record_triage rt ON rt.tenant_id=r.tenant_id AND rt.record_id=r.id
     WHERE r.tenant_id=$1 AND r.id=ANY($2::uuid[]) ORDER BY r.id FOR UPDATE OF r`, [tenantId, ids]);
   const byId = new Map(records.map(record => [record.id, record]));
@@ -101,7 +102,7 @@ export async function backfillTriageSuggestions({tenantId, apply = false, sample
     const existingFields = present ? 's.resolution,s.record_id AS suggested_record_id' : 'NULL::text AS resolution,NULL::uuid AS suggested_record_id';
     const rows = await tx.queryAll(`SELECT r.id,r.tenant_id,r.platform,r.title,r.content,r.author_name,r.keyword,r.url,r.ai_result,${existingFields}
       FROM records r LEFT JOIN record_triage rt ON rt.tenant_id=r.tenant_id AND rt.record_id=r.id ${existingJoin}
-      WHERE r.tenant_id=$1 AND (${TRIAGE_SUGGESTION_ACTIVE_SQL}) ORDER BY r.id`, [tenantId]);
+      WHERE r.tenant_id=$1 AND (${triageSuggestionActiveSql()}) ORDER BY r.id`, [tenantId]);
     const result = {tenantId, enabled, ruleVersion: TRIAGE_SUGGESTION_RULE_VERSION, dryRun: !apply, scanned: rows.length,
       matched: 0, alreadyOpen: 0, suppressed: 0, wouldCreate: 0, wouldReopen: 0, applied: 0, samples: [], recordIds: []};
     for (const row of rows) {

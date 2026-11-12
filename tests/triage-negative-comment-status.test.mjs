@@ -1,4 +1,4 @@
-import {TRIAGE_SUGGESTION_ACTIVE_SQL} from '../server/services/triage-suggestions.js';
+import {triageSuggestionActiveSql} from '../server/services/triage-suggestions.js';
 import { PLATFORM_LABELS } from '../server/services/platform-labels.js';
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -23,7 +23,7 @@ function triageHarness() {
   const router = {get() {}, post() {}, patch(path, ...callbacks) {handlers.set(path, callbacks.at(-1));}};
   const middleware = () => {};
   const context = vm.createContext({
-    ...recordAdmission, TRIAGE_SUGGESTION_ACTIVE_SQL,
+    ...recordAdmission, triageSuggestionActiveSql,
     resolveTriageSuggestions: async()=>[],
     Router: () => router,
     requireTenantAccess: middleware, requireTenantWriter: middleware, requireSessionUser: middleware,

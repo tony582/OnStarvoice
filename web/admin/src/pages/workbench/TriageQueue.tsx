@@ -40,6 +40,9 @@ import { RecordLabelChips } from '@/components/shared/RecordLabels'
 import { CrossPostBadge } from '@/components/shared/CrossPostBadge'
 import { triageDisplay } from '@/lib/triage-display'
 import { RecordTriageStatus } from '@/components/shared/RecordTriageStatus'
+import { TriageSuggestionBadge, SuggestionConfirmation, SuggestionUndoBanner } from '@/components/shared/TriageSuggestion'
+import { useSuggestionConfirmation, useSuggestionUndo } from '@/lib/use-triage-suggestions'
+import { openTriageSuggestion, suggestionSelectionIds, TRIAGE_SUGGESTION_RULE_VERSION, type SuggestionSummary, type SuggestionSelection, type SuggestionBatchResult } from '@/lib/triage-suggestions'
 import { crossPostDrawerRecord, crossPostSummary, type CrossPostMember } from '@/lib/cross-posts'
 import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
 import {
@@ -61,7 +64,7 @@ interface Pagination { page: number; totalPages: number; total: number }
 // 列表行沿用服务端的宽松字段集合；字段名以 /triage/records 的 SELECT 为准。
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type TriageRecord = { id: string } & Record<string, any>
-type TriageListResponse = { records: TriageRecord[]; pagination?: Pagination }
+type TriageListResponse = { records: TriageRecord[]; pagination?: Pagination; suggestions?: SuggestionSummary; selection?: SuggestionSelection[] }
 interface CustomTagsMutationResponse {
   customTags?: unknown
   custom_tags?: unknown
@@ -82,7 +85,7 @@ interface ArchiveMutationResponse {
   updatedIds?: unknown
   skipped?: unknown
 }
-interface BatchModeMutationResponse {
+interface BatchModeMutationResponse extends Omit<SuggestionBatchResult, 'updatedIds'> {
   updated?: unknown
   updatedIds?: unknown
   skipped?: unknown
@@ -311,6 +314,7 @@ type TriageFilterSnapshot = {
   sentiment: string
   watchedFilter: string
   crossPlatform: boolean
+  suggestionFilter: boolean
   contentTopic: string
   customTagIds: string[]
   intents: string[]
@@ -330,6 +334,7 @@ function recordMatchesFilters(record: Record<string, unknown>, filters: TriageFi
   if (filters.sentiment && String(record.sentiment || '') !== filters.sentiment) return false
   if (filters.watchedFilter === 'watched' && !record.is_watched) return false
   if (filters.crossPlatform && !crossPostSummary(record).count) return false
+  if (filters.suggestionFilter && !openTriageSuggestion(record)) return false
   if (filters.contentTopic) {
     const topic = String(record.content_topic || '')
     if (filters.contentTopic === 'unclassified' ? topic !== '' : topic !== filters.contentTopic) return false
@@ -354,6 +359,9 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [relevanceConfidences, setRelevanceConfidences] = useState<string[]>(() => normalizePostConfidenceFilter(initial?.relevanceConfidence))
   const [platform, setPlatform] = useState(initial?.platform ?? '')
   const [crossPlatform, setCrossPlatform] = useState(initial?.crossPlatform === 'true')
+  const [suggestionFilter, setSuggestionFilter] = useState(initial?.suggestion === 'non_monitor')
+  const [suggestionSummary, setSuggestionSummary] = useState<SuggestionSummary | null>(null)
+  const [excludedSuggestions, setExcludedSuggestions] = useState<{ key: string; ids: Set<string> }>({ key: '', ids: new Set() })
   const [watchedFilter, setWatchedFilter] = useState(initial?.watched === 'watched' ? 'watched' : '')
   const [keyword, setKeyword] = useState(() => String(initial?.keyword ?? '').trim())
   const [keywordDraft, setKeywordDraft] = useState(() => String(initial?.keyword ?? '').trim())
@@ -405,12 +413,15 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   }, [])
   const { ask, dialog } = useNotePrompt()
   const { ask: askStatusChange, dialog: statusChangeDialog } = useStatusChangePrompt()
+  const suggestionConfirmation = useSuggestionConfirmation()
+
 
   const filterParams = useCallback(() => {
     const params = new URLSearchParams({ sentiment, platform, keyword })
     if (contentTopic) params.set('contentTopic', contentTopic)
     if (watchedFilter) params.set('watched', watchedFilter)
     if (crossPlatform) params.set('crossPlatform', 'true')
+    if (suggestionFilter) params.set('suggestion', 'non_monitor')
     if (archiveView !== 'active') params.set('bucket', archiveView)
     else params.set('queue', 'triage')
     appendPostIntentFilter(params, intents)
@@ -432,11 +443,28 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     if (dateRanges.handled.from) params.set('handledFrom', dateRanges.handled.from)
     if (dateRanges.handled.to) params.set('handledTo', dateRanges.handled.to)
     return params
-  }, [archiveView, triageStatuses, risk, identity, sentiment, contentTopic, intents, relevances, relevanceConfidences, platform, watchedFilter, crossPlatform, keyword, sort, captureKeywords, customTagIds, dateRanges])
+  }, [archiveView, triageStatuses, risk, identity, sentiment, contentTopic, intents, relevances, relevanceConfidences, platform, watchedFilter, crossPlatform, suggestionFilter, keyword, sort, captureKeywords, customTagIds, dateRanges])
 
   // 勾选跟着「当前这一页的查询」走：筛选、排序、翻页、切视图都会自动清空勾选，避免带着看不见的幽灵选中去批量处理。
   const filterQuery = useMemo(() => filterParams().toString(), [filterParams])
-  const sel = useSelection(`${filterQuery}|${pageSize}|${pagination?.page ?? 1}`)
+  const activeSuggestionQuery = useRef(filterQuery)
+  useEffect(() => { activeSuggestionQuery.current = filterQuery }, [filterQuery])
+  const pageSelection = useSelection(`${filterQuery}|${pageSize}|${pagination?.page ?? 1}`)
+  const excludedSuggestionIds = useMemo(() => excludedSuggestions.key === filterQuery ? excludedSuggestions.ids : new Set<string>(), [excludedSuggestions, filterQuery])
+  const suggestionSelectionActive = suggestionFilter && archiveView === 'active'
+  const setSuggestionChecked = useCallback((ids: string[], checked: boolean) => setExcludedSuggestions(previous => {
+    const next = new Set(previous.key === filterQuery ? previous.ids : [])
+    for (const id of ids) { if (checked) next.delete(id); else next.add(id) }
+    return { key: filterQuery, ids: next }
+  }), [filterQuery])
+  const suggestedPageIds = useMemo(() => records.filter(record => openTriageSuggestion(record) && !excludedSuggestionIds.has(record.id)).map(record => record.id), [records, excludedSuggestionIds])
+  const sel = useMemo(() => suggestionSelectionActive ? {
+    ...pageSelection, selected: new Set(suggestedPageIds), count: suggestedPageIds.length,
+    has: (id: string) => suggestedPageIds.includes(id),
+    toggle: (id: string) => setSuggestionChecked([id], excludedSuggestionIds.has(id)),
+    setMany: setSuggestionChecked, setAll: setSuggestionChecked,
+  } : pageSelection, [suggestionSelectionActive, pageSelection, suggestedPageIds, excludedSuggestionIds, setSuggestionChecked])
+  const suggestionAcceptCount = Math.max(0, (suggestionSummary?.count || 0) - excludedSuggestionIds.size)
   const selectionBusy = batchBusy || modeBusyId !== null || archiveBusyId !== null || watchBusyId !== null
   const lastToggledIndex = useRef<number | null>(null)
   const toggleSelection = (id: string, index: number, shiftKey = false) => {
@@ -456,8 +484,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     sel.setAll(records.map(record => String(record.id)), checked)
   }
 
-  const clearSelectionRef = useRef(sel.clear)
-  useEffect(() => { clearSelectionRef.current = sel.clear }, [sel.clear])
+  const clearSelectionRef = useRef(pageSelection.clear)
+  useEffect(() => { clearSelectionRef.current = pageSelection.clear }, [pageSelection.clear])
 
   const batchRemovalCatalog = (() => {
     const tagsById = new Map<string, CustomTag>()
@@ -533,6 +561,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       editJournal.current = newerEdits
       clearSelectionRef.current()
       setPagination(data.pagination || null)
+      setSuggestionSummary(data.suggestions || null)
       listShown.current = true
     } catch (err) {
       if (requestSeq !== listRequestSeq.current) return
@@ -544,6 +573,16 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     }
   }), [filterParams, pageSize, showBatchFeedback])
 
+  const suggestionUndo = useSuggestionUndo(async result => {
+    if (drawerRecord && result.restoredIds.includes(drawerRecord.id)) {
+      const data = await api.get<{ suggestion: unknown }>(`/triage/records/${drawerRecord.id}/suggestion`)
+      applySavedEdits({ [drawerRecord.id]: { triage_status: 'unhandled', triageSuggestion: data.suggestion } })
+    }
+    setExcludedSuggestions({ key: '', ids: new Set() })
+    await load(pagination?.page || 1, { silent: true })
+    refreshBadges()
+  })
+
   const cancelSelection = () => {
     if (selectionBusy) return
     sel.clear()
@@ -552,6 +591,17 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   // 手动刷新：按当前条件重查列表（会清掉勾选）。
   const refreshList = () => { void load(pagination?.page || 1) }
   const refreshBusy = loading || batchBusy || Boolean(modeBusyId || archiveBusyId || noteBusyId || watchBusyId)
+
+  // Refresh only suggestion counts after ordinary status edits: keep list order,
+  // selection and the open drawer exactly where the user was working.
+  const refreshSuggestionSummary = useCallback(async () => {
+    const params = filterParams()
+    params.set('page', '1'); params.set('pageSize', '1')
+    try {
+      const data = await api.get<TriageListResponse>('/triage/records?' + params)
+      if (activeSuggestionQuery.current === filterQuery) setSuggestionSummary(data.suggestions || null)
+    } catch { /* The saved status is kept; explicit refresh can retry the count. */ }
+  }, [filterParams, filterQuery])
 
   const exportXlsx = async () => {
     setExporting(true)
@@ -569,14 +619,15 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const activeDateFilterCount = Object.values(dateRanges).filter(range => range.from || range.to).length
   const hasCustomSort = sort.field !== 'publish' || sort.dir !== 'desc'
   const activeIntentCount = intents.length + relevances.length + relevanceConfidences.length
-  const hasActiveFilters = Boolean(crossPlatform || platform || sentiment || contentTopic || activeIntentCount || keyword || triageStatuses.length || risk.length || identity.length || captureKeywords.length || customTagIds.length || activeDateFilterCount || hasCustomSort)
+  const hasActiveFilters = Boolean(suggestionFilter || crossPlatform || platform || sentiment || contentTopic || activeIntentCount || keyword || triageStatuses.length || risk.length || identity.length || captureKeywords.length || customTagIds.length || activeDateFilterCount || hasCustomSort)
   const activeFilterCount = [platform, sentiment, contentTopic].filter(Boolean).length
-    + Number(crossPlatform) + activeIntentCount + Number(Boolean(keyword)) + triageStatuses.length + risk.length + identity.length + captureKeywords.length + customTagIds.length + activeDateFilterCount + Number(hasCustomSort)
+    + Number(crossPlatform) + Number(suggestionFilter) + activeIntentCount + Number(Boolean(keyword)) + triageStatuses.length + risk.length + identity.length + captureKeywords.length + customTagIds.length + activeDateFilterCount + Number(hasCustomSort)
   const clearFilters = () => {
     setPlatform(''); setSentiment(''); setKeyword(''); setKeywordDraft(''); setTriageStatuses([]); setRisk([]); setIdentity([]); setCaptureKeywords([]); setCustomTagIds([]); setDateRanges(emptyDateRanges())
     setIntents([]); setRelevances([]); setRelevanceConfidences([])
     setContentTopic('')
     setCrossPlatform(false)
+    setSuggestionFilter(false)
     setSort({ field: 'publish', dir: 'desc' })
   }
   // 输入框只维护草稿，停顿后才提交搜索；回车只提前提交，不再额外发第二次请求。
@@ -820,6 +871,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   ) => {
     applySavedEdits(Object.fromEntries([...ids].map(id => [id, {
       triage_status: newStatus,
+      triageSuggestion: null,
       ...(note?.trim() ? {
         progress_count: Number((records.find(record => record.id === id) || (drawerRecord?.id === id ? drawerRecord : null))?.progress_count || 0) + 1,
         progress_latest_body: note.trim(),
@@ -852,6 +904,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
         values.note,
       )
       refreshBadges()
+      void refreshSuggestionSummary()
       return true
     } catch (err) {
       console.error(err)
@@ -860,7 +913,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     } finally {
       setModeBusyId(null)
     }
-  }, [archiveBusyId, archiveView, modeBusyId, refreshBadges, showBatchFeedback, syncModeLocally])
+  }, [archiveBusyId, archiveView, modeBusyId, refreshBadges, showBatchFeedback, syncModeLocally, refreshSuggestionSummary])
 
   const changeRecordMode = async (record: TriageRecord, newStatus: TriageMode): Promise<boolean> => {
     if (archiveView === 'archived' || modeBusyId || archiveBusyId) return false
@@ -879,49 +932,95 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const runBatch = async (newStatus: TriageMode, requestedIds = [...sel.selected]): Promise<boolean> => {
     const ids = [...new Set(requestedIds)]
     if (archiveView === 'archived' || !ids.length || batchBusy) return false
-    const modeLabel = CONTENT_TRIAGE_MODES.find(mode => mode.value === newStatus)?.label || newStatus
-    const values = await askStatusChange({
-      statusLabel: modeLabel,
-      batchCount: ids.length,
-      requireFeishuTableNo: newStatus === 'negative_feishu',
-    })
-    if (!values) return false
-    setBatchFeedback(null)
     setBatchBusy(true)
+    let hadSuggestions = ids.some(id => openTriageSuggestion(records.find(record => record.id === id) || (drawerRecord?.id === id ? drawerRecord : {})))
     try {
+      let suggestionMode: 'split' | undefined
+      let values: StatusChangeValues = { note: '', feishuTableNo: '' }
+      if (newStatus === 'reviewed' && ids.length > 1) {
+        const suggested = await Promise.all(ids.map(async id => {
+          const record = records.find(row => row.id === id) || (drawerRecord?.id === id ? drawerRecord : null)
+          if (record && Object.prototype.hasOwnProperty.call(record, 'triageSuggestion')) return Boolean(openTriageSuggestion(record))
+          const data = await api.get<{ suggestion: unknown }>(`/triage/records/${id}/suggestion`)
+          return Boolean(data.suggestion)
+        }))
+        const count = suggested.filter(Boolean).length
+        hadSuggestions = count > 0
+        if (count) {
+          const choice = await suggestionConfirmation.ask({ kind: 'mixed', total: ids.length, suggested: count })
+          if (!choice) return false
+          if (choice === 'split') suggestionMode = 'split'
+        } else {
+          const response = await askStatusChange({ statusLabel: '已复核', batchCount: ids.length })
+          if (!response) return false
+          values = response
+        }
+      } else {
+        const response = await askStatusChange({
+          statusLabel: CONTENT_TRIAGE_MODES.find(mode => mode.value === newStatus)?.label || newStatus,
+          batchCount: ids.length, requireFeishuTableNo: newStatus === 'negative_feishu',
+        })
+        if (!response) return false
+        values = response
+      }
+      setBatchFeedback(null)
       const result = await api.patch<BatchModeMutationResponse>('/triage/records/batch', {
-        ids,
-        status: newStatus,
-        note: values.note,
+        ids, status: newStatus, note: values.note,
+        ...(suggestionMode ? { suggestionMode } : {}),
         ...(newStatus === 'negative_feishu' ? { feishuTableNo: values.feishuTableNo } : {}),
       })
       const changedIds = changedBatchModeIds(result, ids)
       const skippedCount = Math.max(0, ids.length - changedIds.length)
-      if (changedIds.length === 0) {
-        showBatchFeedback('所选内容未能修改，请核对后重试', 'error')
-        return false
+      if (!changedIds.length) { showBatchFeedback('所选内容未能修改，请核对后重试', 'error'); return false }
+      for (const status of new Set(changedIds.map(id => result.statusById?.[id] || newStatus))) {
+        syncModeLocally(changedIds.filter(id => (result.statusById?.[id] || newStatus) === status), status as TriageMode,
+          status === 'negative_feishu' ? values.feishuTableNo : undefined, values.note)
       }
-
-      syncModeLocally(
-        changedIds,
-        newStatus,
-        newStatus === 'negative_feishu' ? values.feishuTableNo : undefined,
-        values.note,
-      )
-      showBatchFeedback(
-        skippedCount > 0
-          ? `已将 ${changedIds.length} 条改为“${modeLabel}”，另有 ${skippedCount} 条未修改`
-          : `已将 ${changedIds.length} 条内容改为“${modeLabel}”`,
-        skippedCount > 0 ? 'warning' : 'success',
-      )
+      suggestionUndo.offer({ ...result, updatedIds: changedIds })
+      const accepted = result.acceptedIds?.length || 0
+      const modeLabel = CONTENT_TRIAGE_MODES.find(mode => mode.value === newStatus)?.label || newStatus
+      showBatchFeedback(suggestionMode === 'split'
+        ? `已将 ${accepted} 条标为非监控，其余 ${changedIds.length - accepted} 条标为已复核${skippedCount ? `，${skippedCount} 条未修改` : ''}`
+        : `已将 ${changedIds.length} 条内容改为“${modeLabel}”${skippedCount ? `，另有 ${skippedCount} 条未修改` : ''}`,
+        skippedCount ? 'warning' : 'success')
       refreshBadges()
+      if (hadSuggestions || accepted) await refreshSuggestionSummary()
       return true
     } catch (err) {
-      console.error(err)
       showBatchFeedback(`批量修改失败：${err instanceof Error ? err.message : '请稍后重试'}`, 'error')
       return false
-    }
-    finally { setBatchBusy(false) }
+    } finally { setBatchBusy(false) }
+  }
+
+  const acceptAllSuggestions = async () => {
+    if (batchBusy || !suggestionSelectionActive || !canWrite()) return
+    setBatchBusy(true)
+    try {
+      const params = filterParams()
+      params.set('suggestion', 'non_monitor'); params.set('selection', '1')
+      const data = await api.get<TriageListResponse>('/triage/records?' + params)
+      if (!Array.isArray(data.selection)) throw new Error('建议列表未能完整读取，请刷新重试')
+      if (Number(data.pagination?.total) > data.selection.length) throw new Error('匹配内容超过单次处理上限，请缩小筛选范围后再接受建议')
+      const ids = suggestionSelectionIds(data.selection, excludedSuggestionIds)
+      const chosen = new Set(ids)
+      const rows = data.selection.filter(row => chosen.has(row.id))
+      if (!rows.length) { showBatchFeedback('没有待接受的建议，请刷新列表', 'warning'); return }
+      if (await suggestionConfirmation.ask({ kind: 'accept', rows }) !== 'accept') return
+      const result = await api.patch<SuggestionBatchResult>('/triage/records/batch', {
+        ids, status: 'reviewed_non_monitor', source: 'suggestion', ruleVersion: TRIAGE_SUGGESTION_RULE_VERSION,
+      })
+      const changedIds = result.updatedIds || []
+      if (!changedIds.length) throw new Error('建议状态已变化，请刷新核对')
+      syncModeLocally(changedIds, 'reviewed_non_monitor')
+      suggestionUndo.offer(result)
+      setExcludedSuggestions({ key: '', ids: new Set() })
+      await load(1, { silent: true })
+      refreshBadges()
+      if (changedIds.length !== ids.length) showBatchFeedback(`已接受 ${changedIds.length} 条，${ids.length - changedIds.length} 条未修改`, 'warning')
+    } catch (err) {
+      showBatchFeedback(`接受建议失败：${err instanceof Error ? err.message : '请稍后重试'}`, 'error')
+      await load(pagination?.page || 1, { silent: true })
+    } finally { setBatchBusy(false) }
   }
 
   const syncArchiveLocally = useCallback((ids: Iterable<string>) => {
@@ -1039,8 +1138,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 
   // 已保存但不再符合当前筛选的行：淡显 + 提示，刷新后才移出。
   const filterSnapshot = useMemo<TriageFilterSnapshot>(() => ({
-    archiveView, triageStatuses, sentiment, watchedFilter, crossPlatform, contentTopic, customTagIds, intents, relevances, relevanceConfidences,
-  }), [archiveView, triageStatuses, sentiment, watchedFilter, crossPlatform, contentTopic, customTagIds, intents, relevances, relevanceConfidences])
+    archiveView, triageStatuses, sentiment, watchedFilter, crossPlatform, suggestionFilter, contentTopic, customTagIds, intents, relevances, relevanceConfidences,
+  }), [archiveView, triageStatuses, sentiment, watchedFilter, crossPlatform, suggestionFilter, contentTopic, customTagIds, intents, relevances, relevanceConfidences])
   const outOfFilterIds = useMemo(() => {
     const ids = new Set<string>()
     for (const record of records) {
@@ -1065,6 +1164,11 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     onOpenCrossPost: openCrossPost,
     onCrossPostBatchStatus: (ids: string[], status: string) => runBatch(status as TriageMode, ids),
     onCrossPostGroupChanged: () => load(pagination?.page || 1, { silent: true }),
+    onTriageSuggestionChanged: (patch: Record<string, unknown>) => {
+      applySavedEdits({ [drawerRecord.id]: patch })
+      void load(pagination?.page || 1, { silent: true })
+      refreshBadges()
+    },
     onClose: () => setDrawerRecord(null),
     canWrite: canWrite(),
     onSetStatus: drawerArchived ? undefined : async (s: string) => {
@@ -1145,6 +1249,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 
   return (
     <div className="space-y-2 lg:w-max lg:min-w-full">
+      <SuggestionUndoBanner {...suggestionUndo} />
       {batchFeedback && (
         <div
           role={batchFeedback.tone === 'error' ? 'alert' : 'status'}
@@ -1344,6 +1449,15 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           </button>
         </div>
       </div>
+
+      {suggestionSummary?.enabled && archiveView === 'active' && <div className="flex flex-wrap items-center gap-3 rounded-lg border border-border bg-card px-3 py-2 text-xs">
+        <button type="button" role="switch" aria-checked={suggestionFilter} onClick={() => setSuggestionFilter(value => !value)} className={cn('rounded-md border px-2.5 py-1.5 font-medium', suggestionFilter ? 'border-primary/40 bg-primary/5 text-primary' : 'border-border text-muted-foreground')}>
+          系统建议非监控 ({suggestionSummary.count})
+        </button>
+        {suggestionSelectionActive && canWrite() && <Button size="sm" variant="outline" disabled={selectionBusy || loading || suggestionAcceptCount === 0} onClick={() => void acceptAllSuggestions()}>全部接受建议 ({suggestionAcceptCount})</Button>}
+        {suggestionSelectionActive && <span className="text-muted-foreground">默认选择全部匹配内容，可取消勾选保留个别建议。</span>}
+        <span className="ml-auto text-muted-foreground">近 30 天：接受 {suggestionSummary.stats.accepted} / 不采纳 {suggestionSummary.stats.rejected} / 失效 {suggestionSummary.stats.superseded} · 采纳率 {suggestionSummary.stats.acceptanceRate == null ? '—' : `${Math.round(suggestionSummary.stats.acceptanceRate * 100)}%`}</span>
+      </div>}
 
       {/* List */}
       {listError ? (
@@ -1576,7 +1690,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       )}
 
       {/* Batch action bar */}
-      {canWrite() && (
+      {canWrite() && !suggestionSelectionActive && (
         <BatchBar
           count={sel.count}
           busy={selectionBusy}
@@ -1641,6 +1755,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       {drawerProps && <RecordDrawer {...drawerProps} />}
       {dialog}
       {statusChangeDialog}
+      <SuggestionConfirmation state={suggestionConfirmation.state} onChoice={suggestionConfirmation.close} />
       {batchTagMode && sel.count > 0 && (
         <BatchCustomTagDialog
           mode={batchTagMode}
@@ -1787,6 +1902,7 @@ function MobileRecordCard({ record: r, canWrite, selected, outOfFilter, onToggle
         ) : (
           <RecordTriageStatus record={r} />
         )}
+        <TriageSuggestionBadge record={r} />
         {hasRiskSignals && <RiskSignals record={r} />}
         {mobileIdentity && <IdentityBadge sourceType={r.source_type} fans={r.author_fans} name={r.author_name} override={r.identity_override} />}
       </div>
@@ -1988,6 +2104,7 @@ function RecordRow({ record: r, canWrite, open, selected, outOfFilter, onToggle,
         open || selected ? 'bg-accent' : 'bg-card group-hover:bg-accent',
       )} onClick={e => e.stopPropagation()}>
         <div className="grid grid-cols-[112px_48px] items-center gap-2">
+          <div className="flex flex-col items-center gap-1">
           {canWrite && !archived && statusDisplay.status === triageStatus ? (
             <TriageStatusMenu
               status={triageStatus}
@@ -2000,6 +2117,8 @@ function RecordRow({ record: r, canWrite, open, selected, outOfFilter, onToggle,
           ) : (
             <RecordTriageStatus record={r} className={TRIAGE_MODE_BADGE_CLASS} />
           )}
+          <TriageSuggestionBadge record={r} />
+          </div>
           {canWrite && !archived ? <InlineRecordProgress record={r} onAdd={onAddNote} busy={noteBusy} /> : <button type="button" onClick={onOpenDetail} aria-label="查看内容详情" className="flex h-8 w-12 items-center justify-center rounded-md text-primary hover:bg-accent"><ChevronRight className="h-4 w-4" /></button>}
         </div>
       </td>

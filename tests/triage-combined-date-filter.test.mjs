@@ -87,8 +87,10 @@ test('handled date filtering stays combined-only and follows initial, clear, sel
   assert.match(filter, /筛选此期间人工更改过处理状态的帖子/);
   assert.match(queue, /handled: \{ from: '', to: '' \}/);
   assert.match(queue, /handled: \{ from: initial\?\.handledFrom \|\| '', to: initial\?\.handledTo \|\| '' \}/);
-  const selection = queue.match(/const sel = useSelection\([^\n]+/)?.[0];
+  const selection = queue.match(/const pageSelection = useSelection\([^\n]+/)?.[0];
   assert.ok(selection);
+  assert.match(queue, /const sel = useMemo\(\(\) => suggestionSelectionActive \? \{/);
+  assert.match(queue, /\} : pageSelection/);
   // 勾选跟着查询走（筛选/翻页/视图变化即清空），不再把整页筛选锁进「多选中」态。
   assert.match(selection, /useSelection\(`\$\{filterQuery\}\|\$\{pageSize\}\|\$\{pagination\?\.page \?\? 1\}`\)/);
   assert.doesNotMatch(queue, /<fieldset disabled=\{selectionActive\}/);

@@ -5,6 +5,12 @@ import { mergeRecordPatches, mergePatchMaps, reconcileQueryRecords } from '../we
 
 const queue = readFileSync(new URL('../web/admin/src/pages/workbench/TriageQueue.tsx', import.meta.url), 'utf8');
 function action(name, next, context) {
+  if (name === 'runBatch') context = {
+    records: rows(), drawerRecord: null, openTriageSuggestion: record => record.triageSuggestion || null,
+    suggestionUndo: { offer: () => {} }, refreshSuggestionSummary: async () => {},
+    suggestionConfirmation: { ask: () => assert.fail('ordinary rows must not prompt for suggestions') },
+    load: () => assert.fail('ordinary status edits must not reload the list'), ...context,
+  };
   const snippet = queue.slice(queue.indexOf(`  const ${name} =`), queue.indexOf(`  const ${next} =`));
   // These callbacks contain erasable annotations only. Keep the server-only Node 18 CI
   // independent of frontend build dependencies while executing the real callback bodies.
@@ -12,13 +18,16 @@ function action(name, next, context) {
     .replace(/recordId: string, fields: ManualRecordFields/g, 'recordId, fields')
     .replace(/: Promise<boolean>/g, '')
     .replace(/: TriageMode/g, '')
+    .replace(/ as TriageMode/g, '')
+    .replace(/let suggestionMode: 'split' \| undefined/g, 'let suggestionMode')
+    .replace(/let values: StatusChangeValues/g, 'let values')
     .replace(/let data: ManualFieldsMutationResponse/g, 'let data')
     .replace(/api\.(get|patch|request)<[^>]+>/g, 'api.$1')
     .replace(/ as Error & \{ cause\?: unknown \}/g, '')
     .replace(/options\?: \{ silent\?: boolean \}/g, 'options');
   return new Function(...Object.keys(context), js)(...Object.values(context));
 }
-const rows = () => [{id:'a',sentiment:'negative',triage_status:'unhandled'}, {id:'b',sentiment:'negative',triage_status:'unhandled'}];
+const rows = () => [{id:'a',sentiment:'negative',triage_status:'unhandled',triageSuggestion:null}, {id:'b',sentiment:'negative',triage_status:'unhandled',triageSuggestion:null}];
 test('saved edits keep membership/order and accumulate actual values without mutating original records', () => {
   const original = rows();
   const patches = mergePatchMaps({a:{sentiment:'neutral'}}, {A:{triage_status:'reviewed',progress_latest_body:'跟进备注'}});
@@ -60,7 +69,7 @@ test('failed save leaves record values and context intact', async () => {
 });
 for (const ids of [['a'],['a','b']]) test(`batch status preserves ${ids.length} selections and patches only acknowledged successes`,async()=>{
   let visible=rows(); const selected=new Set(ids);
-  const batch=action('runBatch','syncArchiveLocally',{
+  const batch=action('runBatch','acceptAllSuggestions',{
     archiveView:'active',batchBusy:false,sel:{count:selected.size,selected,clear:()=>assert.fail('must keep selection')},
     CONTENT_TRIAGE_MODES:[{value:'reviewed',label:'已复核'}],askStatusChange:async()=>({note:'已核对'}),
     setBatchFeedback:()=>{},setBatchBusy:()=>{},api:{patch:async()=>({updatedIds:['a']})},
@@ -75,14 +84,14 @@ for (const ids of [['a'],['a','b']]) test(`batch status preserves ${ids.length} 
   assert.equal(visible.length,2);
 });
 test('ordinary mutations never reload/filter the list or clear selection',()=>{
-  for (const [start,end] of [['updateManualFields','updateCustomTags'],['updateCustomTags','closeBatchTagDialog'],['applyBatchCustomTags','deleteCustomTag'],['saveFeishuTableNo','syncModeLocally'],['changeTriageMode','changeRecordMode'],['runBatch','syncArchiveLocally'],['syncWatchedLocally','setRecordsWatched'],['toggleWatch','createPatrolFromSelection']]) {
+  for (const [start,end] of [['updateManualFields','updateCustomTags'],['updateCustomTags','closeBatchTagDialog'],['applyBatchCustomTags','deleteCustomTag'],['saveFeishuTableNo','syncModeLocally'],['changeTriageMode','changeRecordMode'],['runBatch','acceptAllSuggestions'],['syncWatchedLocally','setRecordsWatched'],['toggleWatch','createPatrolFromSelection']]) {
     const block=queue.slice(queue.indexOf(`  const ${start} =`),queue.indexOf(`  const ${end} =`));
     assert.doesNotMatch(block,/\bload\(|sel\.clear\(|setDrawerRecord\(null\)|modeVisibleInCurrentList|leavesCurrentSentiment/,start);
   }
 });
 test('cross-post batch uses only explicit selected ids and keeps the unrelated list selection',async()=>{
   const selected=new Set(['a','b']);let request,prompt,patched;
-  const batch=action('runBatch','syncArchiveLocally',{
+  const batch=action('runBatch','acceptAllSuggestions',{
     archiveView:'active',batchBusy:false,sel:{count:selected.size,selected},
     CONTENT_TRIAGE_MODES:[{value:'negative_feishu',label:'负面-飞书表'}],
     askStatusChange:async options=>{prompt=options;return {note:'跨平台核对',feishuTableNo:'42'}},
@@ -109,8 +118,9 @@ function queryHarness(get) {
     withTriageReadDeadline:(read,controller)=>read(controller.signal),readWithBusyRetry:read=>read(),
     setRecords:fn=>{state.records=fn(state.records)},setSavedEdits:value=>{state.saved=value},
     clearSelectionRef:{current:()=>{state.clears++}},setPagination:value=>{state.pagination=value},
+    setSuggestionSummary:value=>{state.suggestions=value},
   };
-  return {state,context,load:action('load','cancelSelection',context)};
+  return {state,context,load:action('load','suggestionUndo',context)};
 }
 test('explicit refresh recovers an invalid last page after edited records leave the filter',async()=>{
   const pages=[];
@@ -135,4 +145,26 @@ test('late older query response cannot replace a newer query or discard a concur
   assert.equal(h.state.records.find(r=>r.id==='a').sentiment,'neutral');
   assert.equal(h.state.pagination.total,1);
   assert.equal(h.state.clears,1);
+});
+
+
+test('mixed reviewed batch keeps rows, selection and drawer while applying server-confirmed per-record statuses', async () => {
+  let visible = rows(), drawer = visible[0]; const selected = new Set(['a','b']); let request;
+  visible[0].triageSuggestion = {suggestion:'non_monitor'};
+  const batch = action('runBatch','acceptAllSuggestions', {
+    records:visible, drawerRecord:drawer, archiveView:'active',batchBusy:false,sel:{selected},
+    CONTENT_TRIAGE_MODES:[{value:'reviewed',label:'已复核'}],
+    suggestionConfirmation:{ask:async prompt=>{assert.deepEqual(prompt,{kind:'mixed',total:2,suggested:1});return 'split';}},
+    setBatchFeedback:()=>{},setBatchBusy:()=>{},
+    api:{patch:async(path,body)=>{request={path,body};return {updatedIds:['a','b'],statusById:{a:'reviewed_non_monitor',b:'reviewed'},acceptedIds:['a']};}},
+    changedBatchModeIds:result=>result.updatedIds,
+    syncModeLocally:(ids,status)=>{const patches=Object.fromEntries(ids.map(id=>[id,{triage_status:status,triageSuggestion:null}]));visible=mergeRecordPatches(visible,patches);drawer=mergeRecordPatches([drawer],patches)[0];},
+    showBatchFeedback:()=>{},refreshBadges:()=>{},
+  });
+  assert.equal(await batch('reviewed'),true);
+  assert.equal(request.body.suggestionMode,'split');
+  assert.deepEqual(visible.map(record=>record.id),['a','b']);
+  assert.deepEqual([...selected],['a','b']);
+  assert.equal(drawer.id,'a');assert.equal(drawer.triage_status,'reviewed_non_monitor');
+  assert.equal(visible[1].triage_status,'reviewed');
 });

@@ -15,6 +15,7 @@ import { captureKeywordPresentation, publishTimePresentation } from '@/lib/publi
 import { Button } from '@/components/ui/button'
 import { triageDisplay } from '@/lib/triage-display'
 import { RecordTriageStatus } from './RecordTriageStatus'
+import { TriageSuggestionPanel } from './TriageSuggestion'
 import { StatusBadge, StatusDot, StatusPill } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { Tooltip } from '@/components/shared/Tooltip'
@@ -90,6 +91,7 @@ interface RecordDrawerProps {
   onOpenCrossPost?: (member: CrossPostMember) => Promise<void>
   onCrossPostBatchStatus?: (ids: string[], status: string) => Promise<boolean>
   onCrossPostGroupChanged?: () => Promise<void> | void
+  onTriageSuggestionChanged?: (patch: Record<string, unknown>) => void
 }
 
 export function RecordDrawer(props: RecordDrawerProps) {
@@ -115,11 +117,14 @@ function RecordDrawerContent({
   onOpenCrossPost,
   onCrossPostBatchStatus,
   onCrossPostGroupChanged,
+  onTriageSuggestionChanged,
 }: RecordDrawerProps) {
   const [recordDetail, setRecordDetail] = useState<any>(null)
+  const [suggestionPatch, setSuggestionPatch] = useState<Record<string, unknown> | null>(null)
+  useEffect(() => { setSuggestionPatch(null) }, [sourceRecord.triage_status])
   // List rows omit media/payload fields. Keep live list judgments authoritative while
   // filling the content facts from the existing tenant-scoped detail endpoint.
-  const r = { ...recordDetail, ...sourceRecord }
+  const r = { ...recordDetail, ...sourceRecord, ...suggestionPatch }
   for (const field of ['payload', 'video_url', 'audio_url', 'transcript', 'transcript_status', 'transcript_error', 'transcript_analysis']) {
     r[field] = sourceRecord[field] ?? recordDetail?.[field]
   }
@@ -615,6 +620,11 @@ function RecordDrawerContent({
                 onSavingChange={setSavingLabels}
               />
             )}
+
+            <div className="mt-3"><TriageSuggestionPanel record={r} canWrite={canProcess} onChanged={patch => {
+              setSuggestionPatch(patch)
+              onTriageSuggestionChanged?.(patch)
+            }} /></div>
 
             {/* 风险区只展示真实风险；官方回复属于处理进展，在“官方回复”与“处理记录”中展示。 */}
             {hasSignals && (

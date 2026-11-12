@@ -1,6 +1,6 @@
 import {randomUUID} from 'node:crypto';
-import {resolveTriageSuggestions, isTriageSuggestionEnabled, TRIAGE_SUGGESTION_ACTIVE_SQL} from '../services/triage-suggestions.js';
-import {OPEN_TRIAGE_SUGGESTION_SQL, openTriageSuggestions, publicTriageSuggestion, triageSuggestionSummary} from '../services/triage-suggestion-views.js';
+import {resolveTriageSuggestions, isTriageSuggestionEnabled, triageSuggestionActiveSql} from '../services/triage-suggestions.js';
+import {openTriageSuggestionSql, openTriageSuggestions, publicTriageSuggestion, triageSuggestionSummary} from '../services/triage-suggestion-views.js';
 import {undoTriageSuggestionBatch} from '../services/triage-suggestion-undo.js';
 import { knownInteractionSumSql } from '../services/interaction-sql.js';
 import { PLATFORM_LABELS as PLATFORM_CN } from '../services/platform-labels.js';
@@ -161,7 +161,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 // 收件箱「待处理队列」条件(别名约定: records r / record_triage rt)。
 // workspace.js 的 /badges 计数 import 此常量,保证侧边栏徽标与收件箱列表数字一致。
-export const ACTIVE_QUEUE_CONDITION = TRIAGE_SUGGESTION_ACTIVE_SQL;
+export const ACTIVE_QUEUE_CONDITION = triageSuggestionActiveSql();
 
 // 处理状态和归档生命周期相互独立。两个列表共享状态范围，只按 archived_at 分组。
 const TRIAGE_CONTENT_CONDITION = `
@@ -728,7 +728,7 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
     const readDb={queryAll:(sql,args)=>queryAll(sql,args,readOptions),queryOne:(sql,args)=>queryOne(sql,args,readOptions)};
     const suggestions=await triageSuggestionSummary(readDb,req.tenantId,where,params);
     if (req.query.suggestion && req.query.suggestion!=='non_monitor') return res.status(400).json({ok:false,error:'invalid_suggestion'});
-    if (req.query.suggestion==='non_monitor') where += suggestions.enabled ? ` AND (${OPEN_TRIAGE_SUGGESTION_SQL})` : ' AND false';
+    if (req.query.suggestion==='non_monitor') where += suggestions.enabled ? ` AND (${openTriageSuggestionSql()})` : ' AND false';
     if (req.query.selection==='1') {
       if (req.query.suggestion!=='non_monitor') return res.status(400).json({ok:false,error:'suggestion_selection_required'});
       const selected=await queryAll(`SELECT r.id,r.title,COUNT(*) OVER() AS matched_total FROM records r
@@ -1572,7 +1572,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       WHERE cp.tenant_id=r.tenant_id AND cp.record_id=r.id AND EXISTS (SELECT 1 FROM record_cross_posts peer
         WHERE peer.tenant_id=cp.tenant_id AND peer.group_id=cp.group_id AND peer.record_id<>cp.record_id))`;
 
-    if (req.query.suggestion==='non_monitor') where += await isTriageSuggestionEnabled({queryOne},req.tenantId) ? ` AND (${OPEN_TRIAGE_SUGGESTION_SQL})` : ' AND false';
+    if (req.query.suggestion==='non_monitor') where += await isTriageSuggestionEnabled({queryOne},req.tenantId) ? ` AND (${openTriageSuggestionSql()})` : ' AND false';
 
     const records = await queryAll(`
       SELECT
