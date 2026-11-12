@@ -24,6 +24,7 @@ import { CrossPostSection } from '@/components/shared/CrossPostSection'
 import type { CrossPostMember } from '@/lib/cross-posts'
 import { WechatForwardAction } from '@/components/shared/WechatForwardAction'
 import { RecordVideoPlayer } from '@/components/shared/RecordVideoPlayer'
+import { canStreamOrTranscribe, hasRecordMediaSource, recordVideoUrl, recordTranscriptText, WECHAT_VIDEO_HINT } from '@/lib/record-media.mjs'
 import {
   FeishuTableNumberControl,
   type FeishuTableNumberSaveResult,
@@ -39,7 +40,7 @@ import { isRecordDetailDegraded, recordDisplayTitle } from '@/lib/record-display
 import { PostJudgmentDetails } from '@/components/shared/PostJudgment'
 import { postJudgment } from '@/lib/post-judgment'
 import { CONTENT_TOPIC_OPTIONS, contentTopicLabel } from '@/lib/content-topic'
-import { wechatArticleBodyBlocks, wechatArticleDetail, wechatArticleImageStorageError, wechatArticlePresentation } from '@/lib/wechat-article.mjs'
+import { wechatArticleBodyBlocks, wechatArticleDetail, wechatArticleImageStorageError, wechatArticlePresentation, wechatCommentPresentation } from '@/lib/wechat-article.mjs'
 
 /**
  * 内容详情抽屉。写操作由调用方持有，抽屉保留当前内容并同步处理记录。
@@ -96,7 +97,7 @@ export function RecordDrawer(props: RecordDrawerProps) {
 }
 
 function RecordDrawerContent({
-  record: r,
+  record: sourceRecord,
   onClose,
   canWrite,
   onSetStatus,
@@ -115,6 +116,13 @@ function RecordDrawerContent({
   onCrossPostBatchStatus,
   onCrossPostGroupChanged,
 }: RecordDrawerProps) {
+  const [recordDetail, setRecordDetail] = useState<any>(null)
+  // List rows omit media/payload fields. Keep live list judgments authoritative while
+  // filling the content facts from the existing tenant-scoped detail endpoint.
+  const r = { ...recordDetail, ...sourceRecord }
+  for (const field of ['payload', 'video_url', 'audio_url', 'transcript', 'transcript_status', 'transcript_error', 'transcript_analysis']) {
+    r[field] = sourceRecord[field] ?? recordDetail?.[field]
+  }
   const [tab, setTab] = useState<RecordDrawerTab>(initialTab)
   const [comments, setComments] = useState<any[]>([])
   const [officialResponses, setOfficialResponses] = useState<any[]>([])
@@ -148,12 +156,16 @@ function RecordDrawerContent({
 
   useEffect(() => {
     let active = true
+    const controller = new AbortController()
+    const options = { signal: controller.signal }
     Promise.all([
-      api.get('/records/' + r.id + '/comments').catch(() => ({ comments: [], officialResponses: [] })),
-      api.get('/records/' + r.id + '/observations').catch(() => ({ observations: [] })),
-      api.get('/records/' + r.id + '/activity').catch(() => ({ activity: [] })),
-    ]).then(([cData, oData, aData]: any[]) => {
+      api.get('/records/' + r.id + '/comments', options).catch(() => ({ comments: [], officialResponses: [] })),
+      api.get('/records/' + r.id + '/observations', options).catch(() => ({ observations: [] })),
+      api.get('/records/' + r.id + '/activity', options).catch(() => ({ activity: [] })),
+      api.get('/opinion-analysis/records/' + r.id + '/detail', options).catch(() => ({ record: null })),
+    ]).then(([cData, oData, aData, detailData]: any[]) => {
       if (!active) return
+      if (detailData.record?.id === r.id) setRecordDetail(detailData.record)
       setComments(cData.comments || [])
       setOfficialResponses(cData.officialResponses || [])
       setObservations(oData.observations || [])
@@ -161,7 +173,7 @@ function RecordDrawerContent({
       setActivity(aData.activity || [])
       setLoadedRecordId(r.id)
     }).finally(() => { if (active) setLoading(false) })
-    return () => { active = false }
+    return () => { active = false; controller.abort() }
   }, [r.id])
 
   useEffect(() => {
@@ -391,13 +403,14 @@ function RecordDrawerContent({
   const deleted = String(r.content_availability_status || '') === 'deleted'
   const hasSignals = alerts > 0 || negComments > 0 || deleted
   const article = r.platform === 'wechat_articles' ? wechatArticlePresentation(r, comments.length) : null
+  const commentPresentation = ['wechat_articles', 'wechat_channels'].includes(r.platform) ? wechatCommentPresentation(r, comments.length) : null
   const articleDetail = article ? wechatArticleDetail(r) : null
   const sourceName = articleDetail?.account || r.author_name || ''
   const triageStatus = r.triage_status || 'unhandled'
 
   const TABS = [
     { id: 'content' as const, label: '内容', icon: FileText },
-    { id: 'comments' as const, label: article?.commentTab || `评论 (${comments.length})`, icon: MessageCircle },
+    { id: 'comments' as const, label: commentPresentation?.commentTab || `评论 (${comments.length})`, icon: MessageCircle },
     { id: 'official' as const, label: `官方回复 (${officialResponses.length})`, icon: CheckCircle },
     { id: 'snapshot' as const, label: '采集', icon: Camera },
     ...(r.sentiment === 'negative'
@@ -656,9 +669,9 @@ function RecordDrawerContent({
 
                 {tab === 'comments' && (
                   <div className="space-y-3">
-                  {article && comments.length > 0 && <div className="rounded-lg border border-border bg-muted/30 p-3 text-xs leading-5"><p className="font-medium">{article.commentTitle}</p><p className="text-muted-foreground">{article.commentDescription}</p>{article.postingNote && <p className="text-muted-foreground">{article.postingNote}</p>}</div>}
+                  {commentPresentation && comments.length > 0 && <div className="rounded-lg border border-border bg-muted/30 p-3 text-xs leading-5"><p className="font-medium">{commentPresentation.commentTitle}</p><p className="text-muted-foreground">{commentPresentation.commentDescription}</p>{commentPresentation.postingNote && <p className="text-muted-foreground">{commentPresentation.postingNote}</p>}</div>}
                   {comments.length === 0 ? (
-                    <EmptyState icon={MessageCircle} title={article?.commentTitle || "暂无评论数据"} description={article ? [article.commentDescription, article.postingNote].filter(Boolean).join(" ") : "需要在采集任务中开启评论采集"} />
+                    <EmptyState icon={MessageCircle} title={commentPresentation?.commentTitle || "暂无评论数据"} description={commentPresentation ? [commentPresentation.commentDescription, commentPresentation.postingNote].filter(Boolean).join(" ") : "需要在采集任务中开启评论采集"} />
                   ) : (
                     <div className="space-y-3">
                       {comments.map((c: any, i: number) => (
@@ -1338,16 +1351,15 @@ function commentClassifier(comment: any): string {
   }
 }
 
-function hasVideo(r: any): boolean {
-  return Boolean(r?.video_url) || r?.note_type === 'video'
-}
-
 const CONTENT_SECTION_TITLE = 'text-[13px] font-semibold text-foreground'
 const CONTENT_ACTION_BUTTON = 'inline-flex shrink-0 items-center gap-1 rounded-md border border-border bg-background px-2.5 py-1 text-xs font-semibold text-primary transition hover:bg-accent disabled:opacity-50'
 const TRANSCRIPT_CLAMP_CHARS = 240
 
 type TranscriptRecord = {
   id?: string | number
+  video_url?: string | null
+  audio_url?: string | null
+  payload?: unknown
   transcript_status?: string | null
   transcript?: string | null
   transcript_error?: string | null
@@ -1369,8 +1381,9 @@ type RecordTranscript = ReturnType<typeof useRecordTranscript>
  * 逐字稿原文放在「原帖内容」，基于它的 AI 分析放在「AI 分析」，两处共用这一份状态。
  */
 function useRecordTranscript(record: TranscriptRecord, enabled: boolean) {
-  const [status, setStatus] = useState<string>(record.transcript_status || 'none')
-  const [text, setText] = useState<string>(record.transcript || '')
+  const initialText = recordTranscriptText(record)
+  const [status, setStatus] = useState<string>(record.transcript_status || (initialText ? 'done' : 'none'))
+  const [text, setText] = useState<string>(initialText)
   const [error, setError] = useState<string>(record.transcript_error || '')
   const [busy, setBusy] = useState(false)
   const [analysis, setAnalysis] = useState<TranscriptAnalysis | null>(record.transcript_analysis || null)
@@ -1381,21 +1394,23 @@ function useRecordTranscript(record: TranscriptRecord, enabled: boolean) {
     if (!enabled || !record.id) return
     const data = await api.get<TranscriptResponse>(`/records/${record.id}/transcript`, { signal })
     if (signal.aborted) return
-    setStatus(data.transcript_status || 'none')
-    setText(data.transcript || '')
+    const savedText = data.transcript || initialText
+    setStatus(savedText && (!data.transcript_status || data.transcript_status === 'none') ? 'done' : data.transcript_status || 'none')
+    setText(savedText)
     setError(data.transcript_error || '')
     setAnalysis(data.transcript_analysis || null)
     setLoadedId(record.id)
     setBusy(data.transcript_status === 'pending' || data.transcript_status === 'processing')
-  }, [enabled, record.id])
+  }, [enabled, record.id, initialText])
   // The first read and subsequent refreshes share one request lane.
   const { refresh: refreshTranscript } = usePolling(readTranscript, {
     intervalMs: 3500,
-    enabled: enabled && (loadedId !== record.id || status === 'pending' || status === 'processing'),
+    enabled: enabled && (loadedId !== record.id || (hasRecordMediaSource(record) && (status === 'pending' || status === 'processing'))),
     resetKey: record.id,
   })
 
   const generate = async () => {
+    if (!enabled || !hasRecordMediaSource(record) || !record.id || busy) return
     setBusy(true); setError('')
     try {
       const d = await api.post<{ status?: string }>(`/records/${record.id}/transcribe`, {})
@@ -1419,10 +1434,12 @@ function useRecordTranscript(record: TranscriptRecord, enabled: boolean) {
     }
   }
 
-  const inProgress = status === 'pending' || status === 'processing'
+  const savedText = text || initialText
+  const displayStatus = savedText && !hasRecordMediaSource(record) ? 'done' : status
+  const inProgress = displayStatus === 'pending' || displayStatus === 'processing'
   return {
-    status, text, error, busy, analysis, analyzing, analyzeError, generate, analyze, inProgress,
-    hasTranscript: status === 'done' && !!text,
+    status: displayStatus, text: savedText, error, busy, analysis, analyzing, analyzeError, generate, analyze, inProgress,
+    hasTranscript: displayStatus === 'done' && !!savedText,
   }
 }
 
@@ -1442,10 +1459,12 @@ type RecordContentTabProps = {
  * 下面是 AI 产出（摘要、深度剖析、视频内容分析、判断依据）。
  */
 function RecordContentTab({ record: r, canProcess, canRefreshImages, cover, images, imageRefs, imageKey, onOpenImage }: RecordContentTabProps) {
-  const video = hasVideo(r)
+  const video = Boolean(recordVideoUrl(r))
+  const transcriptAvailable = canStreamOrTranscribe(r)
+  const mediaAvailable = hasRecordMediaSource(r)
   const article = r.platform === 'wechat_articles' ? wechatArticlePresentation(r) : null
   const articleBlocks = article ? wechatArticleBodyBlocks(r, images.map((url, index) => ({ url, ref: imageRefs[index] || '' }))) : []
-  const transcript = useRecordTranscript(r, video)
+  const transcript = useRecordTranscript(r, transcriptAvailable)
   const gallery = (
     <RecordImageGallery
       key={imageKey}
@@ -1463,6 +1482,7 @@ function RecordContentTab({ record: r, canProcess, canRefreshImages, cover, imag
     <div className="space-y-9">
       <section aria-label="原帖内容" className="space-y-6">
         <ContentGroupHeader icon={FileText} title="原帖内容" />
+        {r.platform === 'wechat_channels' && !video && <p className="text-xs leading-5 text-muted-foreground">{WECHAT_VIDEO_HINT}</p>}
         {video && <RecordVideoPlayer key={String(r.id)} record={r} poster={cover} />}
         {!video && articleBlocks.length === 0 && gallery}
         <div>
@@ -1477,7 +1497,7 @@ function RecordContentTab({ record: r, canProcess, canRefreshImages, cover, imag
                   imageStorageErrors={[block.storageError]} onOpen={onOpenImage} />)}
           </div> : <p className="whitespace-pre-wrap text-sm leading-relaxed">{r.content || (article ? '本次未取得正文' : '无正文')}</p>}
         </div>
-        {video && <TranscriptTextSection transcript={transcript} canWrite={canProcess} />}
+        {transcriptAvailable && <TranscriptTextSection transcript={transcript} canWrite={canProcess && mediaAvailable} />}
         {/* 视频帖的图通常只有封面：放在正文和逐字稿后面，主要用来提取封面上的文字 */}
         {video && gallery}
       </section>
@@ -1509,7 +1529,7 @@ function RecordContentTab({ record: r, canProcess, canRefreshImages, cover, imag
             embedded
           />
         </div>
-        {video && transcript.hasTranscript && <TranscriptAnalysisSection transcript={transcript} canWrite={canProcess} />}
+        {transcriptAvailable && transcript.hasTranscript && <TranscriptAnalysisSection transcript={transcript} canWrite={canProcess} />}
         <PostJudgmentDetails record={r} />
       </section>
     </div>

@@ -4,6 +4,8 @@ import { readFileSync } from 'node:fs';
 
 import { collectRecordMediaUrls, recordVideoUrl } from '../server/services/media-proxy.js';
 
+import { recordVideoUrl as adminRecordVideoUrl, canStreamOrTranscribe } from '../web/admin/src/lib/record-media.mjs';
+
 const source = path => readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
 
 test('recordVideoUrl picks the video link in the same order as the admin and the proxy allow-list', () => {
@@ -15,6 +17,7 @@ test('recordVideoUrl picks the video link in the same order as the admin and the
   ];
   for (const [record, expected] of cases) {
     assert.equal(recordVideoUrl(record), expected);
+    assert.equal(adminRecordVideoUrl(record), expected);
     // 返回的链接必须能通过 media-proxy 的归属校验，否则转发播放会被 403
     assert.ok(collectRecordMediaUrls(record).has(expected));
   }
@@ -27,16 +30,22 @@ test('recordVideoUrl returns nothing for records without a video (audio and imag
   assert.equal(recordVideoUrl({ cover_url: 'https://p3.douyinpic.com/c.jpg', payload: '{bad json' }), '');
 });
 
-test('the drawer player asks the server for the link when the list row does not carry it', () => {
+test('the drawer fills skinny rows from detail before deciding media capability, and no-stream player never fetches', () => {
   const player = source('web/admin/src/components/shared/RecordVideoPlayer.tsx');
   const routes = source('server/routes/records.js');
   const triage = source('server/routes/triage.js');
+  const drawer = source('web/admin/src/components/shared/RecordDrawer.tsx');
 
-  // 内容分诊列表不返回 video_url —— 这正是播放器要单独取链接的原因
+  // 内容分诊列表不返回 video_url；详情补齐事实后才挂载播放器。
   assert.doesNotMatch(triage.slice(triage.indexOf('page.matched_total'), triage.indexOf('page.matched_total') + 2000), /r\.video_url/);
-  assert.match(player, /api\.get<\{ videoUrl\?: string \}>\(`\/records\/\$\{record\.id\}\/video`\)/);
-  assert.match(player, /if \(rowVideoUrl \|\| record\.id == null\) return/);
-  assert.match(player, /const videoUrl = rowVideoUrl \|\| fetchedVideoUrl/);
+  assert.match(drawer, /api\.get\('\/opinion-analysis\/records\/' \+ r\.id \+ '\/detail', options\)/);
+  assert.match(drawer, /const options = \{ signal: controller\.signal \}/);
+  assert.match(drawer, /if \(detailData\.record\?\.id === r\.id\) setRecordDetail/);
+  assert.match(drawer, /active = false; controller\.abort\(\)/);
+  assert.match(player, /const videoUrl = recordVideoUrl\(record\)/);
+  assert.match(player, /if \(!videoUrl\) return null/);
+  assert.doesNotMatch(player, /api\.get(?:<|\()/);
+  assert.equal(canStreamOrTranscribe({platform:'wechat_channels',note_type:'video',url:'https://weixin.qq.com/sph/example'}), false);
 
   assert.match(routes, /router\.get\('\/:id\/video', requireTenantAccess,/);
   assert.match(routes, /SELECT id, video_url, payload FROM records WHERE id = \$1 AND tenant_id = \$2/);

@@ -30,7 +30,10 @@ test('the content tab shows the post itself first and the AI output below it', (
   }
 
   // 逐字稿原文和它的 AI 分析共用一份状态，只拉取一次
-  assert.match(tab, /const transcript = useRecordTranscript\(r, video\)/);
+  assert.match(tab, /const transcript = useRecordTranscript\(r, transcriptAvailable\)/);
+  assert.match(tab, /const transcriptAvailable = canStreamOrTranscribe\(r\)/);
+  assert.match(tab, /canWrite=\{canProcess && mediaAvailable\}/);
+  assert.match(tab, /video && <RecordVideoPlayer/);
   assert.equal((drawer.match(/useRecordTranscript\(/g) || []).length, 2, 'one definition and one call');
   assert.match(drawer, /\{tab === 'content' && \(\s*<RecordContentTab/);
 });

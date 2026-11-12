@@ -5,6 +5,7 @@ import {
   Filter, Image as ImageIcon, Layers3, Loader2, RefreshCw, Search, X,
 } from 'lucide-react'
 import { api } from '@/lib/api'
+import { canStreamOrTranscribe, hasRecordMediaSource, recordTranscriptText, WECHAT_VIDEO_HINT } from '@/lib/record-media.mjs'
 import { formatDate, formatNumber, formatRecordMetric, platformName, friendlyError, proxiedImg } from '@/lib/utils'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
@@ -1434,19 +1435,6 @@ function videoDuration(row: any) {
   )
 }
 
-function videoTranscript(row: any) {
-  return firstValue(
-    value(row, 'payload.videoTranscript'),
-    value(row, 'payload.videoTranscriptText'),
-    value(row, 'payload.videoTranscriptExtracted'),
-    value(row, 'payload.videoSubtitleText'),
-    value(row, 'payload.subtitleText'),
-    value(row, 'payload.transcript'),
-    value(row, 'payload.asrText'),
-    value(row, 'payload.videoText'),
-  )
-}
-
 function videoScriptAnalysis(row: any) {
   return firstValue(
     value(row, 'payload.videoScriptAnalysis'),
@@ -1833,26 +1821,29 @@ function AttachmentDownloadCell({ row }: { row: any }) {
 
 // 视频逐字稿单元:有结果显示文本;没结果给「生成逐字稿」按钮(异步转写 + 轮询)
 const TRANSCRIPT_TERMINAL = ['done', 'failed', 'expired', 'no_media', 'no_speech']
-function TranscriptCell({ row }: { row: any }) {
-  const initialText = String(row?.transcript || videoTranscript(row) || '')
+export function TranscriptCell({ row }: { row: any }) {
+  const enabled = canStreamOrTranscribe(row)
+  const canGenerate = hasRecordMediaSource(row)
+  const initialText = recordTranscriptText(row)
   const [status, setStatus] = useState<string>(row?.transcript_status || (initialText ? 'done' : 'none'))
   const [text, setText] = useState<string>(initialText)
   const [error, setError] = useState<string>(row?.transcript_error || '')
   const [busy, setBusy] = useState(false)
   const readTranscript = useCallback(async (signal: AbortSignal) => {
+    if (!enabled || !row?.id) return
     const data: any = await api.get(`/records/${row.id}/transcript`, { signal })
     if (signal.aborted) return
     setStatus(data.transcript_status || 'none')
-    setText(data.transcript || '')
+    setText(data.transcript || initialText)
     setError(data.transcript_error || '')
     if (TRANSCRIPT_TERMINAL.includes(data.transcript_status)) setBusy(false)
-  }, [row.id])
+  }, [row.id, enabled, initialText])
   const { refresh: refreshTranscript } = usePolling(readTranscript, {
-    intervalMs: 3500, enabled: status === 'pending' || status === 'processing', resetKey: row.id,
+    intervalMs: 3500, enabled: enabled && canGenerate && (status === 'pending' || status === 'processing'), resetKey: row.id,
   })
 
   const generate = async () => {
-    if (!row?.id || busy) return
+    if (!canGenerate || !row?.id || busy) return
     setBusy(true); setError('')
     try {
       const d: any = await api.post(`/records/${row.id}/transcribe`, {})
@@ -1867,13 +1858,14 @@ function TranscriptCell({ row }: { row: any }) {
 
   const inProgress = busy || status === 'pending' || status === 'processing'
 
-  if (status === 'done' && text) {
+  if (text && (status === 'done' || !canGenerate)) {
     return (
       <div className="max-w-full whitespace-pre-wrap break-words text-xs leading-5 lg:max-w-[220px]" title={text}>
         {text.length > 200 ? text.slice(0, 200) + '…' : text}
       </div>
     )
   }
+  if (!canGenerate) return <span className="text-xs text-muted-foreground">{row.platform === 'wechat_channels' ? WECHAT_VIDEO_HINT : '—'}</span>
   return (
     <div className="flex flex-col gap-1">
       <button

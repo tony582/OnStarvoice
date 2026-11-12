@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { Play, VideoOff } from 'lucide-react'
 import { api } from '@/lib/api'
 import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
+import { recordVideoUrl } from '@/lib/record-media.mjs'
 
 type PlaybackMode = 'idle' | 'direct' | 'proxy' | 'unavailable'
 
@@ -14,35 +15,6 @@ type VideoRecord = Record<string, unknown> & {
   payload?: unknown
 }
 
-function parsePayload(payload: unknown): Record<string, unknown> {
-  if (payload && typeof payload === 'object') return payload as Record<string, unknown>
-  if (typeof payload !== 'string' || !payload.trim()) return {}
-  try {
-    const parsed = JSON.parse(payload)
-    return parsed && typeof parsed === 'object' ? parsed : {}
-  } catch {
-    return {}
-  }
-}
-
-function urlOf(item: unknown): string {
-  if (typeof item === 'string') return item.trim()
-  if (item && typeof item === 'object') {
-    const value = (item as Record<string, unknown>).url || (item as Record<string, unknown>).src || ''
-    return String(value).trim()
-  }
-  return ''
-}
-
-// 取值顺序与「下载附件」（DataPage videoUrl）和服务端 collectRecordMediaUrls 一致，转发时才能通过归属校验
-function recordVideoUrl(record: VideoRecord): string {
-  const payload = parsePayload(record.payload)
-  const videoUrls = Array.isArray(payload.videoUrls) ? payload.videoUrls : []
-  return [record.video_url, payload.videoUrl, payload.videoLink, payload.video_url, payload.awemeVideoUrl, videoUrls[0]]
-    .map(urlOf)
-    .find(value => /^https?:\/\//i.test(value)) || ''
-}
-
 /**
  * 详情抽屉里直接播放平台视频。点了才加载，不在打开抽屉时拉视频。
  * 先让浏览器直连平台链接（不占服务器带宽）；平台拒绝（防盗链 / 过期）就改走服务端转发
@@ -50,18 +22,7 @@ function recordVideoUrl(record: VideoRecord): string {
  */
 export function RecordVideoPlayer({ record, poster }: { record: VideoRecord; poster?: string }) {
   const [mode, setMode] = useState<PlaybackMode>('idle')
-  const rowVideoUrl = recordVideoUrl(record)
-  // 内容分诊等列表不带 video_url / payload：行里没有就向服务端单独取一次
-  const [fetchedVideoUrl, setFetchedVideoUrl] = useState('')
-  useEffect(() => {
-    if (rowVideoUrl || record.id == null) return
-    let active = true
-    api.get<{ videoUrl?: string }>(`/records/${record.id}/video`)
-      .then(data => { if (active) setFetchedVideoUrl(String(data.videoUrl || '')) })
-      .catch(() => { /* 取不到就不显示播放器，逐字稿照常 */ })
-    return () => { active = false }
-  }, [record.id, rowVideoUrl])
-  const videoUrl = rowVideoUrl || fetchedVideoUrl
+  const videoUrl = recordVideoUrl(record)
   if (!videoUrl) return null
 
   const tenant = api.getTenant()

@@ -18,3 +18,8 @@ export function wechatArticlePresentation(record?: Record<string, unknown>, capt
   bodyStatus: string; bodyLabel: string; bodyDescription: string; metricNotice: string;
   commentStatus: string; commentTitle: string; commentDescription: string; postingNote: string; commentTab: string;
 }
+
+export interface WechatCommentPresentation {
+  commentStatus: string; commentTitle: string; commentDescription: string; postingNote: string; commentTab: string;
+}
+export function wechatCommentPresentation(record?: Record<string, unknown>, capturedComments?: number): WechatCommentPresentation

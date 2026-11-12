@@ -123,19 +123,40 @@ const COMMENT_LABELS = {
   empty: ['暂无可见留言', '已检查留言区，本次没有发现可见留言。'],
   captured: ['已采集留言', '这里只包含采集时可见的留言，不代表全部留言。'],
   partial: ['留言未采完整', '本次只采集了部分可见留言。'],
+  not_relocated: ['未重新定位到原帖', '本次未重新定位到原帖，未能读取留言，不能据此判断没有留言。'],
 }
 
-export function wechatArticlePresentation(record = {}, capturedComments = 0) {
-  const article = wechatArticleData(record)
+export function wechatCommentPresentation(record = {}, capturedComments = 0) {
+  const channel = record.platform === 'wechat_channels'
+  const article = channel ? {} : wechatArticleData(record)
   const payload = object(record.payload)
   const comments = object(article.comments)
   const rawStatus = String(comments.status || payload.commentsCaptureStatus || record.comments_capture_status || 'unknown')
   const commentStatus = ['done', 'complete', 'ok'].includes(rawStatus) ? 'captured'
     : Object.hasOwn(COMMENT_LABELS, rawStatus) ? rawStatus : 'unknown'
-  const [commentTitle, commentDetail] = commentStatus === 'unavailable' && comments.reason === 'no_comment_entry'
+  let [commentTitle, commentDetail] = commentStatus === 'unavailable' && comments.reason === 'no_comment_entry'
     ? ['未显示留言入口', '本次文章页面未显示留言入口，不能据此判断留言数量为零。'] : COMMENT_LABELS[commentStatus]
-  const commentDescription = commentDetail + (capturedComments > 0 && ['closed', 'unavailable', 'unknown', 'disabled', 'empty'].includes(commentStatus)
-    ? ' 下方保留此前已采集的留言。' : '')
+  if (channel) {
+    commentTitle = commentTitle.replaceAll('留言', '评论')
+    commentDetail = commentDetail.replaceAll('留言', '评论').replace('文章关闭了评论，正文仍正常保留。', '原帖关闭了评论。')
+      .replace('文末评论状态', '评论区状态').replace('，正文仍正常保留。', '。')
+  }
+  const noun = channel ? '评论' : '留言'
+  const commentDescription = commentDetail + (capturedComments > 0 && ['closed', 'unavailable', 'unknown', 'disabled', 'empty', 'not_relocated'].includes(commentStatus)
+    ? ` 下方保留此前已采集的${noun}。` : '')
+  const postingState = String(comments.postingState || '')
+  const postingNote = ['follow_required', 'follow_to_comment', 'follow_required_to_post', 'followers_only'].includes(postingState)
+    ? '需关注后才能留言；这不影响查看已展示的留言。' : ''
+  return {
+    commentStatus, commentTitle, commentDescription, postingNote,
+    commentTab: capturedComments > 0 ? `${noun} (${capturedComments})`
+      : commentStatus === 'empty' ? `${noun} (0)` : noun,
+  }
+}
+
+export function wechatArticlePresentation(record = {}, capturedComments = 0) {
+  const article = wechatArticleData(record)
+  const payload = object(record.payload)
   const bodyStatus = String(article.bodyStatus || payload.detailCaptureStatus || record.detail_capture_status || 'unknown')
   const fromPage = article.source === 'page_dom'
   const body = bodyStatus === 'complete' || bodyStatus === 'done'
@@ -166,13 +187,8 @@ export function wechatArticlePresentation(record = {}, capturedComments = 0) {
     && object(latestMetrics[key]).value == null && object(savedMetrics[key]).value != null)
     ? '最近一次未读到部分互动数，当前显示此前已知值。' : ''
   if (fromPage) metricNotice += '互动数按网页或手机当时显示值记录；未显示数字的项目记为未知。'
-  const postingState = String(comments.postingState || '')
-  const postingNote = ['follow_required', 'follow_to_comment', 'follow_required_to_post', 'followers_only'].includes(postingState)
-    ? '需关注后才能留言；这不影响查看已展示的留言。' : ''
   return {
     bodyStatus, bodyLabel: body.label, bodyDescription: body.description, metricNotice,
-    commentStatus, commentTitle, commentDescription, postingNote,
-    commentTab: capturedComments > 0 ? `留言 (${capturedComments})`
-      : commentStatus === 'empty' ? '留言 (0)' : '留言',
+    ...wechatCommentPresentation(record, capturedComments),
   }
 }

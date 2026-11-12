@@ -15,6 +15,7 @@ import { EmptyState } from '@/components/shared/EmptyState'
 import { RecordImageGallery } from '@/components/shared/RecordImageGallery'
 import { recordDisplayCover, recordDisplayImageEntries } from '@/components/shared/record-images'
 import { RecordPatrolPanel } from '@/components/shared/RecordDrawer'
+import { wechatCommentPresentation } from '@/lib/wechat-article.mjs'
 import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
 
 const PANEL_MIN = 480, PANEL_MAX = 900, PANEL_DEFAULT = 620
@@ -248,6 +249,7 @@ function TicketDrawerContent({
     platform: rec?.platform || t.platform,
     url: rec?.url || t.url || cmt?.record_url || '',
   }
+  const commentPresentation = ['wechat_articles', 'wechat_channels'].includes(sourceRecord.platform) ? wechatCommentPresentation(sourceRecord, comments.length) : null
   const cover = recordCover(rec, t)
   const imageEntries = recordDisplayImageEntries(rec)
   const images = imageEntries.map(item => item.url)
@@ -255,7 +257,7 @@ function TicketDrawerContent({
   const timeline = buildTimeline(t, notes)
   const tabs = [
     { id: 'content' as const, label: '内容', icon: FileText },
-    { id: 'comments' as const, label: `评论 (${comments.length})`, icon: MessageCircle },
+    { id: 'comments' as const, label: commentPresentation?.commentTab || `评论 (${comments.length})`, icon: MessageCircle },
     { id: 'official' as const, label: `官方回复 (${officialResponses.length})`, icon: CheckCircle },
     { id: 'snapshot' as const, label: '采集', icon: Camera },
     ...(rec
@@ -431,9 +433,10 @@ function TicketDrawerContent({
 
                 {tab === 'comments' && (
                   comments.length === 0 ? (
-                    <EmptyState icon={MessageCircle} title="暂无评论数据" description="需要在插件采集时开启评论采集" />
+                    <EmptyState icon={MessageCircle} title={commentPresentation?.commentTitle || "暂无评论数据"} description={commentPresentation ? [commentPresentation.commentDescription, commentPresentation.postingNote].filter(Boolean).join(" ") : "需要在插件采集时开启评论采集"} />
                   ) : (
                     <div className="space-y-3">
+                      {commentPresentation && <div className="rounded-lg border border-border bg-muted/30 p-3 text-xs leading-5"><p className="font-medium">{commentPresentation.commentTitle}</p><p className="text-muted-foreground">{commentPresentation.commentDescription}</p>{commentPresentation.postingNote && <p className="text-muted-foreground">{commentPresentation.postingNote}</p>}</div>}
                       {comments.map((comment, index) => (
                         <div key={comment.id || index} className={cn('rounded-lg p-3.5', comment.is_negative ? 'bg-status-red/[0.05]' : 'bg-muted/50')}>
                           <div className="mb-1.5 flex flex-wrap items-center gap-2">

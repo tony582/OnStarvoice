@@ -35,10 +35,12 @@ test('content ticket drawer follows the triage detail anatomy', () => {
 
   assert.match(drawer, /data-drawer-header/);
   assert.match(drawer, /label: '内容'/);
-  assert.match(drawer, /label: `评论 \(\$\{comments\.length\}\)`/);
+  assert.match(drawer, /label: commentPresentation\?\.commentTab \|\| `评论 \(\$\{comments\.length\}\)`/);
   assert.match(drawer, /label: `官方回复 \(\$\{officialResponses\.length\}\)`/);
   assert.match(drawer, /label: '采集'/);
   assert.match(drawer, /label: `处理记录 \(\$\{timeline\.length\}\)`/);
+  assert.match(drawer, /wechatCommentPresentation\(sourceRecord, comments\.length\)/);
+  assert.match(drawer, /commentPresentation\?\.commentTitle/);
   assert.match(drawer, /工单信息/);
   assert.match(drawer, /互动数据|label="点赞"/);
   assert.match(drawer, /记录进展/);
