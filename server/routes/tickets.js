@@ -7,6 +7,7 @@ import { getRecordLifecycle, sendRecordArchived } from '../services/record-lifec
 import { getOfficialResponses, getRecordComments } from '../services/comment-workflow.js';
 import { formatPublishDate } from '../services/publish-date.js';
 import { TICKET_EVENT_TYPE_BY_ACTION } from '../services/ticket-event-types.js';
+import { resolveTriageSuggestions } from '../services/triage-suggestions.js';
 
 const router = Router();
 
@@ -146,6 +147,9 @@ async function archiveContentRecordForTicketClose(tx, {
 
   // 来源 records 行已由调用方先锁住。这里再以 archived_at IS NULL 作为数据库级
   // 幂等门：内容已归档时不覆盖首次归档时间/归档人，也不重复写 record.archived。
+  const previousTriage = await tx.queryOne(`
+    SELECT record_id FROM record_triage WHERE tenant_id = $1 AND record_id = $2
+  `, [tenantId, recordId]);
   const archived = await tx.queryOne(`
     INSERT INTO record_triage (
       tenant_id, record_id, status, priority, owner_user_id, owner_name,
@@ -162,6 +166,13 @@ async function archiveContentRecordForTicketClose(tx, {
   `, [tenantId, recordId, actorUserId, actorName]);
 
   if (archived) {
+    // An existing triage row is only archived here; its human status stays intact.
+    // Only the legacy missing-row repair introduces negative_feishu.
+    if (!previousTriage) {
+      await resolveTriageSuggestions(tx, {
+        tenantId, recordIds: [recordId], status: 'negative_feishu', userId: actorUserId,
+      });
+    }
     await tx.execute(`
       INSERT INTO audit_logs (
         tenant_id, actor_type, actor_id, actor_user_id,
@@ -225,6 +236,7 @@ async function markContentRecordNegativeFeishu(tx, { tenantId, recordId, userId,
      DO UPDATE SET status = 'negative_feishu', feishu_table_no = excluded.feishu_table_no, updated_at = now()`,
     [tenantId, recordId, userId || null, userName || '', String(feishuTableNo || '').trim()],
   );
+  await resolveTriageSuggestions(tx, {tenantId, recordIds: [recordId], status: 'negative_feishu', userId});
   return previous?.status || 'unhandled';
 }
 

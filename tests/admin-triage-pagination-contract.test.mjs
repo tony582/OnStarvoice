@@ -56,8 +56,13 @@ test('content triage counts and pages the filtered posts in one statement', () =
   const pageStatement = route.slice(pageCte, statementEnd);
 
   // The admission predicates cost about a second per evaluation over a
-  // tenant's posts: the page statement is the only one that may run them.
-  assert.equal(route.slice(0, pageCte).includes('${where}'), false, 'nothing evaluates the filter before the page statement');
+  // tenant's posts: the normal page still counts and pages in one statement.
+  const selectionStart=route.indexOf("if (req.query.selection==='1')");
+  const selectionEnd=route.indexOf('const countParams =',selectionStart);
+  assert.match(route.slice(selectionStart,selectionEnd),/return res\.json/,'all-suggestion selection returns before paged path');
+  assert.equal(route.slice(0,selectionStart).includes('${where}'),false);
+  const suggestionViews=readFileSync(new URL('../server/services/triage-suggestion-views.js',import.meta.url),'utf8');
+  assert.match(suggestionViews,/COUNT\(\*\)::int AS count FROM record_triage_suggestions s\s+JOIN records r/u,'suggestion count starts with its small indexed table');
   assert.match(pageStatement, /SELECT r\.id, COUNT\(\*\) OVER \(\) AS matched_total\s+FROM records r\s+LEFT JOIN record_triage rt[^\n]+\s+\$\{where\}\s+ORDER BY/u);
   assert.equal([...pageStatement.matchAll(/\$\{where\}/gu)].length, 1);
   assert.match(pageStatement, /SELECT\s+page\.matched_total,/u);

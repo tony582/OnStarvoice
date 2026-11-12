@@ -1,3 +1,4 @@
+import {ACTIVE_QUEUE_CONDITION} from '../server/routes/triage.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -185,7 +186,7 @@ test('pending queue and archive lifecycle remain independent from the selected s
   const route = source('server/routes/triage.js');
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
 
-  const activeQueue = between(route, 'export const ACTIVE_QUEUE_CONDITION', '// 处理状态和归档生命周期相互独立');
+  const activeQueue = ACTIVE_QUEUE_CONDITION;
   assert.match(activeQueue, /COALESCE\(rt\.status, 'unhandled'\) = 'unhandled'/);
   assert.match(activeQueue, /rt\.archived_at IS NULL/);
 

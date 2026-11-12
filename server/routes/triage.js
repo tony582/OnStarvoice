@@ -1,3 +1,7 @@
+import {randomUUID} from 'node:crypto';
+import {resolveTriageSuggestions, isTriageSuggestionEnabled, TRIAGE_SUGGESTION_ACTIVE_SQL} from '../services/triage-suggestions.js';
+import {OPEN_TRIAGE_SUGGESTION_SQL, openTriageSuggestions, publicTriageSuggestion, triageSuggestionSummary} from '../services/triage-suggestion-views.js';
+import {undoTriageSuggestionBatch} from '../services/triage-suggestion-undo.js';
 import { knownInteractionSumSql } from '../services/interaction-sql.js';
 import { PLATFORM_LABELS as PLATFORM_CN } from '../services/platform-labels.js';
 import {getCrossPosts, excludeCrossPost} from '../services/cross-posts/store.js';
@@ -157,14 +161,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 // 收件箱「待处理队列」条件(别名约定: records r / record_triage rt)。
 // workspace.js 的 /badges 计数 import 此常量,保证侧边栏徽标与收件箱列表数字一致。
-export const ACTIVE_QUEUE_CONDITION = `
-  r.record_type NOT IN ('official_content', 'blogger_profile')
-  AND r.business_visibility = 'eligible'
-  AND (${recordTriageAdmissionSql('r')})
-  AND (${recordEffectiveRelevanceSql('r')} IS DISTINCT FROM 'irrelevant')
-  AND COALESCE(rt.status, 'unhandled') = 'unhandled'
-  AND rt.archived_at IS NULL
-`;
+export const ACTIVE_QUEUE_CONDITION = TRIAGE_SUGGESTION_ACTIVE_SQL;
 
 // 处理状态和归档生命周期相互独立。两个列表共享状态范围，只按 archived_at 分组。
 const TRIAGE_CONTENT_CONDITION = `
@@ -615,6 +612,44 @@ router.post('/records/:id/cross-posts/exclude', requireTenantAccess, requireTena
   } catch (err) { if (err.status) return res.status(err.status).json({ok:false,error:err.code,message:err.message}); return next(err); }
 });
 
+router.get('/records/:id/suggestion', requireTenantAccess, async (req,res,next)=>{
+  try {
+    if (!UUID_RE.test(req.params.id)) return res.status(400).json({ok:false,error:'invalid_id'});
+    const rows=await openTriageSuggestions({queryAll,queryOne},req.tenantId,[req.params.id]);
+    return res.json({ok:true,suggestion:publicTriageSuggestion(rows[0])});
+  } catch(err) {return next(err);}
+});
+router.post('/records/:id/suggestion/reject', requireTenantAccess, requireTenantWriter, async(req,res,next)=>{
+  try {
+    if (!UUID_RE.test(req.params.id)) return res.status(400).json({ok:false,error:'invalid_id'});
+    const result=await withTransaction(async tx=>{
+      const record=await getRecordLifecycle({tenantId:req.tenantId,recordId:req.params.id,tx,lock:true});
+      if (!record) return null;
+      if (record.archived_at) return {archived:true};
+      const rows=await openTriageSuggestions(tx,req.tenantId,[req.params.id]);
+      if (!rows.length) return {resolved:0};
+      const resolved=await resolveTriageSuggestions(tx,{tenantId:req.tenantId,recordIds:[req.params.id],status:'rejected',userId:req.user?.id || null});
+      await tx.execute(`INSERT INTO audit_logs(tenant_id,actor_type,actor_id,actor_user_id,action,target_type,target_id,metadata)
+        VALUES($1,$2,$3,$4,'record.triage_suggestion_rejected','record',$5,$6::jsonb)`,
+      [req.tenantId,req.actorType || 'system',req.user?.id || req.authCode || '',req.user?.id || null,req.params.id,
+        {source:'suggestion',ruleVersion:rows[0].rule_version}]);
+      return {resolved:resolved.length};
+    });
+    if (!result) return res.status(404).json({ok:false,error:'not_found'});
+    if (result.archived) return sendRecordArchived(res,[req.params.id]);
+    return res.json({ok:true,...result});
+  } catch(err) {return next(err);}
+});
+router.post('/suggestions/undo',requireTenantAccess,requireTenantWriter,async(req,res,next)=>{
+  try {
+    if (!UUID_RE.test(String(req.body?.undoId || ''))) return res.status(400).json({ok:false,error:'invalid_undo_id'});
+    const result=await withTransaction(tx=>undoTriageSuggestionBatch(tx,{tenantId:req.tenantId,undoId:req.body.undoId,
+      actorType:req.actorType || 'system',actorId:req.user?.id || req.authCode || '',userId:req.user?.id || null}));
+    if (!result) return res.status(409).json({ok:false,error:'undo_expired',message:'撤销时限已过，请在处理记录中修改。'});
+    return res.json({ok:true,...result});
+  } catch(err) {return next(err);}
+});
+
 router.get('/records', requireTenantAccess, async (req, res, next) => {
   try {
     const {
@@ -690,6 +725,20 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
         WHERE peer.tenant_id=cp.tenant_id AND peer.group_id=cp.group_id AND peer.record_id<>cp.record_id))`;
 
     const readOptions = { clientGone: createClientGoneProbe(req, res) };
+    const readDb={queryAll:(sql,args)=>queryAll(sql,args,readOptions),queryOne:(sql,args)=>queryOne(sql,args,readOptions)};
+    const suggestions=await triageSuggestionSummary(readDb,req.tenantId,where,params);
+    if (req.query.suggestion && req.query.suggestion!=='non_monitor') return res.status(400).json({ok:false,error:'invalid_suggestion'});
+    if (req.query.suggestion==='non_monitor') where += suggestions.enabled ? ` AND (${OPEN_TRIAGE_SUGGESTION_SQL})` : ' AND false';
+    if (req.query.selection==='1') {
+      if (req.query.suggestion!=='non_monitor') return res.status(400).json({ok:false,error:'suggestion_selection_required'});
+      const selected=await queryAll(`SELECT r.id,r.title,COUNT(*) OVER() AS matched_total FROM records r
+        LEFT JOIN record_triage rt ON rt.tenant_id=r.tenant_id AND rt.record_id=r.id
+        ${where} ORDER BY ${orderBySql(sort,dir)} LIMIT 10000`,params,readOptions);
+      const open=await openTriageSuggestions(readDb,req.tenantId,selected.map(row=>row.id));
+      const byId=new Map(open.map(row=>[row.record_id,row]));
+      return res.json({ok:true,selection:selected.map(({matched_total,...row})=>({...row,triageSuggestion:publicTriageSuggestion(byId.get(row.id))})),
+        suggestions:{...suggestions,count:Number(selected[0]?.matched_total || 0)},pagination:{total:Number(selected[0]?.matched_total || 0)}});
+    }
     const countParams = [...params];
     const limit = Math.min(100, Math.max(1, Number(pageSize) || 30));
     const offset = (Math.max(1, Number(page)) - 1) * limit;
@@ -805,6 +854,8 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       `, countParams, readOptions))?.total) || 0;
     }
 
+    if (req.query.suggestion==='non_monitor') suggestions.count=total;
+
     // Enrich only the page: one row per record, no change to total/pagination.
     const crossRows = records.length ? await queryAll(`SELECT cp.record_id,cp.group_id,
       COUNT(*)::int AS member_count,array_agg(DISTINCT r.platform ORDER BY r.platform) AS platforms
@@ -817,6 +868,9 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       const cross=crossMap.get(record.id);
       Object.assign(record,{cross_post_group_id:cross?.group_id || null,cross_post_count:cross?.member_count || 0,cross_post_platforms:cross?.platforms || []});
     }
+    const openSuggestions=await openTriageSuggestions(readDb,req.tenantId,records.map(row=>row.id));
+    const suggestionById=new Map(openSuggestions.map(row=>[row.record_id,row]));
+    for (const record of records) record.triageSuggestion=publicTriageSuggestion(suggestionById.get(record.id));
     const publicRecords = records.map(({ matched_total: _matchedTotal, ...record }) => redactXhsRecordNavigation(withRecordAdmissionFields({
       ...record,
       publish_display: formatPublishDate(record.publish_time, record.created_at),
@@ -825,6 +879,7 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
     return res.json({
       ok: true,
       records: publicRecords,
+      suggestions,
       pagination: { page: Number(page), pageSize: limit, total, totalPages: Math.ceil(total / limit) },
     });
   } catch (err) {
@@ -923,15 +978,19 @@ router.patch('/records/watch', requireTenantAccess, requireSessionUser, requireT
 // 批量分诊更新。注意:必须注册在 '/records/:recordId' 之前,否则 'batch' 会被当作 recordId 解析。
 router.patch('/records/batch', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
   try {
+    const sourceSuggestion=req.body?.source==='suggestion';
+    const splitSuggestions=req.body?.suggestionMode==='split';
+    const maxIds=sourceSuggestion?10000:100;
     const rawIds = req.body?.ids;
-    if (!Array.isArray(rawIds) || rawIds.length === 0 || rawIds.length > 100) {
-      return res.status(400).json({ ok: false, error: 'invalid_ids', message: 'ids 需为 1-100 个内容ID' });
+    if (!Array.isArray(rawIds) || rawIds.length === 0 || rawIds.length > maxIds) {
+      return res.status(400).json({ ok: false, error: 'invalid_ids', message: `ids 需为 1-${maxIds} 个内容ID` });
     }
     const ids = [...new Set(rawIds.map(id => String(id || '').trim().toLowerCase()).filter(Boolean))];
     const validIds = ids.filter(id => UUID_RE.test(id));
 
     const status = req.body?.status ? String(req.body.status) : null;
     const priority = req.body?.priority ? String(req.body.priority) : null;
+    if ((sourceSuggestion && status!=='reviewed_non_monitor') || (splitSuggestions && status!=='reviewed') || (req.body?.suggestionMode && !splitSuggestions)) return res.status(400).json({ok:false,error:'invalid_suggestion_action'});
     const note = String(req.body?.note || '').trim();
     const requestedFeishuTableNo = Object.prototype.hasOwnProperty.call(req.body || {}, 'feishuTableNo')
       ? String(req.body.feishuTableNo || '').trim()
@@ -967,6 +1026,7 @@ router.patch('/records/batch', requireTenantAccess, requireTenantWriter, async (
     }
 
     let updatedIds = [];
+    let resultDetails={};
     let archivedIds = [];
     if (validIds.length) {
       const mutation = await withTransaction(async tx => {
@@ -981,8 +1041,11 @@ router.patch('/records/batch', requireTenantAccess, requireTenantWriter, async (
           .map(row => String(row.id).toLowerCase());
         if (sealedIds.length) return { updatedIds: [], archivedIds: sealedIds };
 
+        const openRows=(sourceSuggestion || splitSuggestions)?await openTriageSuggestions(tx,req.tenantId,validIds):[];
+        if (sourceSuggestion && (openRows.length!==ids.length || validIds.length!==ids.length)) return {updatedIds:[],archivedIds:[],staleSuggestions:true};
+        const splitIds=splitSuggestions?openRows.map(row=>row.record_id):[];
         const previousRows = await tx.queryAll(`
-          SELECT r.id AS record_id,
+          SELECT r.id AS record_id, to_jsonb(rt) AS snapshot,
             COALESCE(rt.status, 'unhandled') AS status,
             COALESCE(rt.priority, 'normal') AS priority,
             COALESCE(rt.feishu_table_no, '') AS feishu_table_no
@@ -995,7 +1058,7 @@ router.patch('/records/batch', requireTenantAccess, requireTenantWriter, async (
             tenant_id, record_id, status, priority, owner_user_id, owner_name,
             feishu_table_no, updated_at
           )
-          SELECT r.tenant_id, r.id, COALESCE($3, 'unhandled'), COALESCE($4, 'normal'), $5, $6,
+          SELECT r.tenant_id, r.id, CASE WHEN r.id=ANY($8::uuid[]) THEN 'reviewed_non_monitor' ELSE COALESCE($3, 'unhandled') END, COALESCE($4, 'normal'), $5, $6,
             COALESCE($7, ''), now()
           FROM records r
           WHERE r.tenant_id = $1 AND r.id = ANY($2::uuid[])
@@ -1007,7 +1070,7 @@ router.patch('/records/batch', requireTenantAccess, requireTenantWriter, async (
             owner_name = excluded.owner_name,
             feishu_table_no = CASE WHEN $7::text IS NOT NULL THEN excluded.feishu_table_no ELSE record_triage.feishu_table_no END,
             updated_at = now()
-          RETURNING record_id
+          RETURNING record_id, to_jsonb(record_triage) AS snapshot
         `, [
           req.tenantId,
           validIds,
@@ -1016,7 +1079,20 @@ router.patch('/records/batch', requireTenantAccess, requireTenantWriter, async (
           req.user?.id || null,
           req.actorName || '',
           status === 'negative_feishu' ? requestedFeishuTableNo : null,
+          splitIds,
         ]);
+        const statusById=Object.fromEntries(rows.map(row=>[row.record_id,row.snapshot.status]));
+        const resolutions=[];
+        if (status) {
+          for (const nextStatus of new Set(Object.values(statusById))) {
+            resolutions.push(...await resolveTriageSuggestions(tx,{tenantId:req.tenantId,
+              recordIds:rows.filter(row=>row.snapshot.status===nextStatus).map(row=>row.record_id),status:nextStatus,userId:req.user?.id || null}));
+          }
+        }
+        const resolutionById=new Map(resolutions.map(row=>[row.record_id,row]));
+        const acceptedIds=resolutions.filter(row=>row.resolution==='accepted').map(row=>row.record_id);
+        const undoId=acceptedIds.length?randomUUID():null;
+        let undoExpiresAt=null;
         // Keep the existing batch action/metadata contract, with one auditable transition per selected record.
         const previous = new Map(previousRows.map(row=>[row.record_id,row]));
         for (const row of rows) {
@@ -1024,16 +1100,29 @@ router.patch('/records/batch', requireTenantAccess, requireTenantWriter, async (
           await tx.execute(`INSERT INTO audit_logs(tenant_id,actor_type,actor_id,actor_user_id,action,target_type,target_id,metadata)
             VALUES($1,$2,$3,$4,'record.triage_batch_updated','record',$5,$6::jsonb)`,[
             req.tenantId,req.actorType || 'system',req.user?.id || req.authCode || '',req.user?.id || null,row.record_id,
-            JSON.stringify({recordIds:[row.record_id],status,priority,note,
+            JSON.stringify({recordIds:[row.record_id],status:status ? row.snapshot.status : null,priority,note,
               feishuTableNo:status==='negative_feishu'?requestedFeishuTableNo:'',
-              previous:{[row.record_id]:{status:before?.status,priority:before?.priority,feishuTableNo:before?.feishu_table_no}},updated:1}),
+              previous:{[row.record_id]:{status:before?.status,priority:before?.priority,feishuTableNo:before?.feishu_table_no}},updated:1,
+              ...(resolutionById.get(row.record_id)?.resolution==='accepted' || sourceSuggestion ? {source:'suggestion',ruleVersion:resolutionById.get(row.record_id)?.rule_version} : {}),
+              ...(undoId ? {undoId,undoBefore:before?.snapshot || null,undoAfter:row.snapshot,suggestionResolution:resolutionById.get(row.record_id) || null} : {})}),
           ]);
+        }
+        if (undoId) {
+          // Give the user ten seconds after the writes, not after lock/transaction start.
+          // One database clock supplies both the displayed and enforced deadline.
+          undoExpiresAt=new Date((await tx.queryOne("SELECT (clock_timestamp()+interval '10 seconds')::text AS deadline")).deadline).toISOString();
+          await tx.execute(`UPDATE audit_logs SET metadata=metadata||jsonb_build_object('undoExpiresAt',$3::text)
+            WHERE tenant_id=$1 AND metadata->>'undoId'=$2 AND target_id=ANY($4::text[])
+              AND action='record.triage_batch_updated'`,[req.tenantId,undoId,undoExpiresAt,rows.map(row=>row.record_id)]);
         }
         return {
           updatedIds: rows.map(row => String(row.record_id).toLowerCase()),
-          archivedIds: [],
+          archivedIds: [],statusById,acceptedIds,undoId,undoExpiresAt,
         };
       });
+      if (mutation.staleSuggestions) return res.status(409).json({ok:false,error:'suggestions_changed',message:'建议或处理状态已变化，请刷新列表后重试。'});
+      const {updatedIds:_ids,archivedIds:_archived,...details}=mutation;
+      resultDetails=details;
       updatedIds = mutation.updatedIds;
       archivedIds = mutation.archivedIds;
     }
@@ -1042,7 +1131,7 @@ router.patch('/records/batch', requireTenantAccess, requireTenantWriter, async (
 
     const updatedSet = new Set(updatedIds);
     const skipped = ids.filter(id => !updatedSet.has(id));
-    return res.json({ ok: true, updated: updatedSet.size, updatedIds: [...updatedSet], skipped });
+    return res.json({ ok: true, updated: updatedSet.size, updatedIds: [...updatedSet], skipped,...resultDetails });
   } catch (err) {
     return next(err);
   }
@@ -1236,6 +1325,7 @@ router.patch('/records/:recordId', requireTenantAccess, requireTenantWriter, asy
         triageNote,
         feishuTableNo,
       ]);
+      if (status) await resolveTriageSuggestions(tx,{tenantId:req.tenantId,recordIds:[req.params.recordId],status,userId:req.user?.id || null});
       await tx.execute(`
         INSERT INTO audit_logs (tenant_id, actor_type, actor_id, actor_user_id, action, target_type, target_id, metadata)
         VALUES ($1, $2, $3, $4, 'record.triage_updated', 'record', $5, $6::jsonb)
@@ -1481,6 +1571,8 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
     if (req.query.crossPlatform === 'true') where += ` AND EXISTS (SELECT 1 FROM record_cross_posts cp
       WHERE cp.tenant_id=r.tenant_id AND cp.record_id=r.id AND EXISTS (SELECT 1 FROM record_cross_posts peer
         WHERE peer.tenant_id=cp.tenant_id AND peer.group_id=cp.group_id AND peer.record_id<>cp.record_id))`;
+
+    if (req.query.suggestion==='non_monitor') where += await isTriageSuggestionEnabled({queryOne},req.tenantId) ? ` AND (${OPEN_TRIAGE_SUGGESTION_SQL})` : ' AND false';
 
     const records = await queryAll(`
       SELECT

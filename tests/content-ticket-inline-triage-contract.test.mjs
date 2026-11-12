@@ -112,6 +112,13 @@ function existingTicketHandlerFixture({ status = 'negative_cold', actorType = 'u
       return { title: '测试帖子', platform: 'xiaohongshu' };
     },
     getRecordLifecycle: async () => ({ id: recordId, archived_at: null }),
+    resolveTriageSuggestions: async (tx, options) => {
+      assert.equal(typeof tx.execute, 'function');
+      assert.equal(options.tenantId, tenantId);
+      assert.deepEqual(Array.from(options.recordIds), [recordId]);
+      assert.equal(options.status, 'negative_feishu');
+      return [];
+    },
     withTransaction: async callback => {
       const pending = structuredClone(committed);
       const result = await callback({

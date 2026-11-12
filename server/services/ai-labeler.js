@@ -47,6 +47,7 @@ import {
 } from './record-content-judgment.js';
 
 import { CONTENT_TOPIC_PROMPT_RULES, CONTENT_TOPIC_VERSION, normalizeContentTopic } from './content-topic.js';
+import {refreshTriageSuggestion} from './triage-suggestions.js';
 
 export const RECORD_CLASSIFICATION_PROMPT_VERSION = 'record-topic-v11';
 const RETRYABLE_MODEL_HTTP_STATUSES = new Set([429, 500, 502, 503, 504]);
@@ -1297,7 +1298,7 @@ function queuePostClassificationTasks({ recordId, tenantId, relevance, sentiment
 // Model calls stay outside the transaction. Re-read and lock before persisting,
 // so a later human decision wins and stale text/model results cannot overwrite it.
 export async function persistRecordClassification({ record, labeled, observedKeywords = [] }) {
-  return withTransaction(async tx => {
+  const saved = await withTransaction(async tx => {
     const current = await tx.queryOne(`SELECT *, ai_labeled_at::text AS classification_version
       FROM records WHERE id = $1 AND tenant_id = $2 FOR UPDATE`, [record.id, record.tenant_id]);
     if (!current || current.business_visibility !== 'eligible'
@@ -1373,6 +1374,12 @@ export async function persistRecordClassification({ record, labeled, observedKey
     ]);
     return { result, persisted };
   });
+  // The classification is committed first. Suggestion failure never rolls it back or bills another model call.
+  if (saved?.persisted) {
+    try { await refreshTriageSuggestion({tenantId: saved.persisted.tenant_id, recordId: record.id}); }
+    catch (error) { console.error(`[AI] Triage suggestion refresh failed for record ${record.id}:`, error?.message || error); }
+  }
+  return saved;
 }
 
 // Records a failed attempt on the record itself (see ai-label-failure.js). It never throws:

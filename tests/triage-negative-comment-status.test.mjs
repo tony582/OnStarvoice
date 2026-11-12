@@ -1,3 +1,4 @@
+import {TRIAGE_SUGGESTION_ACTIVE_SQL} from '../server/services/triage-suggestions.js';
 import { PLATFORM_LABELS } from '../server/services/platform-labels.js';
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -22,7 +23,8 @@ function triageHarness() {
   const router = {get() {}, post() {}, patch(path, ...callbacks) {handlers.set(path, callbacks.at(-1));}};
   const middleware = () => {};
   const context = vm.createContext({
-    ...recordAdmission,
+    ...recordAdmission, TRIAGE_SUGGESTION_ACTIVE_SQL,
+    resolveTriageSuggestions: async()=>[],
     Router: () => router,
     requireTenantAccess: middleware, requireTenantWriter: middleware, requireSessionUser: middleware,
     getRecordLifecycle: async () => ({id: recordIds[0], archived_at: null}),
@@ -46,9 +48,9 @@ function triageHarness() {
         queryAll: async (sql, params) => {
           assert.equal(params[0], tenantId);
           const selected = pendingRows.filter(row => params[1].includes(row.record_id));
-          if (/SELECT r.id AS record_id/.test(sql)) return structuredClone(selected);
+          if (/SELECT r.id AS record_id/.test(sql)) return structuredClone(selected).map(row=>({...row,snapshot:{...row}}));
           assert.match(sql, /INSERT INTO record_triage/);
-          return selected.map(row => update(row, params[2], params[3], params[6]));
+          return selected.map(row => {update(row,params[2],params[3],params[6]);return {...row,snapshot:{...row}};});
         },
         execute: async (sql, params) => {
           // A status selection may only append its normal audit event; there is

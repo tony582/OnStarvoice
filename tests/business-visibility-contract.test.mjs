@@ -1,3 +1,4 @@
+import {ACTIVE_QUEUE_CONDITION} from '../server/routes/triage.js';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import test from 'node:test';
@@ -25,7 +26,7 @@ test('business-facing queues, dashboards, reports and AI workers require eligibl
   const alertEngine = source('server/services/alert-engine.js');
   const recordStore = source('server/services/record-store.js');
 
-  assert.ok((triage.match(/business_visibility = 'eligible'/gu) || []).length >= 4);
+  assert.ok(((triage+ACTIVE_QUEUE_CONDITION).match(/business_visibility = 'eligible'/gu) || []).length >= 4);
   assert.ok((workspace.match(/business_visibility = 'eligible'/gu) || []).length >= 10);
   assert.ok((negativePatrol.match(/business_visibility = 'eligible'/gu) || []).length >= 1);
   assert.match(negativePatrol, /function negativeCandidateQualificationSql\(/u);
