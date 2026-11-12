@@ -65,7 +65,12 @@ export async function runWechatTask({task, store, device, permit, preview, clock
     let last;
     for (const wait of PREVIEW_RETRIES) {
       if (wait) await sleep(wait, permit.signal);
-      try { return await preview.resolve(link); } catch (error) { last = error; if (error.code === 'share_link_invalid') break; }
+      if (permit.signal.aborted) throw permit.signal.reason;
+      try { return await preview.resolve(link, {signal: permit.signal}); }
+      catch (error) {
+        last = error;
+        if (error?.code === 'share_link_invalid' || error?.retryable === false || permit.signal.aborted) break;
+      }
     }
     throw last;
   };

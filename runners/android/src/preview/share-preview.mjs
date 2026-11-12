@@ -4,7 +4,7 @@ import {setTimeout as sleep} from 'node:timers/promises';
 import {readArticleDocument} from './article-dom.mjs';
 import {canonicalArticleUrl} from '../core/wechat-article-evidence.mjs';
 import {resolvePreviewChrome, SYSTEM_CHROME} from './chrome-cache.mjs';
-import {visitLocalPreviewPage} from './local-selfcheck.mjs';
+import {stopPreviewBrowsers, terminatePreviewBrowser} from './chrome-process.mjs';
 
 // A copied WeChat Channels share link opens WeChat's public preview page in an ordinary browser. That page
 // requests its own post data (feed/get_feed_info); this resolver opens the link in a headless Chrome on this
@@ -44,20 +44,25 @@ export function readFeedInfo(body) {
 
 export function createSharePreview({chromePath, chromeExplicit = false, profileDir, port = 9333, maxTabs = 2,
   browserOptions, onDiagnostic = () => {}, onWarning = browserOptions?.onWarning ?? console.error,
-  selfcheckLaunchTimeoutMs = 30_000, selfcheckTimeoutMs = 10_000,
+  selfcheckLaunchTimeoutMs = 30_000,
   timeoutMs = 15_000, spawnImpl = spawn, fetchImpl = globalThis.fetch, WebSocketImpl = globalThis.WebSocket} = {}) {
   if (typeof profileDir !== 'string' || !profileDir) throw new PreviewError('preview_unavailable', 'A private Chrome profile directory is required');
   const requestedPath = chromePath;
   const selected = resolvePreviewChrome({...browserOptions, chromePath, chromeExplicit,
     ...(chromeExplicit ? {onWarning: () => {}} : {})});
   chromePath = selected.path;
+  const systemChrome = browserOptions?.systemChrome ?? SYSTEM_CHROME;
   const checkRequired = selected.source === 'managed' || chromeExplicit;
   const explicitPathChanged = chromeExplicit && requestedPath && requestedPath !== selected.path;
-  let chrome = null, socket = null, connecting = null, connectionAbort = null, seq = 0, active = 0, generation = 0;
+  let chrome = null, socket = null, connecting = null, connectionAbort = null, seq = 0, generation = 0;
   let preparation = null, checkAbort = null, closed = false, checkState = checkRequired ? 'pending' : 'ready', checkError = null;
+  let runtimeFallback = null;
   const waiting = new Map(), listeners = new Set(), queue = [], activeJobs = new Set(), ownedBrowsers = new Set();
   const abortError = signal => signal?.reason instanceof PreviewError ? signal.reason : new PreviewError('aborted');
-  const reset = () => {
+  const diagnose = entry => { try { onDiagnostic(entry); } catch { /* Optional local diagnostics. */ } };
+  const warn = message => { try { onWarning(message); } catch { /* Optional warning. */ } };
+  const canUseSystemChrome = () => !closed && !chromeExplicit && chromePath !== systemChrome && chromeAvailable(systemChrome);
+  const reset = ({stopBrowser = true} = {}) => {
     generation++;
     const oldSocket = socket, oldChrome = chrome;
     socket = null; chrome = null; connecting = null;
@@ -66,7 +71,12 @@ export function createSharePreview({chromePath, chromeExplicit = false, profileD
     waiting.clear();
     for (const job of activeJobs) job.controller.abort(new PreviewError('preview_unavailable'));
     try { oldSocket?.close(); } catch { /* closed */ }
-    try { if (oldChrome?.exitCode == null && oldChrome?.signalCode == null) oldChrome?.kill('SIGTERM'); } catch { /* gone */ }
+    if (stopBrowser) terminatePreviewBrowser(oldChrome);
+  };
+  const stopOwnedBrowsers = () => {
+    reset({stopBrowser: false});
+    // A socket close can reset chrome before its process actually exits.
+    return stopPreviewBrowsers(ownedBrowsers);
   };
   const send = (method, params = {}, sessionId, signal, onLateResult) => new Promise((resolve, reject) => {
     if (signal?.aborted) { reject(abortError(signal)); return; }
@@ -162,14 +172,13 @@ export function createSharePreview({chromePath, chromeExplicit = false, profileD
     await whileActive(connect(), signal);
     // Creation may succeed after its caller has stopped. Keep that one CDP response handler until it
     // arrives (or this shared browser closes), so a late target is closed instead of becoming an orphan.
-    const closeTarget = targetId => send('Target.closeTarget', {targetId}, undefined,
-      kind === 'selfcheck' ? signal : AbortSignal.timeout(1000)).catch(() => {});
+    const closeTarget = targetId => send('Target.closeTarget', {targetId}, undefined, AbortSignal.timeout(1000)).catch(() => {});
     const {targetId} = await send('Target.createTarget', {url: 'about:blank'}, undefined, signal,
       result => { if (result?.targetId) void closeTarget(result.targetId); });
     let listener = null;
     try {
       const {sessionId} = await send('Target.attachToTarget', {targetId, flatten: true}, undefined, signal);
-      if (kind === 'article' || kind === 'selfcheck') {
+      if (kind === 'article') {
         // Keep Chrome's normal desktop UA. The Channels-only mobile override never applies to article tabs.
         await send('Emulation.setDeviceMetricsOverride', {width: 1280, height: 900, deviceScaleFactor: 1, mobile: false}, sessionId, signal);
         await send('Emulation.setLocaleOverride', {locale: 'zh-CN'}, sessionId, signal);
@@ -182,14 +191,6 @@ export function createSharePreview({chromePath, chromeExplicit = false, profileD
         const navigation = await send('Page.navigate', {url: link}, sessionId, signal);
         if (navigation.errorText) throw new PreviewError('article_preview_navigation_failed');
         await whileActive(loaded, signal);
-        if (kind === 'selfcheck') {
-          const result = await send('Runtime.evaluate', {expression: '({url:location.href,readyState:document.readyState,text:document.body?.textContent})',
-            returnByValue: true}, sessionId, signal);
-          const value = result.result?.value;
-          if (result.exceptionDetails || value?.url !== link || value?.readyState !== 'complete'
-            || value?.text !== new URL(link).pathname.split('/').at(-1)) throw new PreviewError('preview_selfcheck_content_invalid');
-          return;
-        }
         return await readArticle(link, sessionId, signal);
       }
       await send('Network.enable', {}, sessionId, signal);
@@ -212,27 +213,76 @@ export function createSharePreview({chromePath, chromeExplicit = false, profileD
       await closeTarget(targetId);
     }
   };
+  const rejectQueued = reason => {
+    for (const job of queue.splice(0)) {
+      job.cleanup();
+      job.reject(reason(job));
+    }
+  };
+  const switchAfterActivePreviews = entry => {
+    // Pause the queue while current tabs finish. Both browsers use the same port and private profile.
+    runtimeFallback = Promise.all([...activeJobs].map(job => job.done)).then(async () => {
+      if (closed) return;
+      const stopped = await stopOwnedBrowsers();
+      if (closed) return;
+      if (!stopped || !canUseSystemChrome()) {
+        checkState = 'failed';
+        checkError = new PreviewError('preview_unavailable');
+        rejectQueued(job => job.retryError ?? checkError);
+        return;
+      }
+      chromePath = systemChrome;
+      diagnose(entry);
+      warn('独立预览浏览器读取超时，本次采集器运行改用系统 Chrome。');
+    }).finally(() => {
+      runtimeFallback = null;
+      pump();
+    });
+  };
+  const noFurtherRetry = error => Object.assign(new PreviewError(error?.code, error?.message), {retryable: false, cause: error});
+  const runJob = async job => {
+    const started = performance.now(), controller = job.controller;
+    let timeout, requeued = false;
+    const timer = setTimeout(() => {
+      timeout = {at: new Date().toISOString(), elapsedMs: Math.round(performance.now() - started)};
+      controller.abort(new PreviewError('preview_timeout'));
+    }, timeoutMs);
+    try { job.resolve(await resolveOne(job.link, job.kind, controller.signal)); }
+    catch (error) {
+      if (closed || job.signal?.aborted) job.reject(new PreviewError('aborted'));
+      else if (error?.code === 'preview_timeout' && timeout && !job.retryError && selected.source === 'managed'
+        && chromePath === selected.path && canUseSystemChrome()) {
+        if (!runtimeFallback) switchAfterActivePreviews({event: 'preview_browser_runtime_fallback', ...timeout,
+          kind: job.kind, browserVersion: selected.version});
+        job.retryError = noFurtherRetry(error);
+        job.controller = new AbortController();
+        queue.unshift(job);
+        requeued = true;
+      } else job.reject(job.retryError ? noFurtherRetry(error) : error);
+    } finally {
+      clearTimeout(timer);
+      if (!requeued) job.cleanup();
+      activeJobs.delete(job);
+      pump();
+    }
+  };
   const pump = () => {
-    while (active < Math.max(1, maxTabs) && queue.length) {
+    while (!closed && !runtimeFallback && activeJobs.size < Math.max(1, maxTabs) && queue.length) {
       const job = queue.shift();
-      if (job.controller.signal.aborted) continue;
-      active++;
       activeJobs.add(job);
-      const timer = setTimeout(() => job.controller.abort(new PreviewError('preview_timeout')), timeoutMs);
-      resolveOne(job.link, job.kind, job.controller.signal).then(job.resolve, job.reject).finally(() => {
-        clearTimeout(timer); job.cleanup(); activeJobs.delete(job); active--; pump();
-      });
+      job.done = runJob(job);
     }
   };
   const enqueue = (link, kind, signal) => new Promise((resolve, reject) => {
-    const controller = new AbortController();
+    if (closed || signal?.aborted) { reject(new PreviewError('aborted')); return; }
+    if (checkState === 'failed') { reject(checkError); return; }
     const aborted = () => {
-      controller.abort(new PreviewError('aborted'));
+      job.controller.abort(new PreviewError('aborted'));
       const index = queue.indexOf(job);
-      if (index >= 0) { queue.splice(index, 1); job.cleanup(); reject(abortError(controller.signal)); }
+      if (index >= 0) { queue.splice(index, 1); job.cleanup(); reject(abortError(job.controller.signal)); }
     };
-    const job = {link, kind, controller, resolve, reject, cleanup: () => signal?.removeEventListener('abort', aborted)};
-    if (signal?.aborted) { reject(new PreviewError('aborted')); return; }
+    const job = {link, kind, signal, controller: new AbortController(), resolve, reject,
+      cleanup: () => signal?.removeEventListener('abort', aborted)};
     signal?.addEventListener('abort', aborted, {once: true});
     queue.push(job); pump();
   });
@@ -240,45 +290,31 @@ export function createSharePreview({chromePath, chromeExplicit = false, profileD
   const prepare = ({signal} = {}) => {
     if (signal?.aborted) return Promise.reject(abortError(signal));
     if (closed) return Promise.reject(new PreviewError('aborted'));
+    if (checkState === 'failed') return Promise.reject(checkError);
     if (!preparation) preparation = (async () => {
       if (!checkRequired) return;
-      let stage = 'launch', launchElapsedMs = 0, pageElapsedMs = 0, stageStarted = performance.now();
+      const started = performance.now();
       checkAbort = new AbortController();
-      let timer = setTimeout(() => checkAbort.abort(new PreviewError('preview_selfcheck_timeout')),
+      const timer = setTimeout(() => checkAbort.abort(new PreviewError('preview_selfcheck_timeout')),
         Math.max(1, Math.min(30_000, selfcheckLaunchTimeoutMs)));
       try {
         if (explicitPathChanged) throw new PreviewError('preview_explicit_unavailable');
         await whileActive(connect(), checkAbort.signal);
-        launchElapsedMs = Math.round(performance.now() - stageStarted); clearTimeout(timer);
-        stage = 'page'; stageStarted = performance.now();
-        timer = setTimeout(() => checkAbort.abort(new PreviewError('preview_selfcheck_timeout')),
-          Math.max(1, Math.min(10_000, selfcheckTimeoutMs)));
-        await visitLocalPreviewPage((url, _marker, selfcheckSignal) => resolveOne(url, 'selfcheck', selfcheckSignal), {signal: checkAbort.signal});
-        pageElapsedMs = Math.round(performance.now() - stageStarted);
-        try { onDiagnostic({event: 'preview_browser_selfcheck_passed', at: new Date().toISOString(),
-          launchElapsedMs, pageElapsedMs, elapsedMs: launchElapsedMs + pageElapsedMs}); } catch { /* Optional local diagnostics. */ }
+        const launchElapsedMs = Math.round(performance.now() - started);
+        diagnose({event: 'preview_browser_selfcheck_passed', at: new Date().toISOString(),
+          stage: 'launch', launchElapsedMs, elapsedMs: launchElapsedMs});
       } catch (error) {
         if (closed || error.code === 'aborted') throw new PreviewError('aborted');
-        const at = new Date().toISOString(); clearTimeout(timer);
-        if (stage === 'launch') launchElapsedMs = Math.round(performance.now() - stageStarted);
-        else pageElapsedMs = Math.round(performance.now() - stageStarted);
-        const oldChrome = chrome, pending = [...ownedBrowsers].filter(child => child.exitCode == null && child.signalCode == null);
-        const exited = pending.map(child => new Promise(resolve => child.once('exit', resolve)));
-        let cleanupTimer;
-        reset();
-        // A socket close may already have reset chrome; only an actual exit releases ownership.
-        for (const child of pending) if (child !== oldChrome) { try { child.kill('SIGTERM'); } catch { /* Still wait for exit. */ } }
-        const stopped = !pending.length || await Promise.race([Promise.all(exited).then(() => true),
-          new Promise(resolve => {cleanupTimer = setTimeout(() => resolve(false), 2000);})]);
-        clearTimeout(cleanupTimer);
-        const fallbackPath = browserOptions?.systemChrome ?? SYSTEM_CHROME;
-        const fallback = !chromeExplicit && stopped && !closed && chromeAvailable(fallbackPath);
-        try { onDiagnostic({event: 'preview_browser_selfcheck_failed', at, stage, code: error.code ?? 'preview_selfcheck_failed',
-          launchElapsedMs, pageElapsedMs, elapsedMs: launchElapsedMs + pageElapsedMs,
-          explicit: chromeExplicit, fallback, browserStopped: stopped}); } catch { /* Optional local diagnostics. */ }
+        const at = new Date().toISOString(), launchElapsedMs = Math.round(performance.now() - started);
+        clearTimeout(timer);
+        const stopped = await stopOwnedBrowsers();
+        if (closed) throw new PreviewError('aborted');
+        const fallback = stopped && canUseSystemChrome();
+        diagnose({event: 'preview_browser_selfcheck_failed', at, stage: 'launch', code: error.code ?? 'preview_selfcheck_failed',
+          launchElapsedMs, elapsedMs: launchElapsedMs, explicit: chromeExplicit, fallback, browserStopped: stopped});
         if (!fallback) throw new PreviewError('preview_browser_selfcheck_failed');
-        chromePath = fallbackPath;
-        try { onWarning('独立预览浏览器自检未通过，当前暂用系统 Chrome；本次启动仅提示一次。'); } catch { /* A warning cannot block fallback. */ }
+        chromePath = systemChrome;
+        warn('独立预览浏览器启动检查未通过，本次采集器运行改用系统 Chrome。');
       } finally { clearTimeout(timer); checkAbort = null; }
       if (closed) throw new PreviewError('aborted');
     })().then(() => { checkState = 'ready'; }, error => { checkState = 'failed'; checkError = error; throw error; });
@@ -304,13 +340,10 @@ export function createSharePreview({chromePath, chromeExplicit = false, profileD
     available: () => !closed && checkState === 'ready' && chromeAvailable(chromePath),
     close() {
       closed = true; checkAbort?.abort(new PreviewError('aborted'));
-      queue.splice(0).forEach(job => { job.cleanup(); job.reject(new PreviewError('aborted')); });
+      rejectQueued(() => new PreviewError('aborted'));
       for (const job of activeJobs) job.controller.abort(new PreviewError('aborted'));
-      const oldChrome = chrome;
-      reset();
-      for (const child of ownedBrowsers) if (child !== oldChrome && child.exitCode == null && child.signalCode == null) {
-        try { child.kill('SIGTERM'); } catch { /* closed */ }
-      }
+      reset({stopBrowser: false});
+      for (const child of ownedBrowsers) terminatePreviewBrowser(child);
     },
   };
 }

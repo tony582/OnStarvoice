@@ -88,7 +88,7 @@ test('a failed preview never uploads OCR-only data; a settled open failure is sk
   const clock = fixtureClock();
   const t = task({filters: {sort: 'all', publishWindowHours: null}, comments: {enabled: false, limit: 0}});
   const calls = [];
-  let opens = 0;
+  let opens = 0, previewCalls = 0;
   const base = device({pages: [[card('打不开的', '车主A', 1), card('能打开的', '车主B', 2)]], calls});
   const broken = {...base, openCard: async params => {
     calls.push('openCard');
@@ -96,7 +96,11 @@ test('a failed preview never uploads OCR-only data; a settled open failure is sk
     return {opened: true, params};
   }};
   const result = await runWechatTask({task: t, store, device: broken, permit: fixturePermit(t, clock), clock, postPauseMs: [0, 0],
-    preview: {resolve: async () => { throw Object.assign(new Error('down'), {code: 'preview_timeout'}); }}});
+    preview: {resolve: async () => {
+      previewCalls++;
+      throw Object.assign(new Error('fallback also timed out'), {code: 'preview_timeout', retryable: false});
+    }}});
+  assert.equal(previewCalls, 1, 'a preview that exhausted its fallback must not be retried by the task');
   assert.equal(result.stats.posts, 0);
   assert.equal(result.stats.previewFailed, 1);
   assert.ok(calls.includes('recoverResults'));
