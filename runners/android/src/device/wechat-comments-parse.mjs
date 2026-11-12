@@ -17,6 +17,7 @@ const REPLIES_TAIL = /\s*(?:展开)?\d{1,4}\s*条回\S{0,2}$/u;
 // right after the term ("OTAQ算是", "NVH°功底"); a model name like "Q5" or "25°C" is left alone.
 const TERM_ICON = /(?<=[\p{Script=Han}A-Za-z])(?:Q(?=[\p{Script=Han}，。！？、+\s]|$)|°(?![CF]))/gu;
 export const cleanCommentText = text => String(text).replace(TERM_ICON, '').trim();
+const cleanCapturedComment = text => cleanCommentText(String(text ?? '').replace(REPLIES_TAIL, '').replace(/首评$/u, '')).replace(TRAILING_GLYPH, '').trim();
 // An image or sticker comment has its header line and no text under it. A text line starts ~60 px below its header;
 // the image comment measured on 2026-11-06 left 400 px before the next row. Such a comment is kept as 「[图片]」.
 export const IMAGE_COMMENT = '[图片]';
@@ -113,10 +114,9 @@ export function parseCommentScreen(rows, {bottom = COMMENT_INPUT_TOP} = {}) {
     if (!item.content.trim() && nextRowY(item.headerY) - item.headerY >= IMAGE_GAP) item.content = IMAGE_COMMENT;
   }
   const last = comments.at(-1);
-  return {headerCount, post, expand, comments: comments.filter(item => item.content.trim())
-    .map(({key: _key, headerY: _y, lastY, ...item}) => ({...item,
-      content: cleanCommentText(item.content.replace(REPLIES_TAIL, '').replace(/首评$/u, '')).replace(TRAILING_GLYPH, '').trim(),
-      cut: bottom - lastY < 130 && item === last})),
+  return {headerCount, post, expand, comments: comments.map(({key: _key, headerY: _y, lastY, ...item}) => ({...item,
+      content: cleanCapturedComment(item.content),
+      cut: bottom - lastY < 130 && item === last})).filter(item => item.content),
   bottomCut: !!last && bottom - last.lastY < 130};
 }
 
@@ -131,15 +131,15 @@ export function namesAgree(a, b) {
   return shorter >= 3 && Math.abs(x.length - y.length) <= 1 && commonPrefix(x, y) >= shorter - 1;
 }
 /** Two readings of one comment text: cut short, a sticker read as a character, a small OCR slip. */
-export function textsAgree(a, b) {
+export function textsAgree(a, b, {aCut = false, bCut = false} = {}) {
   const x = bareText(a), y = bareText(b);
+  if (!x || !y) { const original=comparable(a); return Boolean(original) && original===comparable(b); }
   if (x === y) return true;
-  if (!x || !y) return false;
-  const [short, long] = x.length <= y.length ? [x, y] : [y, x];
-  if (short.length >= 4 && long.startsWith(short.slice(0, -1))) return true;
+  const [short, long, cut] = x.length <= y.length ? [x, y, aCut] : [y, x, bCut];
+  if (short.length < long.length && short.length >= 4 && long.startsWith(short.slice(0, -1))) return cut === true;
   return similarity(x, y) >= 0.8;
 }
-export const sameComment = (a, b) => namesAgree(a.author, b.author) && textsAgree(a.content, b.content);
+export const sameComment = (a, b) => namesAgree(a.author, b.author) && textsAgree(a.content, b.content, {aCut:a.cut,bCut:b.cut});
 
 /**
  * Merge screens in scroll order. Overlapping comments (same commenter, same text as far as OCR lets us tell) are
@@ -149,8 +149,12 @@ export function mergeCommentScreens(screens, {limit = Infinity} = {}) {
   const merged = [];
   let parentIndex = null;
   for (const screen of screens) {
-    for (const item of screen.comments) {
-      const existing = merged.findIndex(seen => sameComment(seen, item));
+    for (const raw of screen.comments) {
+      const item={...raw,content:cleanCapturedComment(raw.content)};
+      if (!item.content) continue;
+      const floor=item.reply ? parentIndex : null;
+      const existing = merged.findIndex(seen => Boolean(seen.reply)===Boolean(item.reply)
+        && (!item.reply || (floor !== null && seen.parentIndex===floor)) && sameComment(seen, item));
       if (existing >= 0) {
         const seen = merged[existing];
         if (comparable(item.content).length > comparable(seen.content).length) Object.assign(seen, {content: item.content, cut: item.cut});
@@ -158,7 +162,7 @@ export function mergeCommentScreens(screens, {limit = Infinity} = {}) {
         if (!item.reply) parentIndex = existing;
         continue;
       }
-      if (merged.length >= limit) continue;
+      if (merged.length >= limit) { if (!item.reply) parentIndex=null; continue; }
       const entry = {author: item.author, location: item.location, timeLabel: item.timeLabel, content: item.content,
         likeCount: item.likeCount, reply: item.reply, parentIndex: item.reply ? parentIndex : null, cut: item.cut};
       merged.push(entry);

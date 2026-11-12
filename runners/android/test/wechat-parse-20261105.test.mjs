@@ -234,18 +234,18 @@ test('an ad card under a comment and the 「首评」 label are not comment text
     [['沪上青山Vlog', '上海', '换这款多少钱啊'], ['勇哥的视界', '山东', '同问']]);
 });
 
-test('a badge read as another character and a sticker read as 起 still merge into one comment per commenter', () => {
+test('name badge variants still merge; complete prefix variants remain separate without cut evidence', () => {
   const first = panel('comments-stickers-20261106-0'), second = panel('comments-stickers-20261106-1');
   assert.deepEqual(first.comments.map(item => item.author), ['田纳西瓜皮', '迷途懒猫心', '强']);
   assert.deepEqual(second.comments.map(item => item.author), ['田纳西瓜皮', '迷途懒猫凶', '强']);
   const merged = mergeCommentScreens([first, second]);
-  assert.equal(merged.length, 3, JSON.stringify(summary(merged)));
+  assert.equal(merged.length, 4, JSON.stringify(summary(merged)));
   assert.ok(merged[2].content.endsWith('最后一地鸡毛'), '首评 is not part of the text');
   assert.equal(namesAgree('迷途懒猫心', '迷途懒猫凶'), true);
   assert.equal(namesAgree('迷途懒猫', '迷途懒猫心'), true);
   assert.equal(namesAgree('张三', '张四'), false, 'two-character names must match exactly');
   assert.equal(namesAgree('迷途懒猫', '迷途小猫咪'), false);
-  assert.equal(textsAgree('安吉星也要付钱的，一天一块钱', '安吉星“也要付钱的，一天一块钱起'), true);
+  assert.equal(textsAgree('安吉星也要付钱的，一天一块钱', '安吉星“也要付钱的，一天一块钱起'), false, 'both complete readings stay distinct');
   assert.equal(textsAgree('没见过凯迪拉克打过广告，人家钱都放安全上了', '没见过凯迪拉克打过广告的，人家钱都放安全上了'), true);
   assert.equal(textsAgree('好看', '好看吗'), false);
   assert.equal(textsAgree('同问', '同问'), true);
