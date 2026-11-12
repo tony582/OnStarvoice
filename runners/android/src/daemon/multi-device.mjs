@@ -19,7 +19,7 @@ export const PLATFORMS = Object.freeze({douyin: 'douyin', wechat: 'wechat_channe
  */
 export function createRunnerDevice({config, store, stateDir, onState}) {
   const wechatConfig = config.wechat && config.wechat.profile === WECHAT_PROFILE.id ? config.wechat : null;
-  const adb = createAdbClient({adbPath: config.adbPath});
+  const adb = createAdbClient({adbPath: config.adbPath, onDiagnostic: entry => recordDiagnostic(store, entry)});
   const douyin = config.deviceProfile
     ? createAndroidDeviceAdapter({serial: config.deviceId, profileId: config.deviceProfile, appiumUrl: config.appiumUrl, adb, onState,
       sharedWithWechat: !!wechatConfig})

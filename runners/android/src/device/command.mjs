@@ -14,8 +14,11 @@ export function runDeviceCommand(file, args, { signal, timeoutMs = 5000, env = p
     }, (error, stdout, stderr) => {
       if (error) {
         // Do not echo subprocess output: it can contain device or account details.
-        reject(new DeviceError(error.code === 'ENOENT' ? 'executable_missing' : 'command_failed',
-          error.code === 'ENOENT' ? 'Required executable is not installed or not on PATH' : 'Device command failed'));
+        const failure=new DeviceError(error.code === 'ENOENT' ? 'executable_missing' : 'command_failed',
+          error.code === 'ENOENT' ? 'Required executable is not installed or not on PATH' : 'Device command failed');
+        // Keep only the classified daemon signal, never raw account/device output.
+        if (/daemon not running|cannot connect to (?:the )?daemon|failed to (?:start|connect to) daemon/iu.test(`${stdout}\n${stderr}`)) failure.adbDaemonUnavailable=true;
+        reject(failure);
       } else resolve({ stdout, stderr });
     });
   }), { signal, timeoutMs });

@@ -1,3 +1,4 @@
+import {createAdbProbeRecovery} from './adb-recovery.mjs';
 import { DeviceError, bounded } from './bounded.mjs';
 import { runDeviceCommand } from './command.mjs';
 import { parseMemInfo } from './douyin-memory.mjs';
@@ -35,24 +36,29 @@ export function selectDevice(devices, serial) {
   return device;
 }
 
-export function createAdbClient({ adbPath = 'adb', command = runDeviceCommand, timeoutMs = 5000 } = {}) {
+export function createAdbClient({ adbPath = 'adb', command = runDeviceCommand, timeoutMs = 5000, onDiagnostic, daemonAvailable, now } = {}) {
   const call = (args, options = {}) => bounded((signal) => command(adbPath,
     ['-H', '127.0.0.1', '-P', '5037', ...args], { signal, timeoutMs }), { timeoutMs, ...options });
-  const listDevices = async (options = {}) => parseAdbDevices((await call(['devices', '-l'], options)).stdout);
+  const listDevicesRaw = async (options = {}) => parseAdbDevices((await call(['devices', '-l'], options)).stdout);
   // Ensure the local adb server is up. This never selects, connects to or opens a device.
   const startServer = async (options = {}) => { await call(['start-server'], options); return {started: true}; };
-  const inspect = async (serial, options = {}) => {
+  const inspectRaw = async (serial, options = {}) => {
     validateSerial(serial);
-    const device = selectDevice(await listDevices(options), serial);
+    const device = selectDevice(await listDevicesRaw(options), serial);
     const values = {};
     // Every device-scoped command explicitly pins the chosen serial.
     for (const [key, property] of Object.entries({ model: 'ro.product.model', androidVersion: 'ro.build.version.release', apiLevel: 'ro.build.version.sdk' })) {
       values[key] = (await call(['-s', serial, 'shell', 'getprop', property], options)).stdout.trim().slice(0, 120);
     }
     // Detect a disconnect during inspection instead of preserving a stale online state.
-    selectDevice(await listDevices(options), serial);
+    selectDevice(await listDevicesRaw(options), serial);
     return { ...device, ...values, connected: true };
   };
+  const recoverProbe=createAdbProbeRecovery({startServer,onDiagnostic,daemonAvailable,now});
+  // Adapters list devices before inspecting one. Protect that earliest read, while inspection uses raw reads
+  // internally so a single failed command is never counted as two consecutive failed probes.
+  const listDevices=(options={})=>recoverProbe(()=>listDevicesRaw(options),options);
+  const inspect=(serial,options={})=>recoverProbe(()=>inspectRaw(serial,options),options);
   const inspectApp = async (serial, options = {}) => {
     validateSerial(serial);
     const value = await call(['-s', serial, 'shell', 'dumpsys', 'package', 'com.ss.android.ugc.aweme'], options);
