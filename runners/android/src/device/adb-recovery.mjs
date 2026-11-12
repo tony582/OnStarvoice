@@ -41,7 +41,11 @@ export function createAdbProbeRecovery({startServer,daemonAvailable=adbDaemonAva
       lastRestart=now();failures=0;restartVersion++;
       restarting=(async()=>{
         try {await startServer({signal});note({event:'adb_server_restarted'});}
-        catch(failure){note({event:'adb_server_restart_failed',code:failure?.code || 'command_failed'});throw failure;}
+        catch(failure){
+          const failureCategory=failure?.code==='device_timeout'?'timeout'
+            :failure?.adbFailureCategory==='remote_host_refused'?'remote_host_refused':'other';
+          note({event:'adb_server_restart_failed',code:failure?.code || 'command_failed',failureCategory});throw failure;
+        }
       })();
       lastRecovery=restarting;
       return recheckAfter(restarting);

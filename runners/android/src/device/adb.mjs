@@ -41,7 +41,12 @@ export function createAdbClient({ adbPath = 'adb', command = runDeviceCommand, t
     ['-H', '127.0.0.1', '-P', '5037', ...args], { signal, timeoutMs }), { timeoutMs, ...options });
   const listDevicesRaw = async (options = {}) => parseAdbDevices((await call(['devices', '-l'], options)).stdout);
   // Ensure the local adb server is up. This never selects, connects to or opens a device.
-  const startServer = async (options = {}) => { await call(['start-server'], options); return {started: true}; };
+  // adb treats an explicit -H as remote, even for 127.0.0.1, and refuses to start that server.
+  const startServer = async (options = {}) => {
+    await bounded(signal => command(adbPath, ['-P', '5037', 'start-server'],
+      {signal, timeoutMs, adbOperation: 'start-server'}), {timeoutMs, ...options});
+    return {started: true};
+  };
   const inspectRaw = async (serial, options = {}) => {
     validateSerial(serial);
     const device = selectDevice(await listDevicesRaw(options), serial);

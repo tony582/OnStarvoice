@@ -7,11 +7,21 @@ import {DOUYIN_P0_PROFILE} from '../src/device/douyin-profile.mjs';
 import {createWechatDeviceAdapter} from '../src/device/wechat-adapter.mjs';
 import {UNICODE_IME} from '../src/device/adb-screen.mjs';
 const failure=(extra={})=>Object.assign(new Error('Device command failed'),{code:'command_failed',...extra});
+const actionOf=args=>args.at(-1)==='start-server'?'start-server':args[4];
+function checkedAction(args){
+  if(actionOf(args)==='start-server'){
+    // adb 37.0.1 rejects starting a server when -H explicitly names even a loopback host.
+    if(args.includes('-H'))throw failure({exitCode:255,adbFailureCategory:'remote_host_refused'});
+    assert.deepEqual(args,['-P','5037','start-server']);
+    return 'start-server';
+  }
+  assert.deepEqual(args.slice(0,4),['-H','127.0.0.1','-P','5037']);
+  return actionOf(args);
+}
 function fixture({hint=false,available=false,startFails=false}={}){
   let healthy=false,time=1000;const calls=[],notes=[];
   const command=async(file,args)=>{
-    calls.push(args);assert.deepEqual(args.slice(0,4),['-H','127.0.0.1','-P','5037']);
-    const action=args[4];
+    calls.push(args);const action=checkedAction(args);
     if(action==='start-server'){if(startFails)throw failure();healthy=true;return{stdout:'',stderr:''};}
     if(!healthy)throw failure({adbDaemonUnavailable:hint});
     return{stdout:action==='devices'?'List of devices attached\nphone-1 device model:Test\n':'Test',stderr:''};
@@ -22,8 +32,8 @@ function fixture({hint=false,available=false,startFails=false}={}){
 test('two failed inspections start the local adb server and immediately reinspect the same device',async()=>{
   for(const hint of [true,false]){
     const f=fixture({hint});await assert.rejects(f.adb.inspect('phone-1'),{code:'command_failed'});
-    assert.deepEqual(f.calls.map(args=>args[4]),['devices'],'one failed inspection counts once, without nested list recovery');
-    assert.equal((await f.adb.inspect('phone-1')).connected,true);assert.equal(f.calls.filter(a=>a[4]==='start-server').length,1);
+    assert.deepEqual(f.calls.map(actionOf),['devices'],'one failed inspection counts once, without nested list recovery');
+    assert.equal((await f.adb.inspect('phone-1')).connected,true);assert.equal(f.calls.filter(a=>actionOf(a)==='start-server').length,1);
     assert.equal(f.notes[0].event,'adb_server_restarted');assert.ok(f.calls.every(a=>!a.includes('kill-server')));
   }
 });
@@ -31,17 +41,24 @@ test('the first device-list read is protected, but ordinary device commands neve
   const f=fixture();
   await assert.rejects(f.adb.listDevices(),{code:'command_failed'});
   assert.equal((await f.adb.listDevices())[0].serial,'phone-1');
-  assert.deepEqual(f.calls.map(args=>args[4]),['devices','devices','start-server','devices']);
+  assert.deepEqual(f.calls.map(actionOf),['devices','devices','start-server','devices']);
   const plain=fixture({hint:true});
   for(let i=0;i<4;i++)await assert.rejects(plain.adb.powerState('phone-1'),{code:'command_failed'});
-  assert.equal(plain.calls.filter(args=>args[4]==='start-server').length,0);
+  assert.equal(plain.calls.filter(args=>actionOf(args)==='start-server').length,0);
+});
+
+test('starting the local server omits host selection while device commands retain host, port and serial',async()=>{
+  const f=fixture();assert.deepEqual(await f.adb.startServer(),{started:true});
+  assert.equal((await f.adb.inspect('phone-1')).connected,true);
+  assert.deepEqual(f.calls[0],['-P','5037','start-server']);
+  assert.ok(f.calls.slice(1).every(args=>args.slice(0,4).join(' ')==='-H 127.0.0.1 -P 5037'));
+  assert.ok(f.calls.filter(args=>args[4]==='-s').every(args=>args[5]==='phone-1'));
 });
 
 function adapterFixture(platform,hint){
   let healthy=false;const calls=[];
   const command=async(file,args)=>{
-    calls.push(args);assert.deepEqual(args.slice(0,4),['-H','127.0.0.1','-P','5037']);
-    const action=args[4];
+    calls.push(args);const action=checkedAction(args);
     if(action==='start-server'){healthy=true;return{stdout:'',stderr:''};}
     if(!healthy)throw failure({adbDaemonUnavailable:hint});
     let stdout;
@@ -69,10 +86,10 @@ for(const platform of ['douyin','wechat_channels'])test(`${platform} real adapte
   for(const hint of [false,true]){
     const f=adapterFixture(platform,hint);
     assert.deepEqual(await f.adapter.probe(),{readyForSearch:false,reason:'command_failed'});
-    assert.deepEqual(f.calls.map(args=>args[4]),['devices']);
+    assert.deepEqual(f.calls.map(actionOf),['devices']);
     assert.equal((await f.adapter.probe()).readyForSearch,true);
     assert.equal((await f.adapter.probe()).readyForSearch,true);
-    assert.equal(f.calls.filter(args=>args[4]==='start-server').length,1);
+    assert.equal(f.calls.filter(args=>actionOf(args)==='start-server').length,1);
     assert.ok(f.calls.every(args=>!args.includes('kill-server')));
   }
 });
@@ -134,16 +151,16 @@ test('a late concurrent port check shares a failed restart without trying again'
 });
 test('a running daemon with unrelated command errors is never restarted',async()=>{
   const f=fixture({available:true});for(let i=0;i<4;i++)await assert.rejects(f.adb.inspect('phone-1'),{code:'command_failed'});
-  assert.equal(f.calls.filter(a=>a[4]==='start-server').length,0);
+  assert.equal(f.calls.filter(a=>actionOf(a)==='start-server').length,0);
 });
 test('restart cooldown survives successes and failed restart attempts',async()=>{
   for(const startFails of [true,false]){
     const f=fixture({hint:true,startFails});await assert.rejects(f.adb.inspect('phone-1'));
     if(startFails)await assert.rejects(f.adb.inspect('phone-1'));else await f.adb.inspect('phone-1');
     f.break();for(let i=0;i<3;i++)await assert.rejects(f.adb.inspect('phone-1'));
-    assert.equal(f.calls.filter(a=>a[4]==='start-server').length,1);f.advance();
+    assert.equal(f.calls.filter(a=>actionOf(a)==='start-server').length,1);f.advance();
     if(startFails)await assert.rejects(f.adb.inspect('phone-1'));else await f.adb.inspect('phone-1');
-    assert.equal(f.calls.filter(a=>a[4]==='start-server').length,2);
+    assert.equal(f.calls.filter(a=>actionOf(a)==='start-server').length,2);
   }
 });
 test('success, non-command failure and abort break the consecutive-failure sequence',async()=>{
@@ -160,4 +177,59 @@ test('command failures preserve only the daemon classification and redact subpro
     assert.equal(error.code,'command_failed');assert.equal(error.adbDaemonUnavailable,true);
     assert.ok(!JSON.stringify(error).includes('private-account-detail'));assert.ok(!error.message.includes('private-account-detail'));return true;
   });
+});
+
+test('only adb startup classifies remote-host refusal without retaining subprocess output',async()=>{
+  const {runDeviceCommand}=await import('../src/device/command.mjs');
+  const script="process.stderr.write('* cannot start server on remote host: private-account-detail');process.exit(255)";
+  for(const adbOperation of ['start-server',undefined]){
+    await assert.rejects(runDeviceCommand(process.execPath,['-e',script],{adbOperation}),error=>{
+      assert.equal(error.code,'command_failed');
+      assert.equal(error.adbFailureCategory,adbOperation==='start-server'?'remote_host_refused':undefined);
+      assert.ok(!JSON.stringify(error).includes('private-account-detail'));
+      assert.ok(!error.message.includes('private-account-detail'));return true;
+    });
+  }
+});
+
+test('restart diagnostics retain only bounded failure categories',async()=>{
+  for(const [error,expected] of [
+    [failure({adbFailureCategory:'remote_host_refused'}),'remote_host_refused'],
+    [Object.assign(new Error('private-timeout-detail'),{code:'device_timeout'}),'timeout'],
+    [failure(),'other'],
+    [failure({adbFailureCategory:'private-account-detail'}),'other'],
+  ]){
+    const notes=[];
+    const recover=createAdbProbeRecovery({startServer:async()=>{throw error;},
+      daemonAvailable:async()=>false,now:()=>1000,onDiagnostic:entry=>notes.push(entry)});
+    const read=async()=>{throw failure();};
+    await assert.rejects(recover(read));await assert.rejects(recover(read));
+    assert.equal(notes.length,1);assert.equal(notes[0].event,'adb_server_restart_failed');
+    assert.equal(notes[0].failureCategory,expected);
+    assert.ok(!JSON.stringify(notes).includes('private-'));
+  }
+});
+
+test('the startup command alone enables adb startup classification',async()=>{
+  const calls=[];
+  const adb=createAdbClient({command:async(file,args,options)=>{
+    calls.push({args,options});return{stdout:'List of devices attached\nphone-1 device model:Test\n',stderr:''};
+  }});
+  await adb.startServer();await adb.listDevices();
+  assert.equal(calls[0].options.adbOperation,'start-server');
+  assert.equal(calls[1].options.adbOperation,undefined);
+});
+
+test('local server startup retains bounded timeout and cancellation',async()=>{
+  const calls=[];
+  const adb=createAdbClient({timeoutMs:15,command:async(file,args,options)=>{
+    calls.push({args,options});
+    return new Promise((resolve,reject)=>options.signal.addEventListener('abort',()=>reject(options.signal.reason),{once:true}));
+  }});
+  await assert.rejects(adb.startServer(),{code:'device_timeout'});
+  assert.equal(calls.length,1);assert.equal(calls[0].options.timeoutMs,15);
+  assert.equal(calls[0].options.signal.aborted,true);
+  const controller=new AbortController();controller.abort();
+  await assert.rejects(adb.startServer({signal:controller.signal}),{code:'aborted'});
+  assert.equal(calls.length,1,'an already canceled startup must not issue a command');
 });

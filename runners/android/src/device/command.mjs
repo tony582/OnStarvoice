@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { DeviceError, bounded } from './bounded.mjs';
 
 // No shell interpolation, npx, installation, or inherited remote ADB endpoints.
-export function runDeviceCommand(file, args, { signal, timeoutMs = 5000, env = process.env } = {}) {
+export function runDeviceCommand(file, args, { signal, timeoutMs = 5000, env = process.env, adbOperation } = {}) {
   return bounded((boundedSignal) => new Promise((resolve, reject) => {
     const safeEnv = { ...env };
     delete safeEnv.ADB_SERVER_SOCKET;
@@ -18,6 +18,8 @@ export function runDeviceCommand(file, args, { signal, timeoutMs = 5000, env = p
           error.code === 'ENOENT' ? 'Required executable is not installed or not on PATH' : 'Device command failed');
         // Keep only the classified daemon signal, never raw account/device output.
         if (/daemon not running|cannot connect to (?:the )?daemon|failed to (?:start|connect to) daemon/iu.test(`${stdout}\n${stderr}`)) failure.adbDaemonUnavailable=true;
+        if (adbOperation === 'start-server') failure.adbFailureCategory =
+          /cannot start server on remote host/iu.test(`${stdout}\n${stderr}`) ? 'remote_host_refused' : 'other';
         reject(failure);
       } else resolve({ stdout, stderr });
     });
