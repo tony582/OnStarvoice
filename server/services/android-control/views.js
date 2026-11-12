@@ -18,8 +18,8 @@ const RUN_SQL=`SELECT task.*,agent.status AS agent_status,agent.capabilities AS 
 export async function listNodes(tx,tenantId) {
   const rows=await tx.queryAll(`SELECT agent.*,held.task_id AS active_run_id,held.metadata AS held_metadata,
     held.status AS held_status,held.task_metadata FROM capture_agents agent LEFT JOIN LATERAL
-    (SELECT item.task_id,item.metadata,item.status,task.metadata AS task_metadata FROM capture_task_items item
-      JOIN capture_tasks task ON task.id=item.task_id AND task.tenant_id=item.tenant_id
+    (SELECT COALESCE(item.execution_task_id,item.task_id) AS task_id,item.metadata,item.status,task.metadata AS task_metadata FROM capture_task_items item
+      JOIN capture_tasks task ON task.id=COALESCE(item.execution_task_id,item.task_id) AND task.tenant_id=item.tenant_id
       WHERE item.tenant_id=agent.tenant_id AND item.assigned_agent_id=agent.id AND item.metadata->>'deviceHeld'='true'
       ORDER BY item.created_at LIMIT 1) held ON true
     WHERE agent.tenant_id=$1 AND agent.capabilities->>'agentKind'='android_mobile' ORDER BY agent.created_at DESC LIMIT 100`,[tenantId]);
@@ -40,7 +40,7 @@ export async function runView(tx,tenantId,taskId) {
   // Forward children also use wechat_channels_mobile_capture; task_type distinguishes them from capture.
   const row=await tx.queryOne(`${RUN_SQL} AND task.id=$3`,[tenantId,MOBILE_RUN_WORKFLOWS,taskId]);
   if (!row) fail('MOBILE_RUN_NOT_FOUND',404);
-  const items=await tx.queryAll(`SELECT item.id,item.keyword,item.status,item.attempt_count,item.assignment_revision,item.metadata,item.error,
+  const items=await tx.queryAll(`SELECT item.id,item.item_type,item.keyword,item.status,item.attempt_count,item.assignment_revision,item.metadata,item.error,
     attempt.checkpoint FROM capture_task_items item LEFT JOIN capture_task_item_attempts attempt
       ON attempt.item_id=item.id AND attempt.tenant_id=item.tenant_id
       AND attempt.assignment_revision=item.assignment_revision AND attempt.id::text=item.metadata->>'attemptId'

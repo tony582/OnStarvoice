@@ -1,6 +1,9 @@
+import {completionStats} from './completion-stats.js';
+
 // One policy for the resume mutation and its read-only UI preview.
 export function resumeError(task, items, now = Date.now()) {
   if (task.metadata.stopRequested || items.some(item => item.metadata?.deviceHeld)) return 'STOP_OR_DEVICE_CLOSURE_REQUIRED';
+  if (task.task_type === 'wechat_forward' || items.some(item => item.item_type === 'wechat_forward')) return 'WECHAT_FORWARD_NOT_RESUMABLE';
   if (!['needs_action', 'interrupted'].includes(task.status)) return 'RUN_NOT_RESUMABLE';
   const deadline = Date.parse(task.metadata.deadlineAt);
   if (!Number.isFinite(deadline) || deadline <= now) return 'RUN_DEADLINE_EXPIRED';
@@ -37,11 +40,5 @@ export function recoveryView(task, items, agent, now = Date.now()) {
     lastClosedAt: closedTimes.length ? new Date(Math.max(...closedTimes)).toISOString() : null};
 }
 export function receiptStats(checkpoint) {
-  const source = checkpoint?.runner?.stats;
-  if (!source) return null;
-  // prefilter*: cards the AI card prefilter skipped / judged / could not judge (opened anyway).
-  return Object.fromEntries(['links', 'cards', 'swipes', 'skippedCards', 'keywordElapsedMs', 'batchElapsedMs',
-    'prefilterSkipped', 'prefilterJudged', 'prefilterUnjudged', 'cardsSeen', 'opened', 'outsideWindow', 'stopReason', 'screens']
-    .filter(key => Object.hasOwn(source,key) && Number.isFinite(source[key]) && source[key] >= 0
-      && (key !== 'stopReason' || Number.isSafeInteger(source[key]))).map(key => [key, source[key]]));
+  return completionStats(checkpoint?.runner?.stats);
 }

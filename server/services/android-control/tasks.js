@@ -3,6 +3,7 @@ import {resumeError} from './recovery.js';
 import {digest,fail,id,runInput,WORKFLOW} from './validation.js';
 import {lockAgent,rollup,taskRow} from './repository.js';
 import {cancelDiscoveryDemands} from '../capture-discovery/detail-lifecycle.js';
+import {refreshOrchestrationParent} from './parent-refresh.js';
 export async function createRun(tx,tenantId,body) {
   const input=runInput(body), requestId=id(body.requestId,'REQUEST_ID'), hash=digest(input);
   await tx.queryOne('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[`android-create:${tenantId}:${requestId}`]);
@@ -30,22 +31,25 @@ export async function controlRun(tx,tenantId,taskId,action,body={}) {
   if (!preliminary) fail('MOBILE_RUN_NOT_FOUND',404);
   await lockAgent(tx,tenantId,preliminary.assigned_agent_id);
   const task=await taskRow(tx,tenantId,taskId);
-  const items=await tx.queryAll('SELECT * FROM capture_task_items WHERE task_id=$1 FOR UPDATE',[taskId]);
+  const items=await tx.queryAll(`SELECT * FROM capture_task_items
+    WHERE tenant_id=$2 AND (task_id=$1 OR execution_task_id=$1) FOR UPDATE`,[taskId,tenantId]);
   if (action==='stop') {
     const scope=body.scope ?? 'discovery';
     if (!['discovery','batch'].includes(scope)) fail('INVALID_STOP_SCOPE',400);
     const metadata={...task.metadata,stopRequested:true,stopScope:task.metadata.stopScope==='batch'?'batch':scope,stopRequestedAt:new Date().toISOString()};
     await tx.execute('UPDATE capture_tasks SET metadata=$2,updated_at=now() WHERE id=$1',[taskId,metadata]);
     await tx.execute(`UPDATE capture_task_items SET status='canceled',updated_at=now(),finished_at=now()
-      WHERE task_id=$1 AND metadata->>'deviceHeld' IS DISTINCT FROM 'true'
-      AND status NOT IN ('completed','completed_with_warnings','canceled','skipped')`,[taskId]);
+      WHERE tenant_id=$2 AND (task_id=$1 OR execution_task_id=$1) AND metadata->>'deviceHeld' IS DISTINCT FROM 'true'
+      AND status NOT IN ('completed','completed_with_warnings','canceled','skipped')`,[taskId,tenantId]);
     if (scope==='batch') await cancelDiscoveryDemands(tx,{tenantId,runId:taskId});
   } else {
     const blockedBy=resumeError(task,items);
     if (blockedBy) fail(blockedBy);
     await tx.execute(`UPDATE capture_task_items SET status='retryable',metadata=metadata||'{"resumeAuthorized":true}'::jsonb,
-      updated_at=now() WHERE task_id=$1 AND status IN ('needs_action','failed')`,[taskId]);
+      updated_at=now() WHERE tenant_id=$2 AND (task_id=$1 OR execution_task_id=$1)
+      AND status IN ('needs_action','failed')`,[taskId,tenantId]);
   }
   await rollup(tx,tenantId,taskId);
+  if (action==='stop') await refreshOrchestrationParent(tx,tenantId,task,task.assigned_agent_id);
   return taskId;
 }

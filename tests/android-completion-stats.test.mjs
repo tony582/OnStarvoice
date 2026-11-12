@@ -63,7 +63,7 @@ test('completion persists only known numeric stats and task receipts expose all 
   assert.deepEqual(f.rows.attempt.checkpoint.runner, {...body.checkpoint,
     stats: {links: 2, posts: 2, outsideWindow: 5, comments: 7, cardsSeen: 9, opened: 4, stopReason: 2, screens: 3}});
   assert.deepEqual(receiptStats(f.rows.attempt.checkpoint),
-    {links: 2, cardsSeen: 9, opened: 4, outsideWindow: 5, stopReason: 2, screens: 3});
+    {links: 2, posts: 2, comments: 7, cardsSeen: 9, opened: 4, outsideWindow: 5, stopReason: 2, screens: 3});
   assert.equal(f.rows.item.status, 'completed');
   assert.equal(f.rows.item.metadata.deviceHeld, false);
   assert.equal(f.rows.task.status, 'completed');
