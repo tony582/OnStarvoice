@@ -44,7 +44,7 @@ export function readFeedInfo(body) {
 
 export function createSharePreview({chromePath, chromeExplicit = false, profileDir, port = 9333, maxTabs = 2,
   browserOptions, onDiagnostic = () => {}, onWarning = browserOptions?.onWarning ?? console.error,
-  selfcheckTimeoutMs = 10_000,
+  selfcheckLaunchTimeoutMs = 30_000, selfcheckTimeoutMs = 10_000,
   timeoutMs = 15_000, spawnImpl = spawn, fetchImpl = globalThis.fetch, WebSocketImpl = globalThis.WebSocket} = {}) {
   if (typeof profileDir !== 'string' || !profileDir) throw new PreviewError('preview_unavailable', 'A private Chrome profile directory is required');
   const requestedPath = chromePath;
@@ -100,19 +100,21 @@ export function createSharePreview({chromePath, chromeExplicit = false, profileD
       if (chrome === process) reset();
     });
     let version = null;
-    for (let i = 0; i < 40 && !version; i++) {
+    for (let i = 0; i < 120 && !version; i++) {
       if (epoch !== generation) throw new PreviewError('preview_unavailable');
       try { version = await whileActive(Promise.resolve(fetchImpl(`http://127.0.0.1:${port}/json/version`,
-        {signal: controller.signal})).then(response => response.json()), controller.signal); } catch { await sleep(250); }
+        {signal: controller.signal})).then(response => response.json()), controller.signal); }
+      catch { await sleep(250, undefined, {signal: controller.signal}); }
     }
     if (epoch !== generation) throw new PreviewError('preview_unavailable');
     if (!version?.webSocketDebuggerUrl?.startsWith('ws://127.0.0.1')) { reset(); throw new PreviewError('preview_unavailable'); }
     socket = new WebSocketImpl(version.webSocketDebuggerUrl);
     const openedSocket = socket;
-    await new Promise((resolve, reject) => {
+    await whileActive(new Promise((resolve, reject) => {
       socket.addEventListener('open', resolve, {once: true});
       socket.addEventListener('error', () => reject(new PreviewError('preview_unavailable')), {once: true});
-    });
+    }), controller.signal);
+    if (epoch !== generation) throw new PreviewError('preview_unavailable');
     socket.addEventListener('message', event => {
       const message = JSON.parse(event.data);
       const entry = message.id ? waiting.get(message.id) : null;
@@ -240,27 +242,39 @@ export function createSharePreview({chromePath, chromeExplicit = false, profileD
     if (closed) return Promise.reject(new PreviewError('aborted'));
     if (!preparation) preparation = (async () => {
       if (!checkRequired) return;
-      const started = performance.now(); checkAbort = new AbortController();
-      const timer = setTimeout(() => checkAbort.abort(new PreviewError('preview_selfcheck_timeout')),
-        Math.max(1, Math.min(10_000, selfcheckTimeoutMs)));
+      let stage = 'launch', launchElapsedMs = 0, pageElapsedMs = 0, stageStarted = performance.now();
+      checkAbort = new AbortController();
+      let timer = setTimeout(() => checkAbort.abort(new PreviewError('preview_selfcheck_timeout')),
+        Math.max(1, Math.min(30_000, selfcheckLaunchTimeoutMs)));
       try {
         if (explicitPathChanged) throw new PreviewError('preview_explicit_unavailable');
+        await whileActive(connect(), checkAbort.signal);
+        launchElapsedMs = Math.round(performance.now() - stageStarted); clearTimeout(timer);
+        stage = 'page'; stageStarted = performance.now();
+        timer = setTimeout(() => checkAbort.abort(new PreviewError('preview_selfcheck_timeout')),
+          Math.max(1, Math.min(10_000, selfcheckTimeoutMs)));
         await visitLocalPreviewPage((url, _marker, selfcheckSignal) => resolveOne(url, 'selfcheck', selfcheckSignal), {signal: checkAbort.signal});
+        pageElapsedMs = Math.round(performance.now() - stageStarted);
+        try { onDiagnostic({event: 'preview_browser_selfcheck_passed', at: new Date().toISOString(),
+          launchElapsedMs, pageElapsedMs, elapsedMs: launchElapsedMs + pageElapsedMs}); } catch { /* Optional local diagnostics. */ }
       } catch (error) {
         if (closed || error.code === 'aborted') throw new PreviewError('aborted');
-        const elapsedMs = Math.round(performance.now() - started);
+        const at = new Date().toISOString(); clearTimeout(timer);
+        if (stage === 'launch') launchElapsedMs = Math.round(performance.now() - stageStarted);
+        else pageElapsedMs = Math.round(performance.now() - stageStarted);
         const oldChrome = chrome, pending = [...ownedBrowsers].filter(child => child.exitCode == null && child.signalCode == null);
         const exited = pending.map(child => new Promise(resolve => child.once('exit', resolve)));
-        let timer;
+        let cleanupTimer;
         reset();
         // A socket close may already have reset chrome; only an actual exit releases ownership.
         for (const child of pending) if (child !== oldChrome) { try { child.kill('SIGTERM'); } catch { /* Still wait for exit. */ } }
         const stopped = !pending.length || await Promise.race([Promise.all(exited).then(() => true),
-          new Promise(resolve => {timer = setTimeout(() => resolve(false), 2000);})]);
-        clearTimeout(timer);
+          new Promise(resolve => {cleanupTimer = setTimeout(() => resolve(false), 2000);})]);
+        clearTimeout(cleanupTimer);
         const fallbackPath = browserOptions?.systemChrome ?? SYSTEM_CHROME;
         const fallback = !chromeExplicit && stopped && !closed && chromeAvailable(fallbackPath);
-        try { onDiagnostic({event: 'preview_browser_selfcheck_failed', code: error.code ?? 'preview_selfcheck_failed', elapsedMs,
+        try { onDiagnostic({event: 'preview_browser_selfcheck_failed', at, stage, code: error.code ?? 'preview_selfcheck_failed',
+          launchElapsedMs, pageElapsedMs, elapsedMs: launchElapsedMs + pageElapsedMs,
           explicit: chromeExplicit, fallback, browserStopped: stopped}); } catch { /* Optional local diagnostics. */ }
         if (!fallback) throw new PreviewError('preview_browser_selfcheck_failed');
         chromePath = fallbackPath;

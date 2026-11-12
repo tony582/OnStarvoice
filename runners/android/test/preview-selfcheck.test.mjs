@@ -12,7 +12,9 @@ import {combineRunnerDevices} from '../src/daemon/multi-device.mjs';
 import {RunnerStore} from '../src/storage/runner-store.mjs';
 
 function fixture(t, {holdSelfcheck = false, holdDevtools = false, explicit = false, closeHangs = false,
-  badBody = false, failedNavigation = false, disconnectSelfcheck = false, systemAvailable = true, timeoutMs = 60} = {}) {
+  badBody = false, failedNavigation = false, disconnectSelfcheck = false, systemAvailable = true,
+  launchDelayMs = 0, devtoolsUnavailableMs = 0, pageDelayMs = 0, holdSocket = false, fakePage = false,
+  launchTimeoutMs = 60, timeoutMs = 60} = {}) {
   const homeDir = mkdtempSync(join(tmpdir(), 'preview-selfcheck-'));
   const paths = chromeInstallPaths(chromeInstallRoot(homeDir), '157.0.8103.78', 'mac-arm64');
   mkdirSync(dirname(paths.executable), {recursive: true});
@@ -24,9 +26,9 @@ function fixture(t, {holdSelfcheck = false, holdDevtools = false, explicit = fal
   const systemChrome = join(homeDir, 'system-chrome');
   if (systemAvailable) writeFileSync(systemChrome, bytes, {mode: 0o700});
   const spawns = [], calls = [], urls = [], diagnostics = [], warnings = [], targets = new Map(), sessions = new Map();
-  let targetSeq = 0;
+  let targetSeq = 0; const launchedAt = performance.now();
   class FakeSocket extends EventEmitter {
-    constructor() { super(); queueMicrotask(() => this.emit('open')); }
+    constructor() { super(); if (!holdSocket) queueMicrotask(() => this.emit('open')); }
     addEventListener(name, listener, options) { options?.once ? this.once(name, listener) : this.on(name, listener); }
     close() { this.closed = true; this.emit('close'); }
     send(raw) {
@@ -46,9 +48,13 @@ function fixture(t, {holdSelfcheck = false, holdDevtools = false, explicit = fal
             if (disconnectSelfcheck) { this.close(); return; }
             if (holdSelfcheck) return;
             if (failedNavigation) { emit({id, result: {errorText: 'net::ERR_FAILED'}}); return; }
-            const response = await fetch(params.url);
-            target.html = await response.text(); target.contentType = response.headers.get('content-type');
-            target.marker = target.html.match(/<body>([^<]+)<\/body>/u)?.[1];
+            if (pageDelayMs) await new Promise(resolve => setTimeout(resolve, pageDelayMs));
+            if (fakePage) target.marker = new URL(params.url).pathname.split('/').at(-1);
+            else {
+              const response = await fetch(params.url);
+              target.html = await response.text(); target.contentType = response.headers.get('content-type');
+              target.marker = target.html.match(/<body>([^<]+)<\/body>/u)?.[1];
+            }
           }
         }
         if (method === 'Runtime.evaluate') {
@@ -71,9 +77,15 @@ function fixture(t, {holdSelfcheck = false, holdDevtools = false, explicit = fal
   }
   const preview = createSharePreview({profileDir: join(homeDir, 'private-profile'),
     chromePath: explicit ? paths.executable : undefined, chromeExplicit: explicit, selfcheckTimeoutMs: timeoutMs,
+    selfcheckLaunchTimeoutMs: launchTimeoutMs,
     browserOptions: {homeDir, platform: 'darwin', arch: 'arm64', systemChrome},
     onDiagnostic: entry => diagnostics.push(entry), onWarning: line => warnings.push(line),
-    fetchImpl: async () => holdDevtools ? new Promise(() => {}) : {json: async () => ({webSocketDebuggerUrl: 'ws://127.0.0.1:9333/fake'})},
+    fetchImpl: async () => {
+      if (holdDevtools) return new Promise(() => {});
+      if (performance.now() - launchedAt < devtoolsUnavailableMs) throw new Error('connection refused while Chrome starts');
+      if (launchDelayMs) await new Promise(resolve => setTimeout(resolve, launchDelayMs));
+      return {json: async () => ({webSocketDebuggerUrl: 'ws://127.0.0.1:9333/fake'})};
+    },
     WebSocketImpl: FakeSocket,
     spawnImpl: (path, args) => {
       const child = new EventEmitter(); child.exitCode = null; child.signalCode = null;
@@ -106,7 +118,8 @@ test('managed preview checks once at startup, concurrent content waits, and self
   assert.equal(one.nickname, 'fixture account'); assert.equal(two.nickname, 'fixture account');
   await f.preview.prepare();
   assert.equal(f.urls.length, 1); assert.equal(f.spawns.length, 1); assert.equal(f.preview.available(), true);
-  assert.equal(f.targets.size, 0); assert.deepEqual(f.diagnostics, []); assert.deepEqual(f.warnings, []);
+  assert.equal(f.targets.size, 0); assert.equal(f.diagnostics.length, 1);
+  assert.equal(f.diagnostics[0].event, 'preview_browser_selfcheck_passed'); assert.deepEqual(f.warnings, []);
   await assert.rejects(fetch(f.urls[0]));
   const navs = f.calls.filter(call => call.method === 'Page.navigate').map(call => call.params.url);
   assert.match(navs[0], /^http:\/\/127\.0\.0\.1:\d+\/preview-selfcheck\//u);
@@ -136,18 +149,105 @@ test('explicit browser path still selfchecks but failure never selects a system 
   assert.deepEqual(f.spawns[0].child.kills, ['SIGTERM']); await assert.rejects(fetch(f.urls[0]));
 });
 
-test('the selfcheck deadline also covers stalled DevTools startup and cleanup', async t => {
+test('the launch deadline covers stalled DevTools startup and cleanup', async t => {
   const f = fixture(t, {holdDevtools: true});
   const start = performance.now(); await f.preview.prepare(); const elapsed = performance.now() - start;
   assert.ok(elapsed < 500, `selfcheck unexpectedly waited ${elapsed} ms`);
   assert.equal(f.diagnostics[0].code, 'preview_selfcheck_timeout');
+  assert.equal(f.diagnostics[0].stage, 'launch');
   assert.deepEqual(f.spawns[0].child.kills, ['SIGTERM']); assert.equal(f.preview.available(), true);
 });
 
+async function flush() { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); }
+function clock(t) {
+  const epoch = Date.parse('2026-11-12T09:00:00.000Z');
+  t.mock.timers.enable({apis: ['setTimeout', 'Date'], now: epoch});
+  t.mock.method(performance, 'now', () => Date.now() - epoch);
+  return {async advance(ms) { t.mock.timers.tick(ms); await flush(); }, at: ms => new Date(epoch + ms).toISOString()};
+}
+
+test('twenty-second cold launch gets a separate ten-second page budget and one passed diagnostic', async t => {
+  const time = clock(t);
+  const f = fixture(t, {launchDelayMs: 20_000, pageDelayMs: 100, fakePage: true,
+    launchTimeoutMs: 30_000, timeoutMs: 10_000});
+  let done = false; const pending = Promise.all([f.preview.prepare(), f.preview.prepare()]).then(() => { done = true; });
+  await time.advance(19_999); assert.equal(done, false); assert.equal(f.urls.length, 0); assert.equal(f.warnings.length, 0);
+  await time.advance(1); assert.equal(done, false); assert.equal(f.urls.length, 1);
+  await time.advance(100); await pending; await f.preview.prepare();
+  assert.equal(f.spawns.length, 1); assert.equal(f.targets.size, 0); assert.equal(f.preview.available(), true);
+  assert.deepEqual(f.diagnostics, [{event: 'preview_browser_selfcheck_passed', at: time.at(20_100),
+    launchElapsedMs: 20_000, pageElapsedMs: 100, elapsedMs: 20_100}]);
+  assert.equal(f.warnings.length, 0);
+});
+
+test('a launch still pending at thirty seconds falls back once and never starts a selfcheck page', async t => {
+  const time = clock(t);
+  const f = fixture(t, {launchDelayMs: 31_000, fakePage: true, launchTimeoutMs: 30_000, timeoutMs: 10_000});
+  const pending = f.preview.prepare();
+  await time.advance(29_999); assert.equal(f.diagnostics.length, 0); assert.equal(f.urls.length, 0);
+  await time.advance(1); await pending;
+  assert.deepEqual(f.diagnostics, [{event: 'preview_browser_selfcheck_failed', at: time.at(30_000), stage: 'launch',
+    code: 'preview_selfcheck_timeout', launchElapsedMs: 30_000, pageElapsedMs: 0, elapsedMs: 30_000,
+    explicit: false, fallback: true, browserStopped: true}]);
+  assert.deepEqual(f.spawns[0].child.kills, ['SIGTERM']);
+  await time.advance(1000); await f.preview.prepare();
+  assert.equal(f.urls.length, 0); assert.equal(f.spawns.length, 1); assert.equal(f.warnings.length, 1);
+});
+
+test('DevTools endpoint retries can span a twenty-second cold start rather than stopping after ten', async t => {
+  const time = clock(t);
+  const f = fixture(t, {devtoolsUnavailableMs: 20_000, fakePage: true, launchTimeoutMs: 30_000, timeoutMs: 10_000});
+  const pending = f.preview.prepare(); await flush();
+  for (let i = 0; i < 79; i++) await time.advance(250);
+  assert.equal(f.diagnostics.length, 0); assert.equal(f.urls.length, 0);
+  await time.advance(250); await pending;
+  assert.equal(f.diagnostics[0].event, 'preview_browser_selfcheck_passed');
+  assert.equal(f.diagnostics[0].launchElapsedMs, 20_000); assert.equal(f.diagnostics[0].pageElapsedMs, 0);
+  assert.equal(f.spawns.length, 1); assert.equal(f.warnings.length, 0);
+});
+
+test('page timeout starts after CDP is ready and reports both stage durations', async t => {
+  const time = clock(t);
+  const f = fixture(t, {launchDelayMs: 2000, holdSelfcheck: true, fakePage: true,
+    launchTimeoutMs: 30_000, timeoutMs: 10_000});
+  const pending = f.preview.prepare();
+  await time.advance(2000); assert.equal(f.urls.length, 1);
+  await time.advance(9999); assert.equal(f.diagnostics.length, 0);
+  await time.advance(1); await pending;
+  assert.deepEqual(f.diagnostics, [{event: 'preview_browser_selfcheck_failed', at: time.at(12_000), stage: 'page',
+    code: 'preview_selfcheck_timeout', launchElapsedMs: 2000, pageElapsedMs: 10_000, elapsedMs: 12_000,
+    explicit: false, fallback: true, browserStopped: true}]);
+  assert.deepEqual(f.spawns[0].child.kills, ['SIGTERM']); assert.equal(f.warnings.length, 1);
+  await assert.rejects(fetch(f.urls[0]));
+});
+
+test('explicit launch timeout does not fall back, and stalled websocket opening is bounded', async t => {
+  const time = clock(t);
+  const f = fixture(t, {explicit: true, holdSocket: true, fakePage: true,
+    launchTimeoutMs: 30_000, timeoutMs: 10_000});
+  const rejected = assert.rejects(f.preview.prepare(), {code: 'preview_browser_selfcheck_failed'});
+  await flush(); await time.advance(30_000); await rejected;
+  assert.equal(f.diagnostics[0].stage, 'launch'); assert.equal(f.diagnostics[0].launchElapsedMs, 30_000);
+  assert.equal(f.diagnostics[0].at, time.at(30_000)); assert.equal(f.diagnostics[0].pageElapsedMs, 0);
+  assert.equal(f.diagnostics[0].explicit, true); assert.equal(f.diagnostics[0].fallback, false);
+  assert.equal(f.urls.length, 0); assert.equal(f.warnings.length, 0); assert.equal(f.preview.available(), false);
+});
+
+test('closing during the launch stage cancels shared preparation without fallback or late page work', async t => {
+  const time = clock(t);
+  const f = fixture(t, {launchDelayMs: 20_000, fakePage: true, launchTimeoutMs: 30_000, timeoutMs: 10_000});
+  const canceled = assert.rejects(f.preview.prepare(), {code: 'aborted'});
+  await time.advance(10_000); f.preview.close(); await canceled; await time.advance(30_000);
+  assert.equal(f.spawns.length, 1); assert.deepEqual(f.spawns[0].child.kills, ['SIGTERM']);
+  assert.equal(f.urls.length, 0); assert.equal(f.diagnostics.length, 0); assert.equal(f.warnings.length, 0);
+});
+
 test('a missing system fallback or an unclosed owned browser leaves preview unavailable', async t => {
+  const time = clock(t);
   for (const options of [{systemAvailable: false}, {closeHangs: true}]) {
-    const f = fixture(t, {...options, holdSelfcheck: true});
-    await assert.rejects(f.preview.prepare(), {code: 'preview_browser_selfcheck_failed'});
+    const f = fixture(t, {...options, holdSelfcheck: true, fakePage: true});
+    const rejected = assert.rejects(f.preview.prepare(), {code: 'preview_browser_selfcheck_failed'});
+    await flush(); await time.advance(60); await time.advance(2000); await rejected;
     assert.equal(f.preview.available(), false); assert.equal(f.spawns.length, 1);
     assert.equal(f.warnings.length, 0); assert.equal(f.diagnostics.length, 1);
     assert.equal(f.diagnostics[0].fallback, false); await assert.rejects(fetch(f.urls[0]));
@@ -155,8 +255,10 @@ test('a missing system fallback or an unclosed owned browser leaves preview unav
 });
 
 test('socket reset retains browser ownership until actual exit and cannot race fallback against a live child', async t => {
-  const f = fixture(t, {disconnectSelfcheck: true, closeHangs: true, timeoutMs: 1000});
-  await assert.rejects(f.preview.prepare(), {code: 'preview_browser_selfcheck_failed'});
+  const time = clock(t);
+  const f = fixture(t, {disconnectSelfcheck: true, closeHangs: true, fakePage: true, timeoutMs: 1000});
+  const rejected = assert.rejects(f.preview.prepare(), {code: 'preview_browser_selfcheck_failed'});
+  await flush(); await time.advance(2000); await rejected;
   assert.equal(f.spawns.length, 1); assert.equal(f.preview.available(), false); assert.equal(f.warnings.length, 0);
   assert.equal(f.diagnostics[0].browserStopped, false); assert.equal(f.diagnostics[0].fallback, false);
   const killsBeforeClose = f.spawns[0].child.kills.length;
@@ -165,9 +267,11 @@ test('socket reset retains browser ownership until actual exit and cannot race f
 });
 
 test('canceling one waiter does not cancel the shared startup check or a second platform waiter', async t => {
-  const f = fixture(t, {holdSelfcheck: true}); const canceled = new AbortController();
+  const time = clock(t);
+  const f = fixture(t, {holdSelfcheck: true, fakePage: true}); const canceled = new AbortController();
   const first = f.preview.prepare({signal: canceled.signal}); const second = f.preview.prepare();
-  canceled.abort(); await assert.rejects(first, {code: 'aborted'}); await second;
+  canceled.abort(); await assert.rejects(first, {code: 'aborted'});
+  await flush(); await time.advance(60); await second;
   assert.equal(f.urls.length, 1); assert.equal(f.diagnostics.length, 1); assert.equal(f.warnings.length, 1);
   assert.equal(f.preview.available(), true);
 });
@@ -215,13 +319,15 @@ test('wrong selfcheck document and navigation error are refused and recorded', a
 });
 
 test('closing while checking cancels startup, cleans local listener and never warns or falls back', async t => {
-  const f = fixture(t, {holdSelfcheck: true, timeoutMs: 1000});
+  const time = clock(t);
+  const f = fixture(t, {holdSelfcheck: true, fakePage: true, timeoutMs: 1000});
   const preparing = f.preview.prepare();
   preparing.catch(() => {});
-  for (let i = 0; i < 500 && !f.urls.length; i++) await new Promise(resolve => setTimeout(resolve, 1));
+  await flush();
   assert.equal(f.urls.length, 1, 'selfcheck navigation must begin before cancellation');
   f.preview.close();
   await assert.rejects(preparing, {code: 'aborted'});
+  await time.advance(40_000);
   assert.equal(f.preview.available(), false); assert.equal(f.spawns.length, 1);
   assert.equal(f.diagnostics.length, 0); assert.equal(f.warnings.length, 0); await assert.rejects(fetch(f.urls[0]));
 });
