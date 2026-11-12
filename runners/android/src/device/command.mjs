@@ -1,9 +1,10 @@
 import { execFile } from 'node:child_process';
-import { DeviceError, bounded } from './bounded.mjs';
+import { DeviceError, bounded, boundedStartup } from './bounded.mjs';
 
 // No shell interpolation, npx, installation, or inherited remote ADB endpoints.
 export function runDeviceCommand(file, args, { signal, timeoutMs = 5000, env = process.env, adbOperation } = {}) {
-  return bounded((boundedSignal) => new Promise((resolve, reject) => {
+  const bound = adbOperation === 'start-server' ? boundedStartup : bounded;
+  return bound((boundedSignal) => new Promise((resolve, reject) => {
     const safeEnv = { ...env };
     delete safeEnv.ADB_SERVER_SOCKET;
     delete safeEnv.ANDROID_ADB_SERVER_ADDRESS;

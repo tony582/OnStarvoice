@@ -140,7 +140,7 @@ test('an aborted concurrent waiter does not recheck after the shared restart',as
 test('a late concurrent port check shares a failed restart without trying again',async()=>{
   let starts=0,reads=0;const waiting=[],bothChecking=deferred();
   const recover=createAdbProbeRecovery({now:()=>1000,startServer:async()=>{starts++;throw failure();},
-    daemonAvailable:()=>{const gate=deferred();waiting.push(gate);if(waiting.length===2)bothChecking.resolve();return gate.promise;}});
+    daemonAvailable:()=>{if(waiting.length===2)return false;const gate=deferred();waiting.push(gate);if(waiting.length===2)bothChecking.resolve();return gate.promise;}});
   const read=async()=>{reads++;throw failure();};
   await assert.rejects(recover(read));
   const first=assert.rejects(recover(read),{code:'command_failed'}),second=assert.rejects(recover(read),{code:'command_failed'});
@@ -220,16 +220,139 @@ test('the startup command alone enables adb startup classification',async()=>{
   assert.equal(calls[1].options.adbOperation,undefined);
 });
 
-test('local server startup retains bounded timeout and cancellation',async()=>{
+test('local server startup retains a separate 30-second bound and cancellation',async t=>{
+  t.mock.timers.enable({apis:['setTimeout']});
   const calls=[];
   const adb=createAdbClient({timeoutMs:15,command:async(file,args,options)=>{
     calls.push({args,options});
     return new Promise((resolve,reject)=>options.signal.addEventListener('abort',()=>reject(options.signal.reason),{once:true}));
   }});
-  await assert.rejects(adb.startServer(),{code:'device_timeout'});
-  assert.equal(calls.length,1);assert.equal(calls[0].options.timeoutMs,15);
+  const pending=adb.startServer(),failed=assert.rejects(pending,{code:'device_timeout'});
+  await flush();t.mock.timers.tick(30_000);await failed;
+  assert.equal(calls.length,1);assert.equal(calls[0].options.timeoutMs,30_000);
   assert.equal(calls[0].options.signal.aborted,true);
   const controller=new AbortController();controller.abort();
   await assert.rejects(adb.startServer({signal:controller.signal}),{code:'aborted'});
   assert.equal(calls.length,1,'an already canceled startup must not issue a command');
+});
+
+async function flush(){for(let i=0;i<30;i++)await Promise.resolve();}
+test('an eight-second cold startup survives the old five-second limit and immediately rechecks',async t=>{
+  t.mock.timers.enable({apis:['setTimeout']});
+  let clock=1000,healthy=false,settled=false;const calls=[],notes=[];
+  const adb=createAdbClient({now:()=>clock,daemonAvailable:async()=>false,onDiagnostic:entry=>notes.push(entry),
+    command:async(file,args,options)=>{
+      const action=checkedAction(args);calls.push({action,timeoutMs:options.timeoutMs});
+      if(action==='start-server'){
+        await new Promise((resolve,reject)=>{
+          const timer=setTimeout(resolve,8000);
+          options.signal.addEventListener('abort',()=>{clearTimeout(timer);reject(options.signal.reason);},{once:true});
+        });healthy=true;return{stdout:'',stderr:''};
+      }
+      if(!healthy)throw failure({adbDaemonUnavailable:true});
+      return{stdout:'List of devices attached\nphone-1 device model:Test\n',stderr:''};
+    }});
+  await assert.rejects(adb.listDevices(),{code:'command_failed'});
+  const pending=adb.listDevices().then(value=>{settled=true;return{value};},error=>{settled=true;return{error};});
+  await flush();clock+=5000;t.mock.timers.tick(5000);await flush();
+  assert.equal(settled,false,'the startup client must remain alive while USB initialization is slow');
+  clock+=3000;t.mock.timers.tick(3000);await flush();
+  const result=await pending;assert.equal(result.error,undefined);assert.equal(result.value[0].serial,'phone-1');
+  assert.deepEqual(calls.map(call=>call.action),['devices','devices','start-server','devices']);
+  assert.equal(calls.find(call=>call.action==='start-server').timeoutMs,30_000);
+  assert.ok(calls.filter(call=>call.action==='devices').every(call=>call.timeoutMs===5000));
+  assert.deepEqual(notes,[{at:new Date(clock).toISOString(),event:'adb_server_restarted',elapsedMs:8000}]);
+});
+
+test('ordinary device commands still expire at five seconds',async t=>{
+  t.mock.timers.enable({apis:['setTimeout']});let optionsSeen,settled=false;
+  const adb=createAdbClient({command:async(file,args,options)=>{
+    assert.equal(checkedAction(args),'-s');optionsSeen=options;
+    return new Promise((resolve,reject)=>options.signal.addEventListener('abort',()=>reject(options.signal.reason),{once:true}));
+  }});
+  const pending=adb.powerState('phone-1').then(()=>{settled=true;},error=>{settled=true;throw error;});
+  const failed=assert.rejects(pending,{code:'device_timeout'});await flush();
+  t.mock.timers.tick(4999);await flush();assert.equal(settled,false);
+  t.mock.timers.tick(1);await failed;assert.equal(optionsSeen.timeoutMs,5000);assert.equal(optionsSeen.signal.aborted,true);
+});
+
+for(const code of ['device_timeout','command_failed'])test(`a ${code} startup with a listening daemon succeeds and reinspects`,async()=>{
+  let clock=1000,healthy=false,checks=0,reads=0;const notes=[];
+  const recover=createAdbProbeRecovery({now:()=>clock,onDiagnostic:entry=>notes.push(entry),
+    startServer:async()=>{clock+=30_000;healthy=true;throw Object.assign(new Error('private-startup-detail'),{code});},
+    daemonAvailable:async()=>{checks++;clock+=250;return true;}});
+  const read=async()=>{reads++;if(!healthy)throw failure({adbDaemonUnavailable:true});return'healthy';};
+  await assert.rejects(recover(read));assert.equal(await recover(read),'healthy');assert.equal(reads,3);assert.equal(checks,1);
+  assert.deepEqual(notes,[{at:new Date(clock).toISOString(),event:'adb_server_restarted',startTimedOut:true,elapsedMs:30_000}]);
+  assert.ok(!JSON.stringify(notes).includes('private-'));
+});
+
+test('timed-out startup with no listener records command duration and keeps cooldown',async()=>{
+  let clock=1000,starts=0,checks=0;const notes=[];
+  const recover=createAdbProbeRecovery({now:()=>clock,onDiagnostic:entry=>notes.push(entry),
+    startServer:async()=>{starts++;clock+=30_000;throw Object.assign(new Error('startup timeout'),{code:'device_timeout'});},
+    daemonAvailable:async()=>{checks++;clock+=250;return false;}});
+  const read=async()=>{throw failure({adbDaemonUnavailable:true});};
+  await assert.rejects(recover(read));await assert.rejects(recover(read),{code:'device_timeout'});
+  assert.equal(checks,1);assert.equal(notes[0].event,'adb_server_restart_failed');assert.equal(notes[0].failureCategory,'timeout');
+  assert.equal(notes[0].elapsedMs,30_000,'port-check time is not startup-command time');
+  clock=60_999;await assert.rejects(recover(read));assert.equal(starts,1);
+  clock=61_000;await assert.rejects(recover(read));assert.equal(starts,2);
+});
+
+test('a listening port after startup failure does not bypass a failed device recheck',async()=>{
+  let reads=0;const notes=[];
+  const recover=createAdbProbeRecovery({now:()=>1000,onDiagnostic:entry=>notes.push(entry),
+    startServer:async()=>{throw Object.assign(new Error('timeout'),{code:'device_timeout'});},daemonAvailable:async()=>true});
+  const read=async()=>{reads++;throw failure({adbDaemonUnavailable:true});};
+  await assert.rejects(recover(read));await assert.rejects(recover(read),{code:'command_failed'});
+  assert.equal(reads,3);assert.equal(notes.length,1);assert.equal(notes[0].startTimedOut,true);
+});
+
+test('a failed post-start listener check preserves the original failure and duration',async()=>{
+  let clock=1000;const notes=[];
+  const original=failure({adbFailureCategory:'remote_host_refused'});
+  const recover=createAdbProbeRecovery({now:()=>clock,onDiagnostic:entry=>notes.push(entry),
+    startServer:async()=>{clock+=40;throw original;},daemonAvailable:async()=>{throw new Error('private-port-detail');}});
+  const read=async()=>{throw failure({adbDaemonUnavailable:true});};
+  await assert.rejects(recover(read));await assert.rejects(recover(read),error=>error===original);
+  assert.equal(notes[0].elapsedMs,40);assert.equal(notes[0].failureCategory,'remote_host_refused');
+  assert.ok(!JSON.stringify(notes).includes('private-'));
+});
+
+test('cancellation of startup cannot become success through a listening port',async()=>{
+  const controller=new AbortController();let checks=0;const notes=[];
+  const recover=createAdbProbeRecovery({now:()=>1000,onDiagnostic:entry=>notes.push(entry),
+    startServer:async()=>{controller.abort();throw Object.assign(new Error('canceled'),{code:'aborted'});},
+    daemonAvailable:async()=>{checks++;return true;}});
+  const read=async()=>{throw failure({adbDaemonUnavailable:true});};
+  await assert.rejects(recover(read));await assert.rejects(recover(read,{signal:controller.signal}));
+  assert.equal(checks,0);assert.equal(notes.some(n=>n.event==='adb_server_restarted'),false);
+});
+
+test('cancellation during the post-start port check prevents false success and device recheck',async()=>{
+  const controller=new AbortController(),checking=deferred(),answer=deferred();let reads=0;const notes=[];
+  const recover=createAdbProbeRecovery({now:()=>1000,onDiagnostic:entry=>notes.push(entry),
+    startServer:async()=>{throw Object.assign(new Error('timeout'),{code:'device_timeout'});},
+    daemonAvailable:()=>{checking.resolve();return answer.promise;}});
+  const read=async()=>{reads++;throw failure({adbDaemonUnavailable:true});};
+  await assert.rejects(recover(read));const pending=recover(read,{signal:controller.signal});const rejected=assert.rejects(pending);
+  await checking.promise;controller.abort();answer.resolve(true);await rejected;
+  assert.equal(reads,2);assert.equal(notes.some(n=>n.event==='adb_server_restarted'),false);
+});
+
+test('a startup that ignores cancellation cannot emit a success event',async()=>{
+  const controller=new AbortController();const notes=[];
+  const recover=createAdbProbeRecovery({now:()=>1000,onDiagnostic:entry=>notes.push(entry),
+    startServer:async()=>{controller.abort();},daemonAvailable:async()=>false});
+  const read=async()=>{throw failure({adbDaemonUnavailable:true});};
+  await assert.rejects(recover(read));await assert.rejects(recover(read,{signal:controller.signal}));
+  assert.equal(notes.some(n=>n.event==='adb_server_restarted'),false);
+});
+
+test('only the startup command wrapper permits the thirty-second bound',async()=>{
+  const {runDeviceCommand}=await import('../src/device/command.mjs');
+  const result=await runDeviceCommand(process.execPath,['-e','process.stdout.write("offline fixture")'],{timeoutMs:30_000,adbOperation:'start-server'});
+  assert.equal(result.stdout,'offline fixture');
+  await assert.rejects(runDeviceCommand(process.execPath,['-e','process.exit(0)'],{timeoutMs:30_000}),{code:'invalid_timeout'});
 });

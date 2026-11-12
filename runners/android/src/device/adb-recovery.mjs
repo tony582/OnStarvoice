@@ -1,4 +1,5 @@
 import {createConnection} from 'node:net';
+import {throwIfAborted} from './bounded.mjs';
 
 export const ADB_RESTART_COOLDOWN_MS = 60_000;
 export function adbDaemonAvailable({signal,timeoutMs=300}={}) {
@@ -40,11 +41,24 @@ export function createAdbProbeRecovery({startServer,daemonAvailable=adbDaemonAva
       if(!unavailable || failures<2 || now()-lastRestart<ADB_RESTART_COOLDOWN_MS)throw error;
       lastRestart=now();failures=0;restartVersion++;
       restarting=(async()=>{
-        try {await startServer({signal});note({event:'adb_server_restarted'});}
+        const startedAt=now();let elapsedMs;
+        try {
+          await startServer({signal});elapsedMs=Math.max(0,now()-startedAt);
+          throwIfAborted(signal);
+          note({event:'adb_server_restarted',elapsedMs});
+        }
         catch(failure){
+          elapsedMs ??= Math.max(0,now()-startedAt);
+          if(signal?.aborted || failure?.code==='aborted')throw failure;
+          // A failed startup client can leave a listening daemon. Check once before declaring failure;
+          // device readiness is still proved by the ordinary immediate recheck below.
+          let listening=false;
+          try {listening=await daemonAvailable({signal});}catch{/* retain the original bounded startup failure */}
+          throwIfAborted(signal);
+          if(listening){note({event:'adb_server_restarted',startTimedOut:true,elapsedMs});return;}
           const failureCategory=failure?.code==='device_timeout'?'timeout'
             :failure?.adbFailureCategory==='remote_host_refused'?'remote_host_refused':'other';
-          note({event:'adb_server_restart_failed',code:failure?.code || 'command_failed',failureCategory});throw failure;
+          note({event:'adb_server_restart_failed',code:failure?.code || 'command_failed',failureCategory,elapsedMs});throw failure;
         }
       })();
       lastRecovery=restarting;

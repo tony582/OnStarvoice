@@ -11,9 +11,13 @@ export function throwIfAborted(signal) {
   if (signal?.aborted) throw new DeviceError('aborted', 'Device operation was canceled');
 }
 
-export async function bounded(operation, { signal, timeoutMs = 5000 } = {}) {
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 15000) {
-    throw new DeviceError('invalid_timeout', 'Device timeout must be between 1 and 15000 ms');
+export const bounded = (operation, options) => boundedWithin(operation, options, 15000);
+// Startup includes USB initialization; ordinary device operations retain their existing ceiling.
+export const boundedStartup = (operation, options) => boundedWithin(operation, options, 30000);
+
+async function boundedWithin(operation, { signal, timeoutMs = 5000 } = {}, maximumMs) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > maximumMs) {
+    throw new DeviceError('invalid_timeout', `Device timeout must be between 1 and ${maximumMs} ms`);
   }
   throwIfAborted(signal);
   const controller = new AbortController();

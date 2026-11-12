@@ -1,7 +1,9 @@
 import {createAdbProbeRecovery} from './adb-recovery.mjs';
-import { DeviceError, bounded } from './bounded.mjs';
+import { DeviceError, bounded, boundedStartup } from './bounded.mjs';
 import { runDeviceCommand } from './command.mjs';
 import { parseMemInfo } from './douyin-memory.mjs';
+
+export const ADB_START_TIMEOUT_MS = 30_000;
 
 export function validateSerial(serial) {
   if (typeof serial !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(serial)) {
@@ -42,9 +44,9 @@ export function createAdbClient({ adbPath = 'adb', command = runDeviceCommand, t
   const listDevicesRaw = async (options = {}) => parseAdbDevices((await call(['devices', '-l'], options)).stdout);
   // Ensure the local adb server is up. This never selects, connects to or opens a device.
   // adb treats an explicit -H as remote, even for 127.0.0.1, and refuses to start that server.
-  const startServer = async (options = {}) => {
-    await bounded(signal => command(adbPath, ['-P', '5037', 'start-server'],
-      {signal, timeoutMs, adbOperation: 'start-server'}), {timeoutMs, ...options});
+  const startServer = async ({signal} = {}) => {
+    await boundedStartup(signal => command(adbPath, ['-P', '5037', 'start-server'],
+      {signal, timeoutMs: ADB_START_TIMEOUT_MS, adbOperation: 'start-server'}), {timeoutMs: ADB_START_TIMEOUT_MS, signal});
     return {started: true};
   };
   const inspectRaw = async (serial, options = {}) => {
