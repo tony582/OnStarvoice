@@ -152,7 +152,7 @@ test('a re-captured post keeps the stored ids of comments OCR read slightly diff
   // 「强广西」 was the old reading of 强 + 广西: too short to call the same commenter; it stays a new comment.
   assert.equal(commentNamesAgree('强广西', '强'), false);
   assert.equal(commentNamesAgree('迷途懒猫', '迷途懒猫心'), true);
-  assert.equal(commentTextsAgree('XT59接入豆包了吗？首评岚图汽车官方…', 'XT59接入豆包了吗？'), true);
+  assert.equal(commentTextsAgree('XT59接入豆包了吗？首评岚图汽车官方…', 'XT59接入豆包了吗？'), false, 'only the shorter reading may authorize prefix merging');
   assert.equal(commentTextsAgree('好看', '好看吗'), false);
 });
 

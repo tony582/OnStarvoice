@@ -153,10 +153,16 @@ export function commentNamesAgree(a, b) {
 }
 export function commentTextsAgree(a, b) {
   const x = bare(a), y = bare(b);
+  if (!x || !y) {
+    const original = comparable(a);
+    return Boolean(original) && original === comparable(b);
+  }
   if (x === y) return true;
-  if (!x || !y) return false;
-  const [short, long] = x.length <= y.length ? [x, y] : [y, x];
-  if (short.length >= 4 && long.startsWith(short.slice(0, -1))) return true;
+  const [short, long, shortOriginal] = x.length <= y.length ? [x, y, a] : [y, x, b];
+  if (short.length < long.length && short.length >= 4 && long.startsWith(short.slice(0, -1))) {
+    // A complete short comment can be a separate comment, even when Dice would also match it.
+    return /(?:…|\.{3})\s*$/u.test(String(shortOriginal ?? ''));
+  }
   return dice(x, y) >= 0.8;
 }
 
@@ -166,24 +172,35 @@ export function commentTextsAgree(a, b) {
  * their parent's stored id.
  */
 export function reuseKnownCommentIds(items, known) {
-  const used = new Set(), renamed = new Map();
-  const ids = new Set(known.map(row => row.commentId));
-  for (const item of items) if (ids.has(item.commentId)) used.add(item.commentId);
-  const mapped = items.map(item => {
-    if (used.has(item.commentId) && ids.has(item.commentId)) return item;
-    const match = known.find(row => !used.has(row.commentId) && commentNamesAgree(row.authorName, item.authorName)
+  const used = new Set(), renamed = new Map(), mapped = new Array(items.length);
+  const knownIds = new Set(known.map(row => row.commentId));
+  // Reserve exact identities before fuzzy matching so an earlier OCR reading cannot steal one.
+  const reserved = new Set(items.filter(item => knownIds.has(item.commentId)).map(item => item.commentId));
+  const isReply = item => Boolean(item.isReply || item.parentCommentId);
+  const sameFloor = (one, two) => isReply(one) === isReply(two)
+    && (one.parentCommentId || '') === (two.parentCommentId || '');
+  // Resolve main comments first, even if a reading has put a reply before its parent.
+  for (const reply of [false, true]) items.forEach((source, index) => {
+    if (isReply(source) !== reply) return;
+    const item = {...source, parentCommentId: renamed.get(source.parentCommentId) ?? source.parentCommentId};
+    const exact = known.find(row => row.commentId === item.commentId && sameFloor(row, item));
+    const match = exact ?? known.find(row => !used.has(row.commentId) && !reserved.has(row.commentId)
+      && sameFloor(row, item) && commentNamesAgree(row.authorName, item.authorName)
       && commentTextsAgree(row.content, item.content));
-    if (!match) return item;
-    used.add(match.commentId);
-    renamed.set(item.commentId, match.commentId);
-    return {...item, commentId: match.commentId};
+    if (match) {
+      used.add(match.commentId);
+      renamed.set(source.commentId, match.commentId);
+    }
+    mapped[index] = match ? {...item, commentId: match.commentId} : item;
   });
-  return mapped.map(item => renamed.has(item.parentCommentId) ? {...item, parentCommentId: renamed.get(item.parentCommentId)} : item);
+  return mapped;
 }
 
 /** Comments already known for a Channels post: stored rows and the last capture's list (its rows may still be queued). */
 export async function knownWechatComments(tx, tenantId, externalId, platform = 'wechat_channels') {
-  const rows = await tx.queryAll(`SELECT c.external_comment_id AS "commentId", c.author_name AS "authorName", c.content
+  const rows = await tx.queryAll(`SELECT c.external_comment_id AS "commentId", c.author_name AS "authorName", c.content,
+    c.parent_comment_id AS "parentCommentId",
+    (c.parent_comment_id <> '' OR COALESCE(c.payload->>'isReply', '') = 'true') AS "isReply"
     FROM record_comments c JOIN records r ON r.id = c.record_id AND r.tenant_id = c.tenant_id
     WHERE r.tenant_id = $1 AND r.platform = $3 AND r.external_id = $2 AND c.external_comment_id LIKE 'wxcc_%'
     ORDER BY c.floor_index, c.created_at LIMIT 2000`, [tenantId, externalId, platform]);
@@ -193,7 +210,8 @@ export async function knownWechatComments(tx, tenantId, externalId, platform = '
   for (const item of Array.isArray(latest?.items) ? latest.items : []) {
     if (typeof item?.commentId === 'string' && item.commentId.startsWith('wxcc_') && !seen.has(item.commentId)) {
       seen.add(item.commentId);
-      rows.push({commentId: item.commentId, authorName: String(item.authorName ?? ''), content: String(item.content ?? '')});
+      rows.push({commentId: item.commentId, authorName: String(item.authorName ?? ''), content: String(item.content ?? ''),
+        parentCommentId: String(item.parentCommentId ?? ''), isReply: item.isReply === true || Boolean(item.parentCommentId)});
     }
   }
   return rows;

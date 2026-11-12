@@ -382,6 +382,37 @@ test('WeChat Channels on a shared phone: claim by platform, post upload, receipt
     assert.equal((await request('/admin/settings', {method: 'PUT', body: {wechat_forward_recipients: '别人'}})).status, 403);
   });
 
+  await t.test('emoji, complete prefixes and replies keep separate stable ids through stored comment rows', async st => {
+    const f = await fixture(st);
+    await elasticParent(f.tenantId, {platform: 'wechat_channels', eligibleAgentIds: [f.phone.id], keywords: ['安吉星']});
+    const {task} = await f.poll({platforms: ['wechat_channels']});
+    const reading = (author, content, parentIndex = null) => ({author, content, parentIndex,
+      reply: parentIndex !== null, timeLabel: '1天前', location: '上海', likeCount: 0});
+    const items = [reading('楼主甲A', '第一层内容不一样'), reading('同一个读者', '确实', 0),
+      reading('楼主乙A', '第二层内容有区别'), reading('同一个读者', '确实', 2),
+      reading('同一个读者', '👍👍'), reading('同一个读者', '😡😡'),
+      reading('同一个读者', '别克君越真不错'), reading('同一个读者', '别克君越真不错，就是车机死机')];
+    const preview = postEvent(task).preview;
+    await f.service.posts(f.principal, {uploadBatchId: randomUUID(), events: [postEvent(task,
+      {preview, comments: {status: 'captured', headerCount: 8, items}})]}, persist);
+    const [first] = await query(`SELECT id,payload->'commentsCleanedItems' AS items FROM records WHERE tenant_id=$1`, [f.tenantId]);
+    assert.equal(new Set(first.items.map(x => x.commentId)).size, 8);
+    for (const c of first.items) await query(`INSERT INTO record_comments
+      (tenant_id,record_id,platform,external_comment_id,parent_comment_id,author_name,content,floor_index,payload)
+      VALUES($1,$2,'wechat_channels',$3,$4,$5,$6,$7,$8)`,
+      [f.tenantId,first.id,c.commentId,c.parentCommentId,c.authorName,c.content,c.floorIndex,c]);
+    const reordered = [reading('楼主乙B', items[2].content), reading('同一个读者', '确实', 0),
+      reading('楼主甲B', items[0].content), reading('同一个读者', '确实', 2), items[5], items[4], items[7], items[6]];
+    await f.service.posts(f.principal, {uploadBatchId: randomUUID(), events: [postEvent(task,
+      {preview, comments: {status: 'captured', headerCount: 8, items: reordered}})]}, persist);
+    const [again] = await query(`SELECT payload->'commentsCleanedItems' AS items FROM records WHERE id=$1`, [first.id]);
+    assert.deepEqual(again.items.map(x => x.commentId), [2,3,0,1,5,4,7,6].map(i => first.items[i].commentId));
+    assert.equal(again.items[1].parentCommentId, first.items[2].commentId);
+    assert.equal(again.items[3].parentCommentId, first.items[0].commentId);
+    assert.equal((await query('SELECT id FROM records WHERE tenant_id=$1', [f.tenantId])).length, 1);
+    await f.complete(task);
+  });
+
   await t.test('a post captured again keeps its comment ids although OCR read the comments a little differently', async st => {
     const f = await fixture(st);
     await elasticParent(f.tenantId, {platform: 'wechat_channels', eligibleAgentIds: [f.phone.id], keywords: ['安吉星', '安吉星收费']});
