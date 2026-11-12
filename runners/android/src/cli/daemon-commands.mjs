@@ -35,7 +35,8 @@ export async function daemonCommand(command, values, {env, stdout}) {
     return setupRunner({stateDir, baseUrl: values['cloud-url'] ?? env.STARVOICE_CLOUD_URL,
       deviceId: values.serial, code: env.STARVOICE_ACTIVATION_CODE,
       simulation: values.simulation === 'true', deviceProfile: values['device-profile'],
-      adbPath: values['adb-path'], appiumUrl: values['appium-url'], clientLabel: values.label});
+      adbPath: values['adb-path'], appiumUrl: values['appium-url'], clientLabel: values.label,
+      wechatPreview: values['wechat-preview'] === 'true', chromePath: values.chrome, onProgress: stdout});
   }
   if (command === 'start') return startRunner({stateDir, stdout});
   const path = join(stateDir, 'runner.sqlite');

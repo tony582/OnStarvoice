@@ -95,6 +95,10 @@ node runners/android/cli.mjs setup --state-dir /path/to/private/android-state --
 
 0.4.0 起同一台手机可同时跑抖音和微信视频号（见 [20261105 视频号](../../docs/hotfix/20261105-wechat-channels-mobile.md)）。Runner 停下后执行一次 `node cli.mjs enable-wechat --state-dir …`：它用本机 `swiftc` 把 `tools/ocr/StarVoiceOCR.swift`（macOS 自带文字识别，不调用任何模型服务）编译到状态目录，并在 `connection.json` 记下 `wechat-8.0.80-de106-api27-p0`。之后空闲探测分别核对两个 App 的版本，轮询带上 `platforms`；探测不再把抖音拉回前台，领到哪个平台的任务就由该任务用审核过的入口切到对应 App（抖音 `.splash.SplashActivity`，微信 `.ui.LauncherUI` 并回到主界面）。微信 8.0.80 不向自动化工具开放页面结构，所以视频号任务**不建 Appium 会话**：只用 adb 截图、本机识字和固定坐标点击，每一步用当前 Activity 确认页面；关键词经 Appium 设置应用的 Unicode 输入法临时输入，输完立即恢复原输入法；「复制链接」得到的短链交给本机无界面 Chrome 打开公开预览页，读取页面自己的帖子数据（文案、发布时间到秒、作者、四个互动数）。评论面板边滑边截图，识字在后台并行。每帖之间随机停 3–6 秒。设了时间范围时按「最新」排序，卡片时间超出范围就结束该关键词，打开后再用预览页的精确时间核对。
 
+0.5.4 候选新增独立预览浏览器安装：`enable-wechat` 默认从 Chrome 官方来源下载并校验 Chrome for Testing，存放在 `~/.local/share/starvoice/chrome-for-testing/<版本>/<mac-arm64 或 mac-x64>/`，安全解压需要 Python 3.9 以上。也可以在原有 `setup` 参数后加 `--wechat-preview true` 只预装浏览器，不自动启用微信；普通抖音 setup、模拟模式和日常启动不下载浏览器。已启用微信的状态目录重新 setup 时会保留 OCR 配置并核对预览浏览器。
+
+正常预览优先使用已校验的独立浏览器。旧配置中的系统 Chrome 默认路径也会自动转为这一选择；`enable-wechat --chrome <可执行文件路径>` 表示新的显式覆盖，不下载另一份浏览器。安装失败但系统 Chrome 可用时会保留错误码、暂时回退，并只提示一次「建议安装独立预览浏览器」。不会关闭、修改或重新签名用户的 Chrome，也不会修改其日常浏览器资料。校验与安装细节见 [独立预览浏览器](tools/browser/README.md)。本次只做离线实现和测试，没有安装真实浏览器或操作生产手机；普通 Chrome 退出再打开、视频号及文章网页读取由 Claude 后续真机复测。
+
 ```sh
 node runners/android/cli.mjs status --state-dir /path/to/private/android-state
 node runners/android/cli.mjs stop --state-dir /path/to/private/android-state

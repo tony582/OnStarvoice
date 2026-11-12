@@ -36,7 +36,8 @@ export async function runCli(args, {stdout = console.log, stderr = console.error
     }
     if (command === 'up') { await runUp(values, {env, stdout}); return 0; }
     if (command === 'enable-wechat') {
-      stdout(JSON.stringify(await enableWechat({stateDir: values['state-dir'], ...(values.chrome ? {chromePath: values.chrome} : {})}), null, 2));
+      stdout(JSON.stringify(await enableWechat({stateDir: values['state-dir'], onWarning: stderr, onProgress: stdout,
+        ...(values.chrome ? {chromePath: values.chrome} : {})}), null, 2));
       return 0;
     }
     if (['setup', 'start', 'stop', 'close', 'status', 'diagnose'].includes(command)) {

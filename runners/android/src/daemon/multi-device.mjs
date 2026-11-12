@@ -31,7 +31,8 @@ export function createRunnerDevice({config, store, stateDir, onState}) {
     ocrBinary: wechatConfig.ocrHelper, ime});
   const articles = createWechatArticleAdapter({serial: config.deviceId, adb, adbPath: config.adbPath || 'adb', ocr,
     ocrBinary: wechatConfig.ocrHelper, ime});
-  const preview = createSharePreview({chromePath: wechatConfig.chromePath || undefined, profileDir: join(stateDir, 'chrome-preview')});
+  const preview = createSharePreview({chromePath: wechatConfig.chromePath || undefined, chromeExplicit: wechatConfig.chromeExplicit === true,
+    profileDir: join(stateDir, 'chrome-preview')});
   return combineRunnerDevices({douyin, wechat, articles, preview, ocr, store});
 }
 

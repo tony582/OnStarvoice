@@ -6,7 +6,7 @@ import {promisify} from 'node:util';
 import {RunnerStore} from '../storage/runner-store.mjs';
 import {readConfig, stateValue, writePrivateJson} from '../daemon/state.mjs';
 import {WECHAT_PROFILE} from '../device/wechat-profile.mjs';
-import {chromeAvailable, DEFAULT_CHROME} from '../preview/share-preview.mjs';
+import {preparePreviewChrome} from '../preview/chrome-install.mjs';
 
 const run = promisify(execFile);
 const OCR_SOURCE = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'tools', 'ocr', 'StarVoiceOCR.swift');
@@ -25,7 +25,8 @@ export async function buildOcrHelper(stateDir, {swiftc = 'swiftc'} = {}) {
  * `enable-wechat --state-dir DIR [--chrome PATH]`: let this phone take WeChat Channels tasks as well. The Runner
  * must be stopped with nothing queued; the Douyin settings are left as they are.
  */
-export async function enableWechat({stateDir, chromePath = DEFAULT_CHROME, build = buildOcrHelper}) {
+export async function enableWechat({stateDir, chromePath, build = buildOcrHelper, prepareBrowser = preparePreviewChrome,
+  onWarning = console.error, onProgress = () => {}}) {
   const directory = resolve(stateDir);
   const config = readConfig(directory);
   const store = new RunnerStore(join(directory, 'runner.sqlite'));
@@ -34,9 +35,13 @@ export async function enableWechat({stateDir, chromePath = DEFAULT_CHROME, build
       throw new Error('Stop the Runner before changing its apps');
     }
   } finally { store.close(); }
-  if (!chromeAvailable(chromePath)) throw new Error('Google Chrome is required to read share-link previews');
+  const browser = await prepareBrowser({chromePath, onWarning, onProgress});
   const ocrHelper = await build(directory);
-  const wechat = {profile: WECHAT_PROFILE.id, ocrHelper, ...(chromePath !== DEFAULT_CHROME ? {chromePath} : {})};
+  // Automatic selection stays automatic, including managed CfT and fallbacks.
+  // Only a user-supplied override is pinned in connection.json.
+  const wechat = {profile: WECHAT_PROFILE.id, ocrHelper,
+    ...(chromePath ? {chromePath: browser.path, chromeExplicit: true} : {})};
   writePrivateJson(directory, 'connection.json', {...config, wechat});
-  return {ok: true, profile: WECHAT_PROFILE.id, ocrHelper, chrome: chromePath, ocrSourceFound: existsSync(OCR_SOURCE)};
+  return {ok: true, profile: WECHAT_PROFILE.id, ocrHelper, chrome: browser.path,
+    previewBrowser: browser, ocrSourceFound: existsSync(OCR_SOURCE)};
 }

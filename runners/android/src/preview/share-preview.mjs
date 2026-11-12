@@ -3,13 +3,14 @@ import {accessSync, constants, mkdirSync} from 'node:fs';
 import {setTimeout as sleep} from 'node:timers/promises';
 import {readArticleDocument} from './article-dom.mjs';
 import {canonicalArticleUrl} from '../core/wechat-article-evidence.mjs';
+import {resolvePreviewChrome, SYSTEM_CHROME} from './chrome-cache.mjs';
 
 // A copied WeChat Channels share link opens WeChat's public preview page in an ordinary browser. That page
 // requests its own post data (feed/get_feed_info); this resolver opens the link in a headless Chrome on this
 // computer and reads that response, exactly what the page shows: caption, publish time, author and counts.
 // It never sends requests of its own to WeChat and never logs in. One Chrome process, a few tabs at a time.
 export const SHARE_LINK = /^https:\/\/weixin\.qq\.com\/sph\/[A-Za-z0-9_-]{4,40}$/u;
-export const DEFAULT_CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+export const DEFAULT_CHROME = SYSTEM_CHROME;
 const MOBILE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148';
 const FEED_API = /^https:\/\/channels\.weixin\.qq\.com\/finder-preview\/api\/feed\/get_feed_info(?:\?|$)/u;
 
@@ -17,7 +18,7 @@ export class PreviewError extends Error {
   constructor(code, message = code) { super(message); this.name = 'PreviewError'; this.code = code; }
 }
 
-export function chromeAvailable(path = DEFAULT_CHROME) {
+export function chromeAvailable(path = resolvePreviewChrome().path) {
   try { accessSync(path, constants.X_OK); return true; } catch { return false; }
 }
 
@@ -40,9 +41,11 @@ export function readFeedInfo(body) {
     exportId: text(data.sceneInfo?.dynamicExportId, 200)};
 }
 
-export function createSharePreview({chromePath = DEFAULT_CHROME, profileDir, port = 9333, maxTabs = 2,
+export function createSharePreview({chromePath, chromeExplicit = false, profileDir, port = 9333, maxTabs = 2,
+  browserOptions,
   timeoutMs = 15_000, spawnImpl = spawn, fetchImpl = globalThis.fetch, WebSocketImpl = globalThis.WebSocket} = {}) {
   if (typeof profileDir !== 'string' || !profileDir) throw new PreviewError('preview_unavailable', 'A private Chrome profile directory is required');
+  chromePath = resolvePreviewChrome({...browserOptions, chromePath, chromeExplicit}).path;
   let chrome = null, socket = null, connecting = null, seq = 0, active = 0, generation = 0;
   const waiting = new Map(), listeners = new Set(), queue = [], activeJobs = new Set();
   const abortError = signal => signal?.reason instanceof PreviewError ? signal.reason : new PreviewError('aborted');
