@@ -99,7 +99,7 @@ node runners/android/cli.mjs setup --state-dir /path/to/private/android-state --
 
 正常预览优先使用已校验的独立浏览器。旧配置中的系统 Chrome 默认路径也会自动转为这一选择；`enable-wechat --chrome <可执行文件路径>` 表示新的显式覆盖，不下载另一份浏览器。安装失败但系统 Chrome 可用时会保留错误码、暂时回退，并只提示一次「建议安装独立预览浏览器」。不会关闭、修改或重新签名用户的 Chrome，也不会修改其日常浏览器资料。校验与安装细节见 [独立预览浏览器](tools/browser/README.md)。本次只做离线实现和测试，没有安装真实浏览器或操作生产手机；普通 Chrome 退出再打开、视频号及文章网页读取由 Claude 后续真机复测。
 
-0.5.5 候选补充本机 HTTP 网页预览自检与失败回退，并修正本机 ADB 服务启动参数。验收说明见 [0.5.5 就绪检查](../../docs/hotfix/20261112-android-055-readiness.md)。预览验收须从普通 Terminal/Finder 启动，保留配置目录位置与祖先链证据；Documents 目录导致超时的猜测在本轮补充对照中未获证实，仍按原因未定的历史现象处理。手机端到端验收必须区分预览成功、列表时间过滤、留言人工对照和实际入库，不以单个页面可打开替代全部通过。
+0.5.6 候选为本机 ADB 启动单独保留 30 秒，普通设备命令仍是 5 秒；微信预览的浏览器启动与本地网页自检分别保留 30 秒和 10 秒。验收说明见 [0.5.6 启动时限与验收](../../docs/hotfix/20261112-android-056-startup.md)。预览验收须从普通 Terminal/Finder 启动，保留配置目录位置与祖先链证据；Documents 目录导致超时的猜测在补充对照 F 中未获证实，仍按原因未定的历史现象处理。手机端到端验收必须区分预览成功、列表时间过滤、留言人工对照和实际入库，不以单个页面可打开替代全部通过。0.5.5 未通过真机验收，生产仍保留 0.5.3；候选不代表已发布。
 
 ```sh
 node runners/android/cli.mjs status --state-dir /path/to/private/android-state
