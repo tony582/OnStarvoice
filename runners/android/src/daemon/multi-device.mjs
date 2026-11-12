@@ -32,7 +32,7 @@ export function createRunnerDevice({config, store, stateDir, onState}) {
   const articles = createWechatArticleAdapter({serial: config.deviceId, adb, adbPath: config.adbPath || 'adb', ocr,
     ocrBinary: wechatConfig.ocrHelper, ime});
   const preview = createSharePreview({chromePath: wechatConfig.chromePath || undefined, chromeExplicit: wechatConfig.chromeExplicit === true,
-    profileDir: join(stateDir, 'chrome-preview')});
+    profileDir: join(stateDir, 'chrome-preview'), onDiagnostic: entry => recordDiagnostic(store, entry)});
   return combineRunnerDevices({douyin, wechat, articles, preview, ocr, store});
 }
 
@@ -41,6 +41,7 @@ export function combineRunnerDevices({douyin, wechat, articles, preview, ocr, st
   const readiness = createOcrReadiness({ocr, now, onDiagnostic: entry =>
     recordDiagnostic(store, {at: new Date(now()).toISOString(), ...entry})});
   readiness.start();
+  preview.start?.();
   const adapters = {[PLATFORMS.douyin]: douyin, [PLATFORMS.wechat]: wechat, [PLATFORMS.articles]: articles};
   return {
     multiPlatform: true,
@@ -48,7 +49,9 @@ export function combineRunnerDevices({douyin, wechat, articles, preview, ocr, st
     forPlatform: platform => adapters[platform ?? PLATFORMS.douyin] ?? null,
     setTaskActive: value => readiness.setTaskActive(value),
     async prepareTask({platform, signal}) {
-      if ([PLATFORMS.wechat, PLATFORMS.articles].includes(platform)) await readiness.ensureReady({signal});
+      if ([PLATFORMS.wechat, PLATFORMS.articles].includes(platform)) {
+        await Promise.all([readiness.ensureReady({signal}), preview.prepare?.({signal})]);
+      }
     },
     /** Readiness per app; the phone is ready when at least one app is. The Douyin reading keeps its fields. */
     async probe({signal} = {}) {
@@ -58,7 +61,7 @@ export function combineRunnerDevices({douyin, wechat, articles, preview, ocr, st
       const ocrState = readiness.status();
       for (const platform of [PLATFORMS.wechat, PLATFORMS.articles]) {
         results[platform] = !ocrState.readyForSearch ? ocrState : !preview.available()
-          ? {readyForSearch: false, reason: 'preview_unavailable'} : await adapters[platform].probe({signal});
+          ? preview.status?.() ?? {readyForSearch: false, reason: 'preview_unavailable'} : await adapters[platform].probe({signal});
       }
       const platforms = Object.keys(results).filter(key => results[key].readyForSearch === true);
       const first = results[PLATFORMS.douyin] ?? results[PLATFORMS.wechat];

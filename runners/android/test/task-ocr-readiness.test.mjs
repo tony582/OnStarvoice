@@ -5,7 +5,7 @@ import {AndroidDaemon} from '../src/daemon/runtime.mjs';
 import {RunnerStore} from '../src/storage/runner-store.mjs';
 import {BudgetLedger} from '../src/core/budget.mjs';
 import {DeviceClosureJournal, readDeviceClosure} from '../src/core/device-closure.mjs';
-import {readDiagnostics} from '../src/core/diagnostics.mjs';
+import {readDiagnostics, recordDiagnostic} from '../src/core/diagnostics.mjs';
 import {fixtureClock, fixtureDevice, fixturePermit, fixtureTask} from './core-fixtures.mjs';
 
 const platforms = ['wechat_channels', 'wechat_articles'];
@@ -114,6 +114,26 @@ test('a warmup failure completes normally without phone actions and keeps detail
     assert.deepEqual(phone.calls, []); assert.deepEqual(activity, [true, false]);
   } finally { store.close(); }
 });
+
+for (const platform of platforms) {
+  test(`${platform}: browser preparation failure retains its reason without adding misleading OCR diagnostics`, async () => {
+    const store = new RunnerStore(':memory:');
+    try {
+      const clock = fixtureClock(), task = makeTask(platform), phone = emptyPhone(clock);
+      recordDiagnostic(store, {event: 'preview_browser_selfcheck_failed', code: 'preview_selfcheck_timeout', fallback: false});
+      const before = readDiagnostics(store);
+      const {device} = runnerDevice(phone.adapter, async () => {
+        throw Object.assign(new Error('preview unavailable'), {code: 'preview_browser_selfcheck_failed'});
+      });
+      for (let i = 0; i < 2; i++) {
+        const result = await runClaimedTask({task, device, store, clock, permit: fixturePermit(task, clock)});
+        assert.equal(result.status, 'needs_action'); assert.equal(result.reason, 'preview_browser_selfcheck_failed');
+        assert.deepEqual(result.details, {operation: 'preview_prepare'}); assert.equal(result.deviceIdle, true);
+      }
+      assert.deepEqual(readDiagnostics(store), before); assert.deepEqual(phone.calls, []);
+    } finally { store.close(); }
+  });
+}
 
 for (const reason of ['user_stop', 'remote_stop', 'lease_expired']) {
   test(`a ${reason} during preparation preserves the unclosed action without moving or closing the phone`, async () => {

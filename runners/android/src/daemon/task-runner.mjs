@@ -35,13 +35,15 @@ export async function runClaimedTask({task, device, store, permit, clock = DEFAU
         const code = permit.signal.aborted ? permit.signal.reason?.code || 'aborted' : fault.code;
         const canceled = ['user_stop', 'operator_takeover', 'remote_stop'].includes(code);
         const interrupted = ['lease_expired', 'usb_disconnected', 'aborted'].includes(code);
+        const previewFailure = code?.startsWith('preview_') === true;
         // A failed preflight must not park/close the phone or clear an earlier unconfirmed operation.
         const deviceClosure = readDeviceClosure(store, task.deviceId);
-        recordDiagnostic(store, {event: 'ocr_warmup_failed', runId: task.identity.discoveryRunId,
+        if (!previewFailure) recordDiagnostic(store, {event: 'ocr_warmup_failed', runId: task.identity.discoveryRunId,
           itemId: task.identity.itemId, at: new Date(clock.wallNow()).toISOString(), code: code || 'ocr_unavailable',
           message: error.message, details: error.details});
         return {status: canceled ? 'canceled' : interrupted ? 'interrupted' : 'needs_action',
-          reason: canceled || interrupted ? code : 'ocr_unavailable', details: {operation: 'ocr_warmup'},
+          reason: canceled || interrupted || previewFailure ? code : 'ocr_unavailable',
+          details: {operation: previewFailure ? 'preview_prepare' : 'ocr_warmup'},
           stats: null, deviceIdle: !deviceClosure?.required, stopConfirmationRequired: Boolean(deviceClosure?.required),
           deviceClosure, pendingEvents: store.pendingCount()};
       }
