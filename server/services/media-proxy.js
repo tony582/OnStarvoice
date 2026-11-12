@@ -10,7 +10,8 @@
  *  历史记录直链失效后上游会 403，本模块会原样把失败透传给前端提示。
  */
 
-import { Readable } from 'node:stream';
+import {pipeline} from 'node:stream/promises';
+import {withSafeMediaDownload} from './safe-media-download.js';
 
 const BROWSER_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
@@ -199,84 +200,53 @@ function encodeContentDisposition(filename) {
  *
  * inline=true 用于后台 <video> 直接播放：不加「下载附件」头，并把浏览器的 Range 请求原样转给上游、
  * 把 206 / Content-Range 原样回传——Safari 不支持分段就不播，Chrome 没有分段就拖不了进度条。
- * timeoutMs 只限制「等上游响应头」和「多久没有新数据」，不限制总时长，否则长视频播到一半会被切断。
+ * 下载的 timeoutMs 覆盖整个响应体；inline 播放只限制空闲等待，以免正常长视频被总时长截断。
+ * 两种模式都逐跳校验目标、限制实际传输字节数，并在断流时中止上游。
  */
 export async function streamMediaToResponse({ url, filename, platform, res, range = '', inline = false, timeoutMs = 60000 }) {
-  const controller = new AbortController();
-  let timer = setTimeout(() => controller.abort(), timeoutMs);
-  const touch = () => {
-    clearTimeout(timer);
-    timer = setTimeout(() => controller.abort(), timeoutMs);
-  };
   try {
-    const referer = resolveReferer(url, platform);
     const requestedRange = /^bytes=\d*-\d*(,\s*\d*-\d*)*$/.test(String(range || '').trim()) ? String(range).trim() : '';
-    const upstream = await fetch(url, {
-      redirect: 'follow',
-      signal: controller.signal,
-      headers: {
-        'User-Agent': BROWSER_UA,
-        Accept: '*/*',
-        ...(referer ? { Referer: referer } : {}),
-        ...(requestedRange ? { Range: requestedRange } : {}),
-      },
-    });
-
-    if (!upstream.ok || !upstream.body) {
-      clearTimeout(timer);
-      if (upstream.status === 416) {
-        const total = upstream.headers.get('content-range');
-        if (total) res.setHeader('Content-Range', total);
-        return res.status(416).end();
+    return await withSafeMediaDownload({
+      url, isAllowedUrl: isAllowedMediaHost, timeoutMs, timeoutMode: inline ? 'idle' : 'total',
+      headers: current => ({
+        'User-Agent': BROWSER_UA, Accept: '*/*',
+        ...(resolveReferer(current, platform) ? {Referer: resolveReferer(current, platform)} : {}),
+        ...(requestedRange ? {Range: requestedRange} : {}),
+      }),
+    }, async ({response: upstream, stream, abort}) => {
+      if (!upstream.ok || !stream) {
+        if (upstream.status === 416) {
+          const total = upstream.headers.get('content-range');
+          if (total) res.setHeader('Content-Range', total);
+          return res.status(416).end();
+        }
+        return res.status(502).json({
+          ok: false, error: 'upstream_failed', status: upstream.status,
+          message: upstream.status === 403 ? '上游拒绝访问，直链可能已过期或被防盗链拦截' : `上游返回 ${upstream.status}`,
+        });
       }
-      return res.status(502).json({
-        ok: false,
-        error: 'upstream_failed',
-        status: upstream.status,
-        message:
-          upstream.status === 403
-            ? '上游拒绝访问，直链可能已过期或被防盗链拦截'
-            : `上游返回 ${upstream.status}`,
-      });
-    }
-
-    res.status(upstream.status === 206 ? 206 : 200);
-    res.setHeader('Content-Type', upstream.headers.get('content-type') || 'application/octet-stream');
-    const len = upstream.headers.get('content-length');
-    if (len) res.setHeader('Content-Length', len);
-    const contentRange = upstream.headers.get('content-range');
-    if (upstream.status === 206 && contentRange) res.setHeader('Content-Range', contentRange);
-    const acceptRanges = upstream.headers.get('accept-ranges');
-    if (acceptRanges) res.setHeader('Accept-Ranges', acceptRanges);
-    else if (upstream.status === 206) res.setHeader('Accept-Ranges', 'bytes');
-    if (!inline) res.setHeader('Content-Disposition', encodeContentDisposition(filename));
-    res.setHeader('Cache-Control', 'no-store');
-
-    touch();
-    const nodeStream = Readable.fromWeb(upstream.body);
-    nodeStream.on('data', touch);
-    nodeStream.on('error', () => {
-      clearTimeout(timer);
-      if (!res.headersSent) res.status(502).end();
-      // 已经开始回传时中途断了：直接断开连接，别用 end() 假装发完——
-      // 客户端会一直等声明长度里剩下的字节；断开后播放器会自己按 Range 重新请求。
-      else res.destroy();
+      res.status(upstream.status === 206 ? 206 : 200);
+      res.setHeader('Content-Type', upstream.headers.get('content-type') || 'application/octet-stream');
+      const len = upstream.headers.get('content-length');
+      if (len) res.setHeader('Content-Length', len);
+      const contentRange = upstream.headers.get('content-range');
+      if (upstream.status === 206 && contentRange) res.setHeader('Content-Range', contentRange);
+      const acceptRanges = upstream.headers.get('accept-ranges');
+      if (acceptRanges) res.setHeader('Accept-Ranges', acceptRanges);
+      else if (upstream.status === 206) res.setHeader('Accept-Ranges', 'bytes');
+      if (!inline) res.setHeader('Content-Disposition', encodeContentDisposition(filename));
+      res.setHeader('Cache-Control', 'no-store');
+      const onClose = () => { if (!res.writableFinished) abort(); };
+      res.once('close', onClose);
+      try { await pipeline(stream, res); }
+      finally { res.removeListener('close', onClose); }
     });
-    res.on('close', () => {
-      clearTimeout(timer);
-      controller.abort();
-      nodeStream.destroy();
-    });
-    nodeStream.pipe(res);
-    nodeStream.on('end', () => clearTimeout(timer));
-  } catch (err) {
-    clearTimeout(timer);
-    if (res.headersSent) return res.end();
-    const aborted = err?.name === 'AbortError';
-    return res.status(aborted ? 504 : 502).json({
-      ok: false,
-      error: aborted ? 'upstream_timeout' : 'proxy_error',
-      message: aborted ? '下载超时' : err.message,
+  } catch (error) {
+    if (res.headersSent || res.destroyed) { res.destroy(); return; }
+    const aborted = error.code === 'upstream_timeout' || error.name === 'AbortError';
+    return res.status(error.status || (aborted ? 504 : 502)).json({
+      ok: false, error: error.code || (aborted ? 'upstream_timeout' : 'proxy_error'),
+      message: error.code === 'too_large' ? '文件超过下载大小上限' : aborted ? '下载超时' : '媒体下载失败',
     });
   }
 }

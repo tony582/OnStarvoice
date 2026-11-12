@@ -12,12 +12,12 @@ import { rename, unlink, readFile, stat } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { join, dirname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { queryOne, queryAll, execute } from '../db/query.js';
 import { resolveReferer, isAllowedMediaHost } from './media-proxy.js';
 import { runProcessBackgroundWork } from '../runtime/process-background-work.js';
 import {inspectWechatImage, WECHAT_IMAGE_MAX_BYTES} from './wechat-image-validation.js';
+import {withSafeMediaDownload} from './safe-media-download.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // server 在 /opt/onstarvoice/server,上两级 + media = /opt/onstarvoice/media(rsync 不碰)
@@ -43,73 +43,39 @@ export async function downloadImage(url, key, platform, targetDir, publicDir, on
   if (!url || !/^https?:\/\//i.test(url) || !isAllowedMediaHost(url)) return null;
   const article = platform === 'wechat_articles';
   const channels = platform === 'wechat_channels';
-  const guarded = article || channels;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 20000);
   let tempPath = '';
-  let overflowBytes = 0;
   try {
-    let current = url, resp;
-    for (let redirects = 0; redirects <= 3; redirects++) {
-      if (guarded) {
-        const parsed = new URL(current);
-        if (!['https:', 'http:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.port || !isAllowedMediaHost(current)) return null;
+    return await withSafeMediaDownload({
+      url, isAllowedUrl: isAllowedMediaHost, timeoutMs: 20000, maxBytes: MAX_BYTES,
+      headers: current => ({'User-Agent': BROWSER_UA, Accept: 'image/*,*/*',
+        ...(resolveReferer(current, platform) ? {Referer: resolveReferer(current, platform)} : {})}),
+    }, async ({response: resp, stream}) => {
+      if (!resp.ok || !stream) {
+        if (channels && [400, 403].includes(resp.status)) onFailure?.({code: 'upstream_rejected', httpStatus: resp.status});
+        return null;
       }
-      const referer = resolveReferer(current, platform);
-      resp = await fetch(current, {
-        redirect: guarded ? 'manual' : 'follow', signal: controller.signal,
-        headers: { 'User-Agent': BROWSER_UA, Accept: 'image/*,*/*', ...(referer ? { Referer: referer } : {}) },
-      });
-      if (!guarded || resp.status < 300 || resp.status >= 400) break;
-      const location = resp.headers.get('location');
-      await resp.body?.cancel();
-      if (!location || redirects === 3) return null;
-      current = new URL(location, current).toString();
-    }
-    if (!resp.ok || !resp.body) {
-      if (channels && [400, 403].includes(resp.status)) onFailure?.({code: 'upstream_rejected', httpStatus: resp.status});
-      await resp.body?.cancel();
-      return null;
-    }
-    const type = (resp.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
-    const ext = EXT_BY_TYPE[type];
-    if (!ext) return null; // 非图片(可能是 403 的 html 错误页)
-    const len = Number(resp.headers.get('content-length') || 0);
-    if (len && len > MAX_BYTES) {
-      if (article && Number.isSafeInteger(len)) {
-        onFailure?.({code: 'too_large', maxBytes: WECHAT_IMAGE_MAX_BYTES, observedBytes: len, source: 'content_length'});
-        await resp.body.cancel();
-      }
-      return null;
-    }
-    ensureMediaDirs();
-    const filename = `${key}.${ext}`;
-    const targetPath = join(targetDir, filename);
-    tempPath = `${targetPath}.${process.pid}.${guarded ? randomUUID() : Date.now()}.part`;
-    if (guarded) {
-      let received = 0;
-      const bounded = new Transform({transform(chunk, encoding, done) {
-        received += chunk.length;
-        if (received > WECHAT_IMAGE_MAX_BYTES) overflowBytes = received;
-        done(received > WECHAT_IMAGE_MAX_BYTES ? new Error('wechat_image_too_large') : null, chunk);
-      }});
-      await pipeline(Readable.fromWeb(resp.body), bounded, createWriteStream(tempPath));
+      const type = (resp.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+      const ext = EXT_BY_TYPE[type];
+      if (!ext) return null;
+      ensureMediaDirs();
+      const filename = `${key}.${ext}`;
+      const targetPath = join(targetDir, filename);
+      tempPath = `${targetPath}.${process.pid}.${randomUUID()}.part`;
+      await pipeline(stream, createWriteStream(tempPath));
       if (article) {
         const verified = inspectWechatImage(await readFile(tempPath), onFailure);
         if (!verified || verified.mime !== (type === 'image/jpg' ? 'image/jpeg' : type)) return null;
       }
-    } else await pipeline(Readable.fromWeb(resp.body), createWriteStream(tempPath));
-    await rename(tempPath, targetPath);
-    tempPath = '';
-    return `/media/${publicDir}/${filename}`;
-  } catch {
-    if (article && overflowBytes > WECHAT_IMAGE_MAX_BYTES) onFailure?.({code: 'too_large', maxBytes: WECHAT_IMAGE_MAX_BYTES,
-      observedBytes: overflowBytes, source: 'stream'});
+      await rename(tempPath, targetPath);
+      tempPath = '';
+      return `/media/${publicDir}/${filename}`;
+    });
+  } catch (error) {
+    if (article && error.code === 'too_large') onFailure?.({code: 'too_large', maxBytes: WECHAT_IMAGE_MAX_BYTES,
+      observedBytes: error.observedBytes, source: error.source});
     return null;
   } finally {
-    if (guarded) controller.abort();
     if (tempPath) await unlink(tempPath).catch(() => {});
-    clearTimeout(timer);
   }
 }
 

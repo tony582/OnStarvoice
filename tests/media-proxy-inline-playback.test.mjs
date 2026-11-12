@@ -66,7 +66,7 @@ function proxy(upstreamBase, { timeoutMs } = {}) {
     res.json = body => { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(body)); return res; };
     const url = new URL(req.url, 'http://proxy.local');
     streamMediaToResponse({
-      url: upstreamBase + url.pathname,
+      url: 'https://p3.douyinvod.com' + url.pathname,
       filename: 'clip.mp4',
       platform: 'douyin',
       res,
@@ -81,9 +81,15 @@ async function withServers(options, run) {
   const seen = [];
   const upstream = await videoUpstream(seen);
   const front = await proxy(upstream.base, options);
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = (url, init) => {
+    const parsed = new URL(String(url));
+    return previousFetch(parsed.origin === 'https://p3.douyinvod.com' ? upstream.base + parsed.pathname : url, init);
+  };
   try {
     await run({ base: front.base, seen });
   } finally {
+    globalThis.fetch = previousFetch;
     front.server.closeAllConnections?.();
     upstream.server.closeAllConnections?.();
     await new Promise(resolve => front.server.close(resolve));
@@ -140,6 +146,17 @@ test('a stream that keeps sending data is not cut off by the timeout', async () 
     const resp = await fetch(`${base}/slow?inline=1`);
     assert.equal(resp.status, 200);
     assert.equal(Buffer.from(await resp.arrayBuffer()).toString(), BODY.toString());
+  });
+});
+
+test('a slow download is bounded by its total body deadline even while data keeps arriving', async () => {
+  await withServers({ timeoutMs: 120 }, async ({ base }) => {
+    const startedAt = Date.now();
+    const resp = await fetch(`${base}/slow`);
+    assert.equal(resp.status, 200);
+    const body = await resp.arrayBuffer().then(buffer => Buffer.from(buffer).toString(), () => null);
+    assert.notEqual(body, BODY.toString());
+    assert.ok(Date.now() - startedAt < 3000);
   });
 });
 

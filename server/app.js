@@ -6,7 +6,7 @@ import { dirname, join } from 'path';
 import { sendTestEmail } from './services/email-notifier.js';
 import { labelPendingRecords } from './services/ai-labeler.js';
 import { generateDailyReport, generateWeeklyReport, generateMonthlyReport } from './services/report-generator.js';
-import { requireAdmin } from './middleware/auth.js';
+import { requireAdmin, requireUser } from './middleware/auth.js';
 import { isDbCapacityError } from './db/query.js';
 
 import authRouter from './routes/auth.js';
@@ -184,7 +184,7 @@ export function createApp({ corsOrigins, health, healthProvider, logger = consol
   app.use('/api/keyword-opportunity', keywordOpportunityRouter);
   app.use('/api/benchmark-discovery', benchmarkDiscoveryRouter);
   app.use('/api/content', contentRouter);
-  app.use('/api/img', imageProxyRouter);
+  app.use('/api/img', requireUser, imageProxyRouter);
   app.use('/api/tickets', ticketsRouter);
   app.use('/api/feedback', feedbackRouter);
   app.use('/api/custom-tags', customTagsRouter);
