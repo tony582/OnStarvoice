@@ -145,7 +145,8 @@ export async function runWechatTask({task, store, device, permit, preview, clock
           continue;
         }
         emptyPages = 0;
-        const skip = await decide(fresh);
+        const eligible = windowHours === null ? fresh : fresh.filter(card => !(card.age?.minHours > windowHours));
+        const skip = await decide(eligible);
         const card = fresh[0];
         const screen = trace.screens;
         seen.push(card);
@@ -153,7 +154,7 @@ export async function runWechatTask({task, store, device, permit, preview, clock
         if (windowHours !== null && card.age && card.age.minHours > windowHours) {
           older++;
           stats.outsideWindow++;
-          trace.record(card, 'old_card', {source: 'list'}, screen);
+          trace.record(card, 'outside_window', {source: 'list'}, screen);
           continue;
         }
         // Unknown list age must break an old-card streak too. A confirmed preview may start a new streak.

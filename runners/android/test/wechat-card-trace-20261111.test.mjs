@@ -47,7 +47,7 @@ test('two old cards followed by a new card remain collectable; three old cards o
     assert.equal(f.result.stats.cardsSeen, 6);
     assert.equal(f.result.stats.outsideWindow, 5);
     assert.equal(f.result.stats.opened, 1);
-    assert.ok(f.notes.some(n => n.disposition === 'old_card' && n.author === '作者旧5'));
+    assert.ok(f.notes.some(n => n.disposition === 'outside_window' && n.author === '作者旧5'));
   } finally {f.store.close();}
 });
 
@@ -71,7 +71,7 @@ test('exact preview ages also wait until the screen is exhausted before stopping
   try {
     assert.deepEqual(f.opened, ['网页旧1', '网页旧2', '网页旧3', '新']);
     assert.equal(f.result.stats.posts, 1);
-    assert.equal(f.notes.filter(n => n.disposition === 'outside_window').length, 3);
+    assert.equal(f.notes.filter(n => n.disposition === 'outside_window' && n.source === 'preview').length, 3);
   } finally {f.store.close();}
 });
 
@@ -129,7 +129,7 @@ test('card diagnostics retain screen counts and all local dispositions, while st
   const f = await collect([[skip, bad, ok], [old(1), old(2), old(3)]], {failOpen: bad.snippet,
     prefilter: () => ({enabled: true, decide: async () => ({skip: new Set([skip.cardKey]), judged: 3, unjudged: 0})})});
   try {
-    for (const disposition of ['prefilter_skip', 'open_failed', 'opened', 'duplicate', 'old_card']) assert.ok(f.notes.some(n => n.disposition === disposition), disposition);
+    for (const disposition of ['prefilter_skip', 'open_failed', 'opened', 'duplicate', 'outside_window']) assert.ok(f.notes.some(n => n.disposition === disposition), disposition);
     assert.ok(f.notes.some(n => n.event === 'screen' && n.rawOcrRows === 17 && n.parsedCards === 3));
     assert.ok(f.notes.some(n => n.event === 'card' && n.keyword === '安吉星' && n.timeLabel && n.age && n.screen > 0));
     assert.ok(Object.values(f.result.stats).every(value => typeof value === 'number'));
@@ -156,4 +156,19 @@ test('the 3000-entry local card ring overwrites its oldest entries without displ
     assert.equal(entries.at(-2).event, 'screen'); assert.equal(entries.at(-1).disposition, 'opened');
     assert.deepEqual(readDiagnostics(store), [{event: 'keep_failure'}]);
   } finally {store.close();}
+});
+
+
+test('outside-window list cards never enter AI prefilter while unknown age is still judged',async()=>{
+  const judged=[];
+  const f=await collect([[old(1),old(2),card('范围内'),card('年龄未知',null)], [old(3),old(4),old(5)]],{
+    prefilter:()=>({enabled:true,decide:async cards=>{judged.push(...cards);return {skip:new Set(cards.map(c=>c.cardId)),judged:cards.length,unjudged:0};}}),
+  });
+  try {
+    assert.deepEqual(judged.map(c=>c.title),['范围内','年龄未知']);
+    assert.equal(f.result.stats.prefilterJudged,2);assert.equal(f.result.stats.prefilterSkipped,2);
+    assert.equal(f.result.stats.outsideWindow,5);assert.equal(f.result.stats.cardsSeen,7);
+    assert.equal(f.notes.filter(n=>n.disposition==='outside_window'&&n.source==='list').length,5);
+    assert.equal(f.result.reason,'publish_window_end');
+  } finally {f.store.close();}
 });

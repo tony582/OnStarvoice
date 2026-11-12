@@ -348,3 +348,15 @@ test('recovery counts an article committed just before the link checkpoint and d
   assert.throws(() => recovered.assertAllowed(), {code: 'budget_exhausted'});
   store.close();
 });
+
+
+test('article prefilter excludes known old cards but retains in-window and unknown ages',async()=>{
+  const cards=[{cardKey:'old',snippet:'旧文章',age:{minHours:48}}, {cardKey:'new',snippet:'新文章',age:{minHours:1}},
+    {cardKey:'unknown',snippet:'未知时间'}, {cardKey:'old2',snippet:'旧文章二',age:{minHours:72}}, {cardKey:'old3',snippet:'旧文章三',age:{minHours:96}}];
+  const seen=[],p=phone({cards});
+  const {result}=await run({device:p.device,prefilter:()=>({enabled:true,decide:async input=>{seen.push(...input);return {skip:new Set(input.map(c=>c.cardId)),judged:input.length,unjudged:0};}})});
+  assert.deepEqual(seen.map(c=>c.title),['新文章','未知时间']);
+  assert.equal(result.stats.prefilterJudged,2);assert.equal(result.stats.prefilterSkipped,2);
+  assert.equal(result.stats.outsideWindow,3);assert.equal(p.calls.filter(c=>c.name==='openCard').length,0);
+  assert.equal(result.reason,'publish_window_end');
+});

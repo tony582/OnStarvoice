@@ -157,9 +157,11 @@ export async function runWechatArticleTask({task, store, device, permit, clock =
           ledger.beforeSwipe(); await call('scroll'); cards = await call('readCards'); continue;
         }
         emptyPages = 0;
-        const skip = await decide(fresh), card = fresh[0];
+        const eligible = hours === null ? fresh : fresh.filter(card => !(card.age?.minHours > hours));
+        const skip = await decide(eligible), card = fresh[0];
         seen.add(card.cardKey); rank++;
         if (hours !== null && card.age?.minHours > hours) {
+          stats.outsideWindow++;
           if (++old >= 2) { result = {status: 'completed', reason: 'publish_window_end'}; break; }
           continue;
         }
