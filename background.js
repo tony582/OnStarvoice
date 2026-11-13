@@ -280,6 +280,7 @@ const contentRelayHeartbeatByRequestId = new Map();
 // 的采集活动是谁发起的。纯内存：SW 重启会清空它，同时也终止了它登记的全部
 // 中继 promise；重启前留在页面里的处理函数因无法追溯，按“无法归属”处理。
 const inFlightContentRelays = new Map();
+const abortedContentCancels = new Map();
 let inFlightContentRelaySequence = 0;
 const abortedCaptureRequestIds = new Map();
 const settledCaptureRequestIds = new Map();
@@ -11345,7 +11346,7 @@ async function stopStopFenceOwnedContentCapture(tabId, activeRequests, ctx) {
   ctx.scopedCancelSent = true;
   try {
     await withStopFenceTimeout(
-      () =>
+      () => abortedContentCancels.get(captureIds[0])?.get(tabId) ||
         chrome.tabs.sendMessage(
           tabId,
           {action: 'cancelCapture', captureRequestId: captureIds[0]},
@@ -19721,6 +19722,7 @@ function pruneExpiredCaptureRequestAborts(now = Date.now()) {
   for (const [requestId, abortedAt] of abortedCaptureRequestIds.entries()) {
     if (now - Number(abortedAt || 0) >= CAPTURE_REQUEST_ABORT_TTL_MS) {
       abortedCaptureRequestIds.delete(requestId);
+      abortedContentCancels.delete(requestId);
     }
   }
 }
@@ -19731,6 +19733,13 @@ function markCaptureRequestAborted(requestId) {
   const now = Date.now();
   pruneExpiredCaptureRequestAborts(now);
   abortedCaptureRequestIds.set(normalized, now);
+  for (const relay of findRelaysByCaptureRequestId(normalized)) {
+    if (!relay.rejectAbort) continue;
+    void cancelAbortedContentCapture(relay.tabId, normalized);
+    relay.rejectAbort(createContentRelayWatchdogError(
+      'CAPTURE_CANCELED', '用户已取消当前采集任务',
+    ));
+  }
   return true;
 }
 
@@ -19944,7 +19953,7 @@ async function clearStoredCaptureProgress({
   });
 }
 
-async function sendContentMessageWithTimeout(tabId, payload, timeoutMs) {
+async function sendContentMessageWithTimeout(tabId, payload, timeoutMs, abort = null) {
   const requestId = beginContentRelayHeartbeat(payload);
   const inactivityTimeoutMs = requestId
     ? CONTENT_RELAY_INACTIVITY_TIMEOUT_MS
@@ -19955,6 +19964,7 @@ async function sendContentMessageWithTimeout(tabId, payload, timeoutMs) {
 
   try {
     return await Promise.race([
+      ...(abort ? [abort] : []),
       chrome.tabs.sendMessage(tabId, payload ?? {}),
       new Promise((_, reject) => {
         const checkWatchdog = () => {
@@ -20093,6 +20103,20 @@ async function cancelTimedOutContentCapture(tabId, captureRequestId = '') {
   } catch {
     // The timed-out page may already have lost its content-script receiver.
   }
+}
+
+function cancelAbortedContentCapture(tabId, requestId) {
+  if (!requestId) return cancelTimedOutContentCapture(tabId);
+  let tabs = abortedContentCancels.get(requestId);
+  if (!tabs) {
+    tabs = new Map();
+    abortedContentCancels.set(requestId, tabs);
+  }
+  if (!tabs.has(tabId)) {
+    // Store the promise before dispatch to deduplicate reentrant callers.
+    tabs.set(tabId, Promise.resolve().then(() => cancelTimedOutContentCapture(tabId, requestId)));
+  }
+  return tabs.get(tabId);
 }
 
 async function reloadStalledCaptureTab(tabId, { shouldAbort = null } = {}) {
@@ -20487,6 +20511,7 @@ async function recordUnattendedAttemptRetired(message = {}, sender = {}) {
     at: new Date().toISOString(),
     reason: String(message?.reason || 'attempt_superseded').trim().slice(0, 60),
     heartbeatStopped: message?.heartbeatStopped === true,
+    producerStopTimedOut: message?.producerStopTimedOut === true,
     skippedCount: Number.isSafeInteger(message?.skippedCount) && message.skippedCount >= 0
       ? message.skippedCount : 0,
     permanentFailedCount: Number.isSafeInteger(message?.permanentFailedCount) &&
@@ -20651,9 +20676,16 @@ async function relayToContentWithRetry(tabId, payload, owner = null) {
   const timeoutMs = getContentRelayTimeoutMs(payload);
   const requestId = getCaptureRequestId(payload);
   const inFlightRelayKey = registerInFlightContentRelay(tabId, payload, owner);
-  if (requestId) {
-    settledCaptureRequestIds.delete(requestId);
+  let abort = null;
+  if (requestId && isUnattendedCaptureRelayPayload(payload) &&
+      !isBestEffortContentRelayAction(payload)) {
+    abort = new Promise((_, reject) => {
+      inFlightContentRelays.get(inFlightRelayKey).rejectAbort = reject;
+    });
+    // It can be rejected while the relay is between sends.
+    void abort.catch(() => {});
   }
+  if (requestId) settledCaptureRequestIds.delete(requestId);
   try {
     if (isBestEffortContentRelayAction(payload)) {
       return await sendContentMessageWithTimeout(tabId, payload, timeoutMs);
@@ -20667,12 +20699,16 @@ async function relayToContentWithRetry(tabId, payload, owner = null) {
           tabId,
           payload,
           timeoutMs,
+          abort,
         );
         if (requestId && isCaptureRequestAborted(requestId)) {
           return resolveAbortedCaptureRequest(payload, response);
         }
         return response;
       } catch (error) {
+        if (error?.code === 'CAPTURE_CANCELED' && isCaptureRequestAborted(requestId)) {
+          return resolveAbortedCaptureRequest(payload);
+        }
         if (
           error?.code === 'CONTENT_RELAY_TIMEOUT' ||
           error?.code === 'CONTENT_RELAY_STALLED'
@@ -20721,7 +20757,6 @@ async function relayToContentWithRetry(tabId, payload, owner = null) {
   } finally {
     inFlightContentRelays.delete(inFlightRelayKey);
     if (requestId) {
-      abortedCaptureRequestIds.delete(requestId);
       markCaptureRequestSettled(requestId);
       await clearStoredCaptureProgress({captureRequestId: requestId}).catch(
         () => false,
@@ -25081,7 +25116,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           markCaptureRequestAborted(requestId);
           await writeCaptureCancelingProgress(tabId, requestId).catch(() => null);
         }
-        await cancelTimedOutContentCapture(tabId, requestId);
+        await cancelAbortedContentCapture(tabId, requestId);
         sendResponse({
           ok: true,
           data: {

@@ -1290,6 +1290,7 @@ let lastUnattendedContentProgressFingerprint = "";
 let activeUnattendedStreamingSyncQueue = null;
 let retiredUnattendedAttemptKey = "";
 const UNATTENDED_ATTEMPT_RETIREMENT_FLUSH_MS = 60 * 1000;
+const UNATTENDED_ATTEMPT_PRODUCER_STOP_MS = 120 * 1000;
 const KEYWORD_PLAN_MODES = new Set([
   "daily",
   "custom_dates",
@@ -3293,13 +3294,26 @@ async function retireSupersededUnattendedAttempt({
       pendingUploads: pendingFrom(beforeStats),
       ...settlementCounts(beforeStats),
     });
+    let producerStopped = false;
+    let producerStopTimedOut = false;
+    const producer = Promise.resolve(queue.whenProducerStopped?.()).then(() => {
+      producerStopped = true;
+    });
     const finishFlush = async (stats) => {
       const pending = pendingFrom(stats);
-      const complete = pending === 0 && !stats?.canceled && !stats?.blocked;
+      const complete = producerStopped && pending === 0 && !stats?.canceled && !stats?.blocked;
       const delivered = await sendReceipt({
         flushed: complete, flushing: !complete, pendingUploads: pending,
         ...settlementCounts(stats),
+        producerStopTimedOut,
       });
+      if (!producerStopped) {
+        // A timeout gives visibility and drains saved jobs, but only an
+        // actual producer exit can attest that no more jobs will arrive.
+        void producer.then(() => queue.drain()).then(finishFlush)
+          .catch(() => finishFlush(queue.getStats()));
+        return;
+      }
       // Pending uploads keep draining after a refused receipt; only the
       // receipt itself stops being resent.
       if (!complete || (!delivered && !receiptRefused)) {
@@ -3315,7 +3329,17 @@ async function retireSupersededUnattendedAttempt({
     const drain = (async () => {
       // A canceled capture may still finish saving/enqueuing its last record.
       // A momentarily empty upload queue is not a complete flush.
-      await queue.whenProducerStopped?.();
+      let producerTimeout;
+      try {
+        await Promise.race([producer, new Promise(resolve => {
+          producerTimeout = setTimeout(() => {
+            producerStopTimedOut = true;
+            resolve();
+          }, UNATTENDED_ATTEMPT_PRODUCER_STOP_MS);
+        })]);
+      } finally {
+        clearTimeout(producerTimeout);
+      }
       return await queue.drain();
     })().catch(() => queue.getStats());
     let timeout;
