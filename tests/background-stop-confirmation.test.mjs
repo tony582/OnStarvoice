@@ -22,6 +22,7 @@ const supportSources = await Promise.all(
     "utils/task-center.js",
     "utils/cloud-targeted-post.js",
     "utils/control-storage-reserve.js",
+    "utils/unattended-report-outbox-core.js",
     "utils/manual-keyword-dispatch.js",
     "utils/keyword-source-binding.js",
     "utils/runtime-tab-policy.js",

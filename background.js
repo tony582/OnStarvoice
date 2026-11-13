@@ -32,6 +32,7 @@ importScripts(
   'utils/keyword-source-binding.js',
   'utils/retired-runner-cleanup.js',
   'utils/control-storage-reserve.js',
+  'utils/unattended-report-outbox-core.js',
   'utils/social-account-usage.js',
   'utils/runtime-tab-policy.js',
   'utils/capture/debug-session.js',
@@ -9430,6 +9431,22 @@ function isLegacyUnattendedRunnerTabForRequest(tab, requestId = '') {
 
 // anyAttempt: 统计请求 R 任一轮次的待报行（只比 requestId）。不传时与原来
 // 一样只认精确的 (R, A)。
+async function flushUnattendedCheckpointReportsInBackground(requestId, attemptId = '') {
+  const outbox = globalThis.OnStarvoiceUnattendedCheckpointOutbox;
+  if (!outbox || !requestId) return;
+  try {
+    await outbox.flushUnattendedCheckpointReportOutbox({
+      requestId,
+      attemptId,
+      anyAttempt: !attemptId,
+      send: updateUnattendedKeywordRun,
+    });
+  } catch (error) {
+    // The existing inspections below still fail closed on unreadable storage.
+    console.warn('[StopFence] checkpoint replay failed:', error);
+  }
+}
+
 async function inspectUnattendedCheckpointOutboxAttempt(
   requestId,
   attemptId,
@@ -9660,6 +9677,7 @@ async function closeExactTerminalUnattendedRunnerAfterFlush(request) {
   if (!marker) {
     return {closed: false, reason: 'checkpoint_flush_not_ready'};
   }
+  await flushUnattendedCheckpointReportsInBackground(normalized.id, normalized.attemptId);
   const initialOutbox = await inspectUnattendedCheckpointOutboxAttempt(
     normalized.id,
     normalized.attemptId,
@@ -11717,6 +11735,7 @@ function stopFenceRunnerAttemptId(tab) {
 // 前重读请求槽；按 URL 复核后关闭，再确认已不在。
 async function closeStopFenceRunnerTabs(ctx) {
   return await runUnattendedRunnerTabLifecycle(async () => {
+    await flushUnattendedCheckpointReportsInBackground(ctx.requestId);
     const closedTabIds = [];
     let tabs;
     try {
@@ -12224,6 +12243,9 @@ async function confirmPreviousUnattendedStopForFenceCheck(offer) {
       }
     } else {
       relayInFlightCount = listRequestRelays(ctx.requestId, ctx.taskKey).length;
+    }
+    if (verdict.ok && sweep.runnerPending.length === 0) {
+      await flushUnattendedCheckpointReportsInBackground(ctx.requestId);
     }
     if (verdict.ok && ctx.request?.recoverySelfStop) {
       for (const attemptId of ctx.terminalAttemptIds) {
@@ -13194,6 +13216,16 @@ async function attemptUnattendedRecoverySelfStop(request, intent, {
     }
     if (!verdict.ok) return fail(verdict.reason, {sweep, workers});
     // 第 4 步：旧 runner。
+    await flushUnattendedCheckpointReportsInBackground(ctx.requestId);
+    for (const sourceRequestId of ctx.sourceRequestIds) {
+      await flushUnattendedCheckpointReportsInBackground(sourceRequestId);
+    }
+    const outbox = await inspectUnattendedCheckpointOutboxAttempt(
+      ctx.requestId, '', {anyAttempt: true},
+    );
+    if (!outbox.known || outbox.pendingCount > 0) {
+      return fail('checkpoint_reports_pending', {sweep, workers});
+    }
     const runnerPlan = await planSelfStopRunners(ctx, sweep.runnerPending, {
       tryIndex,
     });
