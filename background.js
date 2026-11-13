@@ -19672,7 +19672,7 @@ function isBestEffortContentRelayAction(payload = {}) {
   return CONTENT_RELAY_BEST_EFFORT_ACTIONS.has(String(payload?.action || ''));
 }
 
-function getContentRelayTimeoutMs(payload = {}) {
+function getContentRelayTimeoutMs(payload = {}, supervisorStallMs = 0) {
   const action = String(payload?.action || '');
   if (
     action === 'ping' ||
@@ -19686,14 +19686,15 @@ function getContentRelayTimeoutMs(payload = {}) {
   }
 
   const requestedDurationMs = Number(payload?.maxDurationMs);
-  if (Number.isFinite(requestedDurationMs) && requestedDurationMs > 0) {
-    return Math.min(
+  const existingTimeout = Number.isFinite(requestedDurationMs) && requestedDurationMs > 0
+    ? Math.min(
       CONTENT_RELAY_MAX_TIMEOUT_MS,
       Math.max(2 * 60 * 1000, requestedDurationMs + 30 * 1000),
-    );
-  }
-
-  return CONTENT_RELAY_DEFAULT_TIMEOUT_MS;
+    )
+    : CONTENT_RELAY_DEFAULT_TIMEOUT_MS;
+  return supervisorStallMs > 0
+    ? Math.min(existingTimeout, supervisorStallMs - 60 * 1000)
+    : existingTimeout;
 }
 
 function normalizeCaptureProgress(progress = null, senderTabId = null) {
@@ -19824,7 +19825,7 @@ function resolveAbortedCaptureRequest(payload = {}, response = null) {
   );
 }
 
-function beginContentRelayHeartbeat(payload = {}) {
+function beginContentRelayHeartbeat(payload = {}, requireBusinessProgress = false) {
   // cancelCapture carries the target request id for request-scoped cancellation,
   // but it must not replace/delete the heartbeat owned by the in-flight capture.
   if (String(payload?.action || '') === 'cancelCapture') return '';
@@ -19834,6 +19835,9 @@ function beginContentRelayHeartbeat(payload = {}) {
   contentRelayHeartbeatByRequestId.set(requestId, {
     updatedAt: now,
     phase: 'request_started',
+    requireBusinessProgress,
+    counts: {},
+    noteIds: new Set(),
   });
   return requestId;
 }
@@ -19843,10 +19847,32 @@ function markContentRelayHeartbeat(progress = {}) {
   if (!requestId || !contentRelayHeartbeatByRequestId.has(requestId)) {
     return;
   }
-  contentRelayHeartbeatByRequestId.set(requestId, {
-    updatedAt: Number(progress?.updatedAt) || Date.now(),
-    phase: String(progress?.phase || ''),
-  });
+  const previous = contentRelayHeartbeatByRequestId.get(requestId);
+  previous.phase = String(progress?.phase || '');
+  if (!previous.requireBusinessProgress) {
+    previous.updatedAt = Number(progress?.updatedAt) || Date.now();
+    return;
+  }
+  if (progress.heartbeatOnly === true) return;
+  let advanced = false;
+  // Search reports detected/qualified/filtered counts; comment scrolling
+  // reports collectedCount. Generic scroll rounds and UI copy aren't data.
+  for (const field of [
+    'detectedCount', 'qualifiedCount', 'filteredCount', 'collectedCount',
+    'savedCount', 'commentsCount', 'loadedCount',
+  ]) {
+    const count = Number(progress[field]);
+    if (Number.isFinite(count) && count > (previous.counts[field] || 0)) {
+      previous.counts[field] = count;
+      advanced = true;
+    }
+  }
+  const noteId = String(progress.currentNoteId || progress.noteId || '').trim();
+  if (noteId && !previous.noteIds.has(noteId) && previous.noteIds.size < 1000) {
+    previous.noteIds.add(noteId);
+    advanced = true;
+  }
+  if (advanced) previous.updatedAt = Date.now();
 }
 
 function createContentRelayWatchdogError(code, message, details = {}) {
@@ -19953,8 +19979,10 @@ async function clearStoredCaptureProgress({
   });
 }
 
-async function sendContentMessageWithTimeout(tabId, payload, timeoutMs, abort = null) {
-  const requestId = beginContentRelayHeartbeat(payload);
+async function sendContentMessageWithTimeout(
+  tabId, payload, timeoutMs, abort = null, requireBusinessProgress = false,
+) {
+  const requestId = beginContentRelayHeartbeat(payload, requireBusinessProgress);
   const inactivityTimeoutMs = requestId
     ? CONTENT_RELAY_INACTIVITY_TIMEOUT_MS
     : 0;
@@ -19977,17 +20005,15 @@ async function sendContentMessageWithTimeout(tabId, payload, timeoutMs, abort = 
             ? now - Number(heartbeat.updatedAt || 0)
             : Number.POSITIVE_INFINITY;
           const networkPauseIsAlive =
-            heartbeat?.phase === 'network_paused' &&
+            !requireBusinessProgress && heartbeat?.phase === 'network_paused' &&
             heartbeatAgeBeforeTickMs <= CONTENT_NETWORK_PAUSE_HEARTBEAT_GRACE_MS;
 
           // 合盖休眠/系统冻结会让定时器整体停摆。唤醒后的大间隔不计入
           // 采集用时，并给原页面一次恢复心跳的机会，而不是立刻误判超时。
           if (tickGapMs > CONTENT_RELAY_SUSPEND_GAP_MS) {
-            if (requestId) {
-              contentRelayHeartbeatByRequestId.set(requestId, {
-                updatedAt: now,
-                phase: 'system_resumed',
-              });
+            if (heartbeat && !requireBusinessProgress) {
+              heartbeat.updatedAt = now;
+              heartbeat.phase = 'system_resumed';
             }
           } else if (!networkPauseIsAlive) {
             activeElapsedMs += tickGapMs;
@@ -20001,7 +20027,7 @@ async function sendContentMessageWithTimeout(tabId, payload, timeoutMs, abort = 
             ? now - Number(latestHeartbeat.updatedAt || 0)
             : 0;
           const latestNetworkPauseIsAlive =
-            latestHeartbeat?.phase === 'network_paused' &&
+            !requireBusinessProgress && latestHeartbeat?.phase === 'network_paused' &&
             heartbeatAgeMs <= CONTENT_NETWORK_PAUSE_HEARTBEAT_GRACE_MS;
 
           if (
@@ -20672,8 +20698,34 @@ async function reconcileRetiredUnattendedRunners() {
   }
 }
 
+async function canReloadUnattendedRelayWorker(tabId, owner) {
+  const owned = (await listOwnedCaptureTabsForRequest(owner.runnerRequestId))
+    .some(entry => entry.tabId === tabId && entry.attemptId === owner.runnerAttemptId);
+  if (!owned) return false;
+  try {
+    const request = await readUnattendedKeywordRunRequest();
+    const lock = await readStoredCaptureExecutionLock();
+    const tab = await chrome.tabs.get(tabId);
+    return request?.id === owner.runnerRequestId &&
+      request.attemptId === owner.runnerAttemptId &&
+      !isTerminalUnattendedRunStatus(request.status) &&
+      ![request.runnerTabId, request.progress?.runnerTabId, lock?.holderTabId]
+        .some(id => Number(id) === tabId) &&
+      isStopFenceContentScriptSiteUrl(tab?.url) && !tab.pendingUrl && !tab.active;
+  } catch {
+    return false;
+  }
+}
+
 async function relayToContentWithRetry(tabId, payload, owner = null) {
-  const timeoutMs = getContentRelayTimeoutMs(payload);
+  const supervised = Boolean(owner?.runnerRequestId && owner?.runnerAttemptId &&
+    isUnattendedCaptureRelayPayload(payload) && !isBestEffortContentRelayAction(payload));
+  const supervisorStallMs = supervised
+    ? payload?.action === 'captureComments'
+      ? UNATTENDED_RUN_COMMENT_STAGE_STALL_MS : UNATTENDED_RUN_BUSINESS_STALL_MS
+    : 0;
+  const timeoutMs = getContentRelayTimeoutMs(payload, supervisorStallMs);
+  const deadlineAt = supervised ? Date.now() + timeoutMs : Infinity;
   const requestId = getCaptureRequestId(payload);
   const inFlightRelayKey = registerInFlightContentRelay(tabId, payload, owner);
   let abort = null;
@@ -20686,11 +20738,26 @@ async function relayToContentWithRetry(tabId, payload, owner = null) {
     void abort.catch(() => {});
   }
   if (requestId) settledCaptureRequestIds.delete(requestId);
+  let deadlineTimer;
+  const deadlineError = () => createContentRelayWatchdogError(
+    'CONTENT_RELAY_TIMEOUT',
+    `页面采集步骤超过 ${Math.ceil(timeoutMs / 1000)} 秒（动作 ${payload?.action || 'unknown'}，阶段 ${contentRelayHeartbeatByRequestId.get(requestId)?.phase || 'unknown'}）`,
+  );
+  const deadline = supervised ? new Promise((_, reject) => {
+    deadlineTimer = setTimeout(() => reject(deadlineError()), timeoutMs);
+  }) : null;
+  const signals = [abort, deadline].filter(Boolean);
+  const awaitStep = (step) => Promise.race([...signals, step]);
+  const isStepOver = () => Date.now() >= deadlineAt || isCaptureRequestAborted(requestId);
+  const stopIfStepOver = () => {
+    if (Date.now() >= deadlineAt) throw deadlineError();
+  };
   try {
     if (isBestEffortContentRelayAction(payload)) {
       return await sendContentMessageWithTimeout(tabId, payload, timeoutMs);
     }
     for (let attempt = 0; attempt < 2; attempt += 1) {
+      stopIfStepOver();
       if (requestId && isCaptureRequestAborted(requestId)) {
         return resolveAbortedCaptureRequest(payload);
       }
@@ -20698,8 +20765,9 @@ async function relayToContentWithRetry(tabId, payload, owner = null) {
         const response = await sendContentMessageWithTimeout(
           tabId,
           payload,
-          timeoutMs,
-          abort,
+          Math.min(timeoutMs, Math.max(1, deadlineAt - Date.now())),
+          signals.length ? Promise.race(signals) : null,
+          supervised,
         );
         if (requestId && isCaptureRequestAborted(requestId)) {
           return resolveAbortedCaptureRequest(payload, response);
@@ -20713,23 +20781,29 @@ async function relayToContentWithRetry(tabId, payload, owner = null) {
           error?.code === 'CONTENT_RELAY_TIMEOUT' ||
           error?.code === 'CONTENT_RELAY_STALLED'
         ) {
-          await cancelTimedOutContentCapture(tabId, requestId);
+          const cancellation = cancelTimedOutContentCapture(tabId, requestId);
+          if (Date.now() >= deadlineAt) throw error;
+          await awaitStep(cancellation);
           if (requestId && isCaptureRequestAborted(requestId)) {
             return resolveAbortedCaptureRequest(payload);
           }
           if (error?.code === 'CONTENT_RELAY_STALLED' && attempt === 0) {
-            await writeContentRelayRecoveryProgress(
+            if (supervised && !await awaitStep(canReloadUnattendedRelayWorker(tabId, owner))) {
+              throw error;
+            }
+            await awaitStep(writeContentRelayRecoveryProgress(
               tabId,
               payload,
               attempt + 1,
-            ).catch(() => null);
+            ).catch(() => null));
             if (requestId && isCaptureRequestAborted(requestId)) {
               return resolveAbortedCaptureRequest(payload);
             }
-            const reloadCompleted = await reloadStalledCaptureTab(tabId, {
-              shouldAbort: () =>
-                Boolean(requestId && isCaptureRequestAborted(requestId)),
-            });
+            stopIfStepOver();
+            const reloadCompleted = await awaitStep(reloadStalledCaptureTab(tabId, {
+              shouldAbort: isStepOver,
+            }));
+            stopIfStepOver();
             if (
               !reloadCompleted ||
               (requestId && isCaptureRequestAborted(requestId))
@@ -20744,17 +20818,23 @@ async function relayToContentWithRetry(tabId, payload, owner = null) {
           throw error;
         }
 
-        await waitForTabReady(tabId).catch(() => null);
+        await awaitStep(waitForTabReady(tabId).catch(() => null));
         if (requestId && isCaptureRequestAborted(requestId)) {
           return resolveAbortedCaptureRequest(payload);
         }
-        await ensureContentScriptReady(tabId);
-        await waitForContentScriptReady(tabId);
+        await awaitStep(ensureContentScriptReady(tabId));
+        await awaitStep(waitForContentScriptReady(tabId));
       }
     }
 
     throw new Error('failed to relay message to content script');
+  } catch (error) {
+    if (error?.code === 'CAPTURE_CANCELED' && isCaptureRequestAborted(requestId)) {
+      return resolveAbortedCaptureRequest(payload);
+    }
+    throw error;
   } finally {
+    clearTimeout(deadlineTimer);
     inFlightContentRelays.delete(inFlightRelayKey);
     if (requestId) {
       markCaptureRequestSettled(requestId);
