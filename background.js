@@ -11459,6 +11459,13 @@ async function evaluateStopFenceTab(candidate, ctx, {rescan = false} = {}) {
       return verdict('request_changed', {platform: 'extension', title});
     }
     if (ctx.isClosableRunnerTab(tab)) {
+      if (tab.discarded === true) {
+        const receipt = await readUnattendedAttemptRetiredReceipt(
+          stopFenceRunnerRequestId(tab) || ctx.requestId, stopFenceRunnerAttemptId(tab),
+        );
+        ctx.runnerGoneWithoutReceipt ||= !isUnattendedRetirementFlushed(receipt);
+        return verdict('tab_discarded', {platform: 'extension', title});
+      }
       return rescan && ctx.selfStop !== true
         ? verdict('runner_close_failed', {platform: 'extension', title})
         : {runnerPending: {tabId, tab}};
@@ -12094,6 +12101,7 @@ function buildStopFenceCheckResult(ctx, {
     pendingTabIds,
     pendingTabs,
     runnerTabsClosed,
+    ...(ctx.runnerGoneWithoutReceipt ? {runnerGoneWithoutReceipt: true} : {}),
     scopedCancelSent: ctx.scopedCancelSent,
     lockReleased: release?.lockReleased === true,
     localLockBoundToRequest: accepted
@@ -12215,6 +12223,15 @@ async function confirmPreviousUnattendedStopForFenceCheck(offer) {
       }
     } else {
       relayInFlightCount = listRequestRelays(ctx.requestId, ctx.taskKey).length;
+    }
+    if (verdict.ok && ctx.request?.recoverySelfStop) {
+      for (const attemptId of ctx.terminalAttemptIds) {
+        const receipt = await readUnattendedAttemptRetiredReceipt(ctx.requestId, attemptId);
+        if (receipt && !isUnattendedRetirementFlushed(receipt) &&
+            await isUnattendedRunnerDocumentGone(receipt.tabId)) {
+          ctx.runnerGoneWithoutReceipt = true;
+        }
+      }
     }
     // 阶段二：阶段一全部成立后才关 R 已终态轮次的 runner，再复扫。
     if (verdict.ok && sweep.runnerPending.length > 0) {
@@ -12785,6 +12802,16 @@ async function closeOwnedDetailWorkersForSelfStop(
 // 第 4 步：旧 runner 只判断、不在这里关。有退役回执的留着（第 5 步之后回执
 // 已是最终回执的当场关，还在冲刷的等它的最终回执到了再关）；最多等 15 秒回执。
 // 没有回执或上传尚未结清时保留页面和锁，后续自动核对继续重试。
+async function isUnattendedRunnerDocumentGone(tabId) {
+  const id = resolveCaptureTaskTabId(tabId);
+  if (!id) return false;
+  try {
+    return (await chrome.tabs.get(id))?.discarded === true;
+  } catch (error) {
+    return isStopFenceMissingTabError(error);
+  }
+}
+
 async function planSelfStopRunners(ctx, runnerPending, {tryIndex = 0} = {}) {
   const runners = runnerPending.map(({tabId, tab}) => ({
     tabId,
@@ -12794,9 +12821,18 @@ async function planSelfStopRunners(ctx, runnerPending, {tryIndex = 0} = {}) {
       [...ctx.terminalAttemptIds][0] || '',
     ),
     receipt: null,
+    gone: false,
   }));
   const readReceipts = async () => {
     for (const runner of runners) {
+      if (runner.gone) continue;
+      if (await isUnattendedRunnerDocumentGone(runner.tabId)) {
+        runner.gone = true;
+        ctx.runnerGoneWithoutReceipt ||= !isUnattendedRetirementFlushed(
+          await readUnattendedAttemptRetiredReceipt(runner.requestId, runner.attemptId),
+        );
+        continue;
+      }
       if (!runner.receipt) {
         runner.receipt = await readUnattendedAttemptRetiredReceipt(
           runner.requestId,
@@ -12804,7 +12840,7 @@ async function planSelfStopRunners(ctx, runnerPending, {tryIndex = 0} = {}) {
         );
       }
     }
-    return runners.every((runner) => runner.receipt);
+    return runners.every((runner) => runner.gone || runner.receipt);
   };
   let allRetired = await readReceipts();
   const waitForReceipts = ctx.mode !== 'recovery' || tryIndex === 0;
@@ -12815,8 +12851,8 @@ async function planSelfStopRunners(ctx, runnerPending, {tryIndex = 0} = {}) {
       allRetired = await readReceipts();
     }
   }
-  const retained = runners.filter((runner) => runner.receipt);
-  const unretired = runners.filter((runner) => !runner.receipt);
+  const retained = runners.filter((runner) => !runner.gone && runner.receipt);
+  const unretired = runners.filter((runner) => !runner.gone && !runner.receipt);
   // 锁的持有文档可能是某个旧轮次的 runner：按轮次读全部退役回执，供第 5 步
   // 核对持有文档是否已退役（它的标签页不一定能按 URL 找到）。
   const receipts = retained.map((runner) => runner.receipt);
@@ -12826,7 +12862,13 @@ async function planSelfStopRunners(ctx, runnerPending, {tryIndex = 0} = {}) {
       ctx.requestId,
       attemptId,
     );
-    if (receipt) receipts.push(receipt);
+    if (!receipt) continue;
+    if (!isUnattendedRetirementFlushed(receipt) &&
+        await isUnattendedRunnerDocumentGone(receipt.tabId)) {
+      ctx.runnerGoneWithoutReceipt = true;
+      continue;
+    }
+    receipts.push(receipt);
   }
   if (unretired.length === 0 && receipts.every(isUnattendedRetirementFlushed)) {
     return {ok: true, retained, receipts, pendingClose: []};
@@ -13203,6 +13245,7 @@ async function attemptUnattendedRecoverySelfStop(request, intent, {
         discardedTabIds: [...ctx.discardedTabIds].slice(0, 20),
         runnerClosed: commit.runnersClosed.length > 0,
         runnerClosedWithoutReceipt: commit.runnersClosed.length > 0,
+        runnerGoneWithoutReceipt: ctx.runnerGoneWithoutReceipt === true,
         runnersRetained: runnerPlan.retained.length,
         retiredRunnersClosed: (commit.retiredRunnersClosed || []).length,
         pendingUploads,
@@ -20444,6 +20487,10 @@ async function recordUnattendedAttemptRetired(message = {}, sender = {}) {
     at: new Date().toISOString(),
     reason: String(message?.reason || 'attempt_superseded').trim().slice(0, 60),
     heartbeatStopped: message?.heartbeatStopped === true,
+    skippedCount: Number.isSafeInteger(message?.skippedCount) && message.skippedCount >= 0
+      ? message.skippedCount : 0,
+    permanentFailedCount: Number.isSafeInteger(message?.permanentFailedCount) &&
+      message.permanentFailedCount >= 0 ? message.permanentFailedCount : 0,
     flushing: message?.flushing === true,
     flushed: message?.flushed === true,
     pendingUploads:

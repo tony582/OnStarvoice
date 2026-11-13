@@ -3278,17 +3278,28 @@ async function retireSupersededUnattendedAttempt({
   //    编排已取消，所以冲刷前先报一次“冲刷中”的回执：后台据此保留本页，不会
   //    在冲刷途中把它当作卡死的 runner 关掉。
   if (queue?.enabled && beforeStats) {
+    const pendingFrom = (stats) => Math.max(0, Number(
+      stats?.retryableFailedCount == null
+        ? stats?.unsettledCount ?? (Number(stats?.remainingCount || 0) + Number(stats?.failedCount || 0))
+        : Number(stats?.remainingCount || 0) + stats.retryableFailedCount,
+    ));
+    const settlementCounts = (stats) => ({
+      skippedCount: Math.max(0, Number(stats?.retirementSkippedCount || 0)),
+      permanentFailedCount: Math.max(0, Number(stats?.permanentFailedCount || 0)),
+    });
     await sendReceipt({
       flushed: false,
       flushing: true,
-      pendingUploads: Math.max(0, Number(beforeStats.remainingCount || 0)),
+      pendingUploads: pendingFrom(beforeStats),
+      ...settlementCounts(beforeStats),
     });
-    const pendingFrom = (stats) => Math.max(0, Number(stats?.unsettledCount ??
-      (Number(stats?.remainingCount || 0) + Number(stats?.failedCount || 0))));
     const finishFlush = async (stats) => {
       const pending = pendingFrom(stats);
       const complete = pending === 0 && !stats?.canceled && !stats?.blocked;
-      const delivered = await sendReceipt({flushed: complete, flushing: !complete, pendingUploads: pending});
+      const delivered = await sendReceipt({
+        flushed: complete, flushing: !complete, pendingUploads: pending,
+        ...settlementCounts(stats),
+      });
       // Pending uploads keep draining after a refused receipt; only the
       // receipt itself stops being resent.
       if (!complete || (!delivered && !receiptRefused)) {
@@ -3314,7 +3325,11 @@ async function retireSupersededUnattendedAttempt({
     clearTimeout(timeout);
     if (!afterStats) {
       void drain.then(finishFlush);
-      return await sendReceipt({flushed: false, flushing: true, pendingUploads: pendingFrom(queue.getStats())});
+      const stats = queue.getStats();
+      return await sendReceipt({
+        flushed: false, flushing: true, pendingUploads: pendingFrom(stats),
+        ...settlementCounts(stats),
+      });
     }
     await finishFlush(afterStats);
     return true;

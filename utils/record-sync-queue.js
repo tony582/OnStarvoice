@@ -55,24 +55,38 @@ export function createRecordSyncQueue({
     excludedCount: 0,
   };
 
-  const getStats = () => ({
-    enabled: queueEnabled,
-    ...stats,
-    pendingCount: pendingJobs.length,
-    activeCount: activeJob ? 1 : 0,
-    remainingCount:
-      pendingJobs.length + (activeJob ? 1 : 0) + dirtyIds.size,
-    activeRecordId: activeJob?.recordId || "",
-    blocked: Boolean(blockedError),
-    error: blockedError,
-    canceled,
-    cancelReason,
-    capturedUniqueCount: capturedIds.size,
-    enqueuedUniqueCount: enqueuedIds.size,
-    excludedUniqueCount: excludedIds.size,
-    succeededUniqueCount: succeededIds.size,
-    unsettledCount: [...enqueuedIds].filter(id => !succeededIds.has(id)).length,
-  });
+  const getStats = () => {
+    let retryableFailedCount = 0;
+    let permanentFailedCount = 0;
+    let retirementSkippedCount = 0;
+    for (const job of failedJobs.values()) {
+      if (pendingIds.has(job.recordId) || activeJob?.recordId === job.recordId) continue;
+      if (job.result?.skipped) retirementSkippedCount += 1;
+      else if (isRetryableResult(job.result, job)) retryableFailedCount += 1;
+      else if (!job.result?.blocked && !job.result?.canceled) permanentFailedCount += 1;
+    }
+    return {
+      enabled: queueEnabled,
+      ...stats,
+      pendingCount: pendingJobs.length,
+      activeCount: activeJob ? 1 : 0,
+      remainingCount:
+        pendingJobs.length + (activeJob ? 1 : 0) + dirtyIds.size,
+      activeRecordId: activeJob?.recordId || "",
+      blocked: Boolean(blockedError),
+      error: blockedError,
+      canceled,
+      cancelReason,
+      capturedUniqueCount: capturedIds.size,
+      enqueuedUniqueCount: enqueuedIds.size,
+      excludedUniqueCount: excludedIds.size,
+      succeededUniqueCount: succeededIds.size,
+      unsettledCount: [...enqueuedIds].filter(id => !succeededIds.has(id)).length,
+      retryableFailedCount,
+      permanentFailedCount,
+      retirementSkippedCount,
+    };
+  };
 
   const stopRequested = () => {
     if (canceled || signal?.aborted === true) {
@@ -218,7 +232,7 @@ export function createRecordSyncQueue({
       result?.skipped ||
       result?.canceled ||
       isCapturePublishWindowExclusion(result) ||
-      syncCancellationState()
+      stopRequested()
     ) {
       return false;
     }
