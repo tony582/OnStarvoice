@@ -88,6 +88,14 @@ export function createRecordSyncQueue({
     };
   };
 
+  const listPendingRecordIds = () => [...new Set([
+    ...pendingIds,
+    ...(activeJob ? [activeJob.recordId] : []),
+    ...dirtyIds,
+    ...[...failedJobs.values()].filter(job => isRetryableResult(job.result, job))
+      .map(job => job.recordId),
+  ])];
+
   const stopRequested = () => {
     if (canceled || signal?.aborted === true) {
       return true;
@@ -445,6 +453,7 @@ export function createRecordSyncQueue({
       return seenIds.has(normalizeRecordId(recordId));
     },
     getStats,
+    listPendingRecordIds,
     countRetryableFailed() {
       let count = 0;
       for (const job of failedJobs.values()) {

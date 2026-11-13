@@ -1337,7 +1337,7 @@ test("a relay still in flight for R, even without a capture id, blocks proof and
 
 // ==================== 两阶段：runner 页 ====================
 
-test("checkpoint rows still pending keep the runner open and release nothing", async () => {
+test("unreplayable checkpoint rows keep the runner open and release nothing", async () => {
   const harness = createHarness();
   seedTypicalFence(harness);
   harness.storage[`${OUTBOX_PREFIX}rev-1`] = {
@@ -1345,7 +1345,7 @@ test("checkpoint rows still pending keep the runner open and release nothing", a
     requestId: REQUEST_ID,
     attemptId: PREVIOUS_ATTEMPT_ID,
     revision: "rev-1",
-    patch: {checkpoint: {completedKeywords: []}},
+    patch: {checkpoint: null},
   };
 
   const result = await runCheck(harness);
@@ -1388,7 +1388,7 @@ test("after two recoveries the runners of every attempt of the terminal request 
   assertCheckSafety(harness, {allowedRemovedTabIds: [30, 31, 32]});
 });
 
-test("an older attempt's runner with checkpoint rows still pending keeps every runner open", async () => {
+test("an older attempt with an unreplayable checkpoint keeps every runner open", async () => {
   const harness = createHarness();
   seedTwoRecoveryRunners(harness);
   harness.storage[`${OUTBOX_PREFIX}rev-0`] = {
@@ -1396,7 +1396,7 @@ test("an older attempt's runner with checkpoint rows still pending keeps every r
     requestId: REQUEST_ID,
     attemptId: "attempt-0",
     revision: "rev-0",
-    patch: {checkpoint: {completedKeywords: []}},
+    patch: {checkpoint: null},
   };
 
   const result = await runCheck(harness);
@@ -2831,6 +2831,7 @@ test("node check drains its two old checkpoints with no runner and leaves anothe
 test("operator confirmation releases a recovery fence without a final retirement receipt", async () => {
   const h = createHarness();
   seedTypicalFence(h);
+  h.storage[LOCK_KEY].holderTabId = 20;
   h.storage[REQUEST_KEY].recoverySelfStop = {fromAttemptId: PREVIOUS_ATTEMPT_ID};
   const result = plain(await h.api.releaseStopFenceLocalResourcesForOperator(
     buildOffer({mode: "release_only", checkId: "release-recovery"}),

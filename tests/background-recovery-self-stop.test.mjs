@@ -2073,7 +2073,7 @@ test("a long ordinary relay shares a five-minute ceiling with its retry", async 
   seedRunningRequest(h);
   const workerId = await createRegisteredWorker(h);
   let attempts = 0;
-  h.addTab({id: workerId, url: "https://www.douyin.com/video/1", content: {
+  h.addTab({id: workerId, url: "https://www.douyin.com/video/1", timeOrigin: freshDocument(), content: {
     onAction(payload) {
       if (payload.action === "ping") return {ok: true};
       attempts += 1;
@@ -2097,7 +2097,7 @@ test("a long ordinary relay shares a five-minute ceiling with its retry", async 
 });
 
 test("forcing an old flushing runner requires ten stagnant minutes and preserves protected tabs", async () => {
-  for (const scenario of ["early", "stagnant", "improving", "focused", "current", "progress", "lock"]) {
+  for (const scenario of ["early", "stagnant", "saved", "unsaved", "improving", "focused", "current", "progress", "lock"]) {
     const clock = createRelayClock();
     const h = createHarness({clock});
     seedRunningRequest(h);
@@ -2107,14 +2107,19 @@ test("forcing an old flushing runner requires ten stagnant minutes and preserves
     const intent = {fromAttemptId: A1, runnerTabId: RUNNER_TAB,
       progressTabId: scenario === "progress" ? RUNNER_TAB : SOURCE_TAB,
       startedAt: new Date(clock.Date.now()).toISOString(), captureRequestIds: [CAPTURE_ID]};
+    const pending = ["saved", "unsaved", "improving"].includes(scenario) ? 1 : 0;
+    h.storage["onstarvoice.auth"] = {captureAgent: {id: "agent-1"}, tenant: {id: "tenant-1"}};
+    h.storage["onstarvoice.data_pool"] = {records: scenario === "saved"
+      ? [{id: "record-1", status: "draft"}] : []};
     const options = {mode: "recovery", tryIndex: 1};
-    await retireRunner(h, A1, {flushing: true, flushed: false, pendingUploads: 0, producerStopped: true});
+    await retireRunner(h, A1, {flushing: true, flushed: false,
+      pendingUploads: pending, producerStopped: true,
+      pendingRecordIds: pending ? ["record-1"] : []});
     const first = await h.api.attemptUnattendedRecoverySelfStop(a2, intent, options);
     assert.equal(first.reason, "checkpoint_reports_pending", scenario);
     await clock.advance(scenario === "early" ? 599000 : 600000);
     if (scenario === "improving") {
-      // A change in a previously known pending count restarts the observation window.
-      await retireRunner(h, A1, {flushing: true, flushed: false, pendingUploads: 1, producerStopped: true});
+      await retireRunner(h, A1, {flushing: true, flushed: false, pendingUploads: 0, producerStopped: true});
     }
     if (scenario === "focused") {
       h.patchTab(RUNNER_TAB, {active: true, lastAccessed: clock.Date.now()});
@@ -2125,10 +2130,16 @@ test("forcing an old flushing runner requires ten stagnant minutes and preserves
     }
     if (scenario === "lock") h.storage[LOCK_KEY].holderTabId = RUNNER_TAB;
     const result = await h.api.attemptUnattendedRecoverySelfStop(a2, intent, options);
-    if (scenario === "stagnant") {
+    if (scenario === "stagnant" || scenario === "saved") {
       assert.equal(result.done?.runnerClosedWithoutReceipt, true);
-      assert.equal(result.done?.abandonedPendingUploads, 0);
+      assert.equal(result.done?.abandonedPendingUploads, pending);
       assert.deepEqual(h.removedTabIds, [RUNNER_TAB]);
+      if (scenario === "saved") {
+        assert.equal(h.storage["onstarvoice.data_pool"].records[0].status, "draft");
+        const handoff = Object.entries(h.storage)
+          .find(([key]) => key.startsWith("onstarvoice.unattendedRunnerUploadHandoff.v1."));
+        assert.deepEqual(plain(handoff?.[1].recordIds), ["record-1"]);
+      }
     } else {
       assert.deepEqual(h.removedTabIds, [], scenario);
     }

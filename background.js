@@ -62,6 +62,7 @@ const STORAGE_KEYS = {
   captureExecutionLock: 'onstarvoice.captureExecutionLock',
   taskLedger: 'onstarvoice.taskLedger',
   syncHistory: 'onstarvoice.sync_history',
+  dataPool: 'onstarvoice.data_pool',
   auth: 'onstarvoice.auth',
   cloudCommandResults: 'onstarvoice.cloudCommandResults',
   cloudAgentStatus: 'onstarvoice.cloudTaskAgentStatus',
@@ -11733,7 +11734,7 @@ function stopFenceRunnerAttemptId(tab) {
 // 阶段二：关闭 R 已终态轮次的 runner 页。规则同 0.4.15 本地收口的
 // closeOwnedRunnerTabs：checkpoint 未上报的轮次保留 runner 让它送达；每关一页
 // 前重读请求槽；按 URL 复核后关闭，再确认已不在。
-async function closeStopFenceRunnerTabs(ctx) {
+async function closeStopFenceRunnerTabs(ctx, {operatorConfirmed = false} = {}) {
   return await runUnattendedRunnerTabLifecycle(async () => {
     await flushUnattendedCheckpointReportsInBackground(ctx.requestId);
     const closedTabIds = [];
@@ -11746,6 +11747,10 @@ async function closeStopFenceRunnerTabs(ctx) {
     const ownedRunnerTabs = (Array.isArray(tabs) ? tabs : []).filter(
       ctx.isClosableRunnerTab,
     );
+    const allOutbox = await inspectUnattendedCheckpointOutboxAttempt(ctx.requestId, '', {anyAttempt: true});
+    if (!allOutbox.known || allOutbox.pendingCount > 0) {
+      return {ok: false, reason: 'checkpoint_reports_pending', closedTabIds};
+    }
     if (ownedRunnerTabs.length === 0) return {ok: true, closedTabIds};
     const attemptIds = new Set();
     for (const tab of ownedRunnerTabs) {
@@ -11790,17 +11795,38 @@ async function closeStopFenceRunnerTabs(ctx) {
           throw error;
         }
         if (!ctx.isClosableRunnerTab(liveTab)) continue;
+        if (operatorConfirmed && !await isSelfStopRequestSlotCurrent({...ctx, mode: 'fence_check'})) {
+          return {ok: false, reason: 'request_changed', closedTabIds};
+        }
         // A 0.4.19 recovery runner may still own an in-memory upload queue.
         // A terminal request or an empty checkpoint outbox does not flush it.
+        let forced = null;
+        let withoutReceipt = false;
         if (ctx.request?.recoverySelfStop) {
           const receipt = await readUnattendedAttemptRetiredReceipt(
             ctx.requestId, stopFenceRunnerAttemptId(liveTab),
           );
-          if (!isUnattendedRetirementFlushed(receipt)) {
+          if (!isUnattendedRetirementFlushed(receipt) && liveTab.discarded !== true) {
+            const lock = await readStoredCaptureExecutionLock();
+            if (!operatorConfirmed) {
+              const candidate = await readStagnantRunnerEvidence(ctx, liveTab, receipt);
+              forced = candidate ? await revalidateStagnantRunner(ctx, candidate, lock) : null;
+            }
+            if ((!forced && !operatorConfirmed) || isProtectedStopFenceRunner(ctx, tabId, lock)) {
+              return {ok: false, reason: 'checkpoint_reports_pending', closedTabIds};
+            }
+            withoutReceipt = true;
+          }
+        }
+        if (forced) {
+          await stageForcedRunnerUploadHandoff(forced);
+          if (!(await revalidateStagnantRunner(ctx, forced, await readStoredCaptureExecutionLock()))) {
             return {ok: false, reason: 'checkpoint_reports_pending', closedTabIds};
           }
         }
         await chrome.tabs.remove(tabId);
+        if (withoutReceipt) ctx.runnerClosedWithoutReceipt = true;
+        if (forced) rememberForcedRunnerClose(ctx, forced);
         closedTabIds.push(tabId);
         ctx.closedRunnerTabIds.add(tabId);
       }
@@ -12122,6 +12148,11 @@ function buildStopFenceCheckResult(ctx, {
     pendingTabs,
     runnerTabsClosed,
     ...(ctx.runnerGoneWithoutReceipt ? {runnerGoneWithoutReceipt: true} : {}),
+    ...(ctx.runnerClosedWithoutReceipt ? {runnerClosedWithoutReceipt: true} : {}),
+    ...(ctx.forcedRunnerClosures?.length ? {
+      abandonedPendingUploads: ctx.forcedRunnerClosures.reduce((sum, entry) => sum + entry.pendingUploads, 0),
+      forcedCloseEvent: forcedRunnerCloseEvent(ctx),
+    } : {}),
     scopedCancelSent: ctx.scopedCancelSent,
     lockReleased: release?.lockReleased === true,
     localLockBoundToRequest: accepted
@@ -12246,6 +12277,10 @@ async function confirmPreviousUnattendedStopForFenceCheck(offer) {
     }
     if (verdict.ok && sweep.runnerPending.length === 0) {
       await flushUnattendedCheckpointReportsInBackground(ctx.requestId);
+      const outbox = await inspectUnattendedCheckpointOutboxAttempt(ctx.requestId, '', {anyAttempt: true});
+      if (!outbox.known || outbox.pendingCount > 0) {
+        verdict = {ok: false, reason: 'checkpoint_reports_pending'};
+      }
     }
     if (verdict.ok && ctx.request?.recoverySelfStop) {
       for (const attemptId of ctx.terminalAttemptIds) {
@@ -12348,18 +12383,20 @@ function buildStopFenceReleaseOnlyResult(
 async function releaseStopFenceLocalResourcesForOperator(offer) {
   const state = await readStopFenceRequestState(offer.requestId);
   const ctx = createStopFenceCheckContext(offer, state, null);
-  const finish = (reason, {runnerTabsClosed = 0, release = null} = {}) =>
-    buildStopFenceReleaseOnlyResult(offer, reason, {
+  const finish = (reason, {runnerTabsClosed = 0, release = null} = {}) => ({
+    ...buildStopFenceReleaseOnlyResult(offer, reason, {
       runnerTabsClosed,
       release,
       boundToR: ctx.boundToR,
-    });
+    }),
+    ...(ctx.runnerClosedWithoutReceipt ? {runnerClosedWithoutReceipt: true} : {}),
+  });
   if (!state.ok) return finish('storage_unreadable');
   if (state.requestActive) return finish('request_active');
   try {
     ctx.lock = await readStoredCaptureExecutionLock();
     ctx.boundToR = isStopFenceLockBoundToRequest(ctx.lock, ctx);
-    const closed = await closeStopFenceRunnerTabs(ctx);
+    const closed = await closeStopFenceRunnerTabs(ctx, {operatorConfirmed: true});
     if (!closed.ok) {
       return finish(closed.reason, {
         runnerTabsClosed: closed.closedTabIds.length,
@@ -12391,6 +12428,8 @@ async function releaseStopFenceLocalResourcesForOperator(offer) {
 // 不刷新；用户的标签页不在关闭范围内。
 const UNATTENDED_RECOVERY_SELF_STOP_MAX_TRIES = 5;
 const UNATTENDED_RECOVERY_SELF_STOP_BUDGET_MS = 8 * 60 * 1000;
+const UNATTENDED_RUNNER_FORCE_CLOSE_AFTER_MS = 10 * 60 * 1000;
+const UNATTENDED_RUNNER_UPLOAD_HANDOFF_PREFIX = 'onstarvoice.unattendedRunnerUploadHandoff.v1.';
 const UNATTENDED_RECOVERY_SELF_STOP_TIMING = {
   retryDelayMs: 60 * 1000,
   firstRetireWaitMs: 15 * 1000,
@@ -12591,6 +12630,7 @@ function createRecoverySelfStopContext(request, intent, epoch, mode) {
         .filter(Boolean),
     ),
     selfStopLockId: String(intent?.lockIdentity?.id || '').trim(),
+    selfStopStartedAt: intent?.startedAt,
     epoch,
     terminalAttemptIds,
     recordedRunnerTabIds: legacyRunnerTabIds,
@@ -12835,6 +12875,98 @@ async function isUnattendedRunnerDocumentGone(tabId) {
   }
 }
 
+function isProtectedStopFenceRunner(ctx, tabId, lock) {
+  return Number(lock?.holderTabId) === tabId ||
+    Number(ctx.fence?.lockIdentity?.holderTabId) === tabId ||
+    collectStopFenceAttributedTabs(ctx).some(({tabId: attributedId, role}) =>
+      attributedId === tabId && ['lock_holder', 'progress_tab', 'group_source', 'debug_source'].includes(role));
+}
+
+async function isStopFenceRunnerFocused(tab) {
+  if (tab?.active !== true) return false;
+  try {
+    // A user can keep looking at the same tab for more than ten minutes.
+    return (await chrome.windows.get(tab.windowId))?.focused !== false;
+  } catch {
+    return true;
+  }
+}
+
+function buildUnattendedRunnerForceObservationKey(requestId, attemptId) {
+  return `onstarvoice.unattendedRunnerForceObservation.v1.${requestId}.${attemptId}`;
+}
+
+async function readStagnantRunnerEvidence(ctx, tab, receipt) {
+  const tabId = resolveCaptureTaskTabId(tab?.id);
+  const attemptId = stopFenceRunnerAttemptId(tab);
+  const requestId = stopFenceRunnerRequestId(tab);
+  if (!tabId || requestId !== ctx.requestId || !attemptId ||
+      attemptId === (ctx.currentAttemptId || ctx.request?.attemptId) ||
+      !(ctx.terminalAttemptIds.has(attemptId) || ctx.request?.recoverySelfStop) ||
+      !ctx.isClosableRunnerTab(tab) ||
+      !isUnattendedRunnerTabForRequest(tab, requestId, attemptId) ||
+      (tab.pendingUrl && tab.pendingUrl !== tab.url) ||
+      receipt?.tabId !== tabId || receipt.requestId !== requestId ||
+      receipt.attemptId !== attemptId || !receipt.documentId ||
+      receipt.heartbeatStopped !== true || receipt.producerStopped !== true ||
+      receipt.flushing !== true || receipt.flushed === true ||
+      !Number.isSafeInteger(receipt.pendingUploads) || receipt.pendingUploads < 0) {
+    return null;
+  }
+  const now = Date.now();
+  const key = buildUnattendedRunnerForceObservationKey(requestId, attemptId);
+  const previous = await readExtensionSessionValue(key);
+  const flushingSince = parseTimestampMs(receipt.flushingSince);
+  const sameObservation = previous?.tabId === tabId &&
+    previous.documentId === receipt.documentId &&
+    previous.flushingSince === receipt.flushingSince &&
+    previous.pendingUploads === receipt.pendingUploads;
+  const selfStopStartedAt = parseTimestampMs(ctx.selfStopStartedAt);
+  const observedAt = sameObservation ? previous.observedAt
+    : ctx.selfStop && Number.isFinite(selfStopStartedAt) && Number.isFinite(flushingSince)
+      ? Math.max(selfStopStartedAt, flushingSince) : now;
+  if (!sameObservation) {
+    await writeExtensionSessionValue(key, {
+      tabId, documentId: receipt.documentId, pendingUploads: receipt.pendingUploads,
+      flushingSince: receipt.flushingSince, observedAt,
+    });
+  }
+  if (now - observedAt < UNATTENDED_RUNNER_FORCE_CLOSE_AFTER_MS ||
+      isProtectedStopFenceRunner(ctx, tabId, ctx.lock) || await isStopFenceRunnerFocused(tab)) {
+    return null;
+  }
+  const pendingRecordIds = Array.isArray(receipt.pendingRecordIds) ? receipt.pendingRecordIds : [];
+  if (pendingRecordIds.length !== receipt.pendingUploads) return null;
+  if (pendingRecordIds.length > 0) {
+    const stored = await chrome.storage.local.get(STORAGE_KEYS.dataPool);
+    const records = stored?.[STORAGE_KEYS.dataPool]?.records;
+    if (!Array.isArray(records)) return null;
+    const savedIds = new Set(records.map(record => String(record?.id || '')));
+    if (pendingRecordIds.some(id => !savedIds.has(id))) return null;
+  }
+  return {
+    tabId, requestId, attemptId, pendingRecordIds,
+    pendingUploads: receipt.pendingUploads,
+    documentId: receipt.documentId,
+  };
+}
+
+async function revalidateStagnantRunner(ctx, candidate, lock) {
+  if (!(await isSelfStopRequestSlotCurrent(ctx))) return null;
+  const tab = await chrome.tabs.get(candidate.tabId);
+  if (tab.discarded || isProtectedStopFenceRunner(ctx, candidate.tabId, lock)) return null;
+  const receipt = await readUnattendedAttemptRetiredReceipt(candidate.requestId, candidate.attemptId);
+  if (typeof chrome.runtime.getContexts !== 'function') return null;
+  const contexts = await chrome.runtime.getContexts({documentIds: [candidate.documentId]});
+  if (!contexts.some(context => context.documentId === candidate.documentId &&
+      context.tabId === candidate.tabId && context.documentUrl === tab.url)) return null;
+  const evidence = await readStagnantRunnerEvidence(ctx, tab, receipt);
+  if (!evidence || evidence.documentId !== candidate.documentId) return null;
+  const outbox = await inspectUnattendedCheckpointOutboxAttempt(ctx.requestId, '', {anyAttempt: true});
+  if (!outbox.known || outbox.pendingCount > 0) return null;
+  return evidence;
+}
+
 async function planSelfStopRunners(ctx, runnerPending, {tryIndex = 0} = {}) {
   const runners = runnerPending.map(({tabId, tab}) => ({
     tabId,
@@ -12874,13 +13006,31 @@ async function planSelfStopRunners(ctx, runnerPending, {tryIndex = 0} = {}) {
       allRetired = await readReceipts();
     }
   }
-  const retained = runners.filter((runner) => !runner.gone && runner.receipt);
+  const pendingClose = [];
+  const retained = [];
+  for (const runner of runners) {
+    if (runner.gone || !runner.receipt) continue;
+    if (!isUnattendedRetirementFlushed(runner.receipt)) {
+      try {
+        const tab = await chrome.tabs.get(runner.tabId);
+        const evidence = await readStagnantRunnerEvidence(ctx, tab, runner.receipt);
+        if (evidence) {
+          pendingClose.push(evidence);
+          continue;
+        }
+      } catch {
+        // Preserve the ordinary receipt gate when identity cannot be read.
+      }
+    }
+    retained.push(runner);
+  }
   const unretired = runners.filter((runner) => !runner.gone && !runner.receipt);
   // 锁的持有文档可能是某个旧轮次的 runner：按轮次读全部退役回执，供第 5 步
   // 核对持有文档是否已退役（它的标签页不一定能按 URL 找到）。
   const receipts = retained.map((runner) => runner.receipt);
   for (const attemptId of ctx.terminalAttemptIds) {
-    if (receipts.some((receipt) => receipt.attemptId === attemptId)) continue;
+    if (receipts.some((receipt) => receipt.attemptId === attemptId) ||
+        pendingClose.some((runner) => runner.attemptId === attemptId)) continue;
     const receipt = await readUnattendedAttemptRetiredReceipt(
       ctx.requestId,
       attemptId,
@@ -12894,7 +13044,7 @@ async function planSelfStopRunners(ctx, runnerPending, {tryIndex = 0} = {}) {
     receipts.push(receipt);
   }
   if (unretired.length === 0 && receipts.every(isUnattendedRetirementFlushed)) {
-    return {ok: true, retained, receipts, pendingClose: []};
+    return {ok: true, retained, receipts, pendingClose};
   }
   // No receipt / unfinished uploads is not evidence of data safety, however
   // long the renderer has been frozen. Automatic checks keep retrying later.
@@ -12904,7 +13054,41 @@ async function planSelfStopRunners(ctx, runnerPending, {tryIndex = 0} = {}) {
 
 // 关掉待关闭的旧 runner：只关 URL 仍是 R 的旧轮次 runner 的页，5 秒内 tabs.get
 // 报不存在才算。
-async function closeSelfStopPendingRunners(ctx, pendingClose) {
+async function stageForcedRunnerUploadHandoff(evidence) {
+  if (!evidence.pendingRecordIds.length) return '';
+  const stored = await chrome.storage.local.get(STORAGE_KEYS.auth);
+  const auth = stored?.[STORAGE_KEYS.auth];
+  const agentId = String(auth?.captureAgent?.id || '').trim();
+  const tenantId = String(auth?.tenant?.id || '').trim();
+  // A sync handoff must have a stable authorization scope; an unscoped
+  // handoff could send old records after a different tenant signs in.
+  if (!agentId || !tenantId) throw new Error('Forced runner sync scope is unknown');
+  const key = UNATTENDED_RUNNER_UPLOAD_HANDOFF_PREFIX +
+    JSON.stringify([evidence.requestId, evidence.attemptId]);
+  await chrome.storage.local.set({[key]: {
+    agentId, tenantId, tabId: evidence.tabId, documentId: evidence.documentId,
+    recordIds: evidence.pendingRecordIds, createdAt: Date.now(),
+  }});
+  return key;
+}
+
+function rememberForcedRunnerClose(ctx, evidence) {
+  (ctx.forcedRunnerClosures ||= []).push(evidence);
+  void writeExtensionSessionValue(
+    buildUnattendedRunnerForceObservationKey(evidence.requestId, evidence.attemptId), null,
+  ).catch(() => {});
+}
+
+function forcedRunnerCloseEvent(ctx) {
+  const entries = ctx.forcedRunnerClosures || [];
+  return {
+    type: 'recovery_self_stop_forced_close',
+    message: `已关闭 ${entries.length} 个停止冲刷的旧运行页，数据池待补传 ${entries.reduce((sum, entry) => sum + entry.pendingUploads, 0)} 条`,
+    at: new Date().toISOString(),
+  };
+}
+
+async function closeSelfStopPendingRunners(ctx, pendingClose, lock) {
   const closedTabIds = [];
   for (const runner of pendingClose) {
     let tab;
@@ -12914,7 +13098,10 @@ async function closeSelfStopPendingRunners(ctx, pendingClose) {
       if (isStopFenceMissingTabError(error)) continue;
       return {ok: false, closedTabIds};
     }
-    if (!ctx.isClosableRunnerTab(tab)) continue;
+    const evidence = await revalidateStagnantRunner(ctx, runner, lock);
+    if (!evidence) return {ok: false, closedTabIds};
+    await stageForcedRunnerUploadHandoff(evidence);
+    if (!(await revalidateStagnantRunner(ctx, runner, lock))) return {ok: false, closedTabIds};
     try {
       await chrome.tabs.remove(runner.tabId);
     } catch {
@@ -12928,6 +13115,7 @@ async function closeSelfStopPendingRunners(ctx, pendingClose) {
     if (!gone) return {ok: false, closedTabIds};
     closedTabIds.push(runner.tabId);
     ctx.closedRunnerTabIds.add(runner.tabId);
+    rememberForcedRunnerClose(ctx, evidence);
   }
   return {ok: true, closedTabIds};
 }
@@ -13112,6 +13300,7 @@ async function commitRecoverySelfStop(ctx, runnerPlan) {
     const closed = await closeSelfStopPendingRunners(
       ctx,
       runnerPlan.pendingClose,
+      lock,
     );
     runnersClosed = closed.closedTabIds;
     pendingClosed = closed.ok;
@@ -13279,6 +13468,9 @@ async function attemptUnattendedRecoverySelfStop(request, intent, {
         runnerClosed: commit.runnersClosed.length > 0,
         runnerClosedWithoutReceipt: commit.runnersClosed.length > 0,
         runnerGoneWithoutReceipt: ctx.runnerGoneWithoutReceipt === true,
+        abandonedPendingUploads: (ctx.forcedRunnerClosures || [])
+          .reduce((total, entry) => total + entry.pendingUploads, 0),
+        forcedRunnerClosures: ctx.forcedRunnerClosures || [],
         runnersRetained: runnerPlan.retained.length,
         retiredRunnersClosed: (commit.retiredRunnersClosed || []).length,
         pendingUploads,
@@ -13481,11 +13673,13 @@ async function persistRecoverySelfStopDone(request, done) {
     };
     await persistUnattendedRunMutation(nextRequest, {
       previousRequest: current,
-      event: {
-        type: 'recovery_self_stop_done',
-        message: UNATTENDED_RECOVERY_SELF_STOP_DONE_MESSAGE,
-        at: now,
-      },
+      event: done.runnerClosedWithoutReceipt
+        ? forcedRunnerCloseEvent({forcedRunnerClosures: done.forcedRunnerClosures})
+        : {
+            type: 'recovery_self_stop_done',
+            message: UNATTENDED_RECOVERY_SELF_STOP_DONE_MESSAGE,
+            at: now,
+          },
     });
     return nextRequest;
   });
@@ -13536,11 +13730,9 @@ async function persistRecoverySelfStopTerminalOutcome(request, done) {
     };
     await persistUnattendedRunMutation(nextRequest, {
       previousRequest: current,
-      event: {
-        type: nextRequest.status,
-        message: nextRequest.message,
-        at: now,
-      },
+      event: finalDone?.runnerClosedWithoutReceipt
+        ? forcedRunnerCloseEvent({forcedRunnerClosures: finalDone.forcedRunnerClosures})
+        : {type: nextRequest.status, message: nextRequest.message, at: now},
     });
     return nextRequest;
   });
@@ -19769,9 +19961,16 @@ function markCaptureRequestAborted(requestId) {
   for (const relay of findRelaysByCaptureRequestId(normalized)) {
     if (!relay.rejectAbort) continue;
     void cancelAbortedContentCapture(relay.tabId, normalized);
-    relay.rejectAbort(createContentRelayWatchdogError(
+    const abort = () => relay.rejectAbort(createContentRelayWatchdogError(
       'CAPTURE_CANCELED', '用户已取消当前采集任务',
     ));
+    if (relay.action === 'captureComments') {
+      // A cooperative content script can return the comments it already has.
+      // Bound that grace independently of the content script's own timeout.
+      relay.abortTimer ??= setTimeout(abort, 200);
+    } else {
+      abort();
+    }
   }
   return true;
 }
@@ -20024,8 +20223,8 @@ async function sendContentMessageWithTimeout(
 
   try {
     return await Promise.race([
-      ...(abort ? [abort] : []),
       chrome.tabs.sendMessage(tabId, payload ?? {}),
+      ...(abort ? [abort] : []),
       new Promise((_, reject) => {
         const checkWatchdog = () => {
           const now = Date.now();
@@ -20560,13 +20759,29 @@ async function recordUnattendedAttemptRetired(message = {}, sender = {}) {
     return {ok: false, reason: 'not_unattended_runner'};
   }
   const pendingUploads = message?.pendingUploads;
+  const producerStopped = message?.producerStopped === true;
+  const previous = await readUnattendedAttemptRetiredReceipt(requestId, attemptId);
+  const at = new Date().toISOString();
+  const documentId = String(sender?.documentId || '').trim().slice(0, 240);
+  const tabId = resolveCaptureTaskTabId(sender?.tab?.id);
+  const flushing = message?.flushing === true;
+  const sameFlushing = flushing && previous?.flushing === true &&
+    previous.documentId === documentId && previous.tabId === tabId &&
+    previous.pendingUploads === pendingUploads &&
+    previous.producerStopped === producerStopped;
   const receipt = {
     v: 1,
     requestId,
     attemptId,
-    documentId: String(sender?.documentId || '').trim().slice(0, 240),
-    tabId: resolveCaptureTaskTabId(sender?.tab?.id),
-    at: new Date().toISOString(),
+    documentId,
+    tabId,
+    at,
+    producerStopped,
+    flushingSince: flushing ? sameFlushing ? previous.flushingSince || at : at : '',
+    pendingRecordIds: Array.isArray(message?.pendingRecordIds)
+      ? [...new Set(message.pendingRecordIds.slice(0, 250)
+          .map(id => String(id || '').trim().slice(0, 160)).filter(Boolean))]
+      : [],
     reason: String(message?.reason || 'attempt_superseded').trim().slice(0, 60),
     heartbeatStopped: message?.heartbeatStopped === true,
     producerStopTimedOut: message?.producerStopTimedOut === true,
@@ -20574,7 +20789,7 @@ async function recordUnattendedAttemptRetired(message = {}, sender = {}) {
       ? message.skippedCount : 0,
     permanentFailedCount: Number.isSafeInteger(message?.permanentFailedCount) &&
       message.permanentFailedCount >= 0 ? message.permanentFailedCount : 0,
-    flushing: message?.flushing === true,
+    flushing,
     flushed: message?.flushed === true,
     pendingUploads:
       Number.isSafeInteger(pendingUploads) && pendingUploads >= 0
@@ -20737,12 +20952,15 @@ async function canReloadUnattendedRelayWorker(tabId, owner) {
   try {
     const request = await readUnattendedKeywordRunRequest();
     const lock = await readStoredCaptureExecutionLock();
+    const taskId = buildUnattendedCaptureTaskId(owner.runnerRequestId);
+    const group = captureTaskTabGroupManager?.getGroupByTaskId?.(taskId);
+    const debug = captureDebugSessionManager?.getSessionByTaskId(taskId);
     const tab = await chrome.tabs.get(tabId);
     return request?.id === owner.runnerRequestId &&
       request.attemptId === owner.runnerAttemptId &&
       !isTerminalUnattendedRunStatus(request.status) &&
-      ![request.runnerTabId, request.progress?.runnerTabId, lock?.holderTabId]
-        .some(id => Number(id) === tabId) &&
+      ![request.runnerTabId, request.progress?.runnerTabId, lock?.holderTabId,
+        group?.sourceTabId, debug?.sourceTabId, debug?.tabId].some(id => Number(id) === tabId) &&
       isStopFenceContentScriptSiteUrl(tab?.url) && !tab.pendingUrl && !tab.active;
   } catch {
     return false;
@@ -20867,6 +21085,7 @@ async function relayToContentWithRetry(tabId, payload, owner = null) {
     throw error;
   } finally {
     clearTimeout(deadlineTimer);
+    clearTimeout(inFlightContentRelays.get(inFlightRelayKey)?.abortTimer);
     inFlightContentRelays.delete(inFlightRelayKey);
     if (requestId) {
       markCaptureRequestSettled(requestId);
