@@ -56,6 +56,15 @@ export async function createDedicatedDetailRunnerTab({
     throw new Error("详情采集工作页与来源页冲突");
   }
 
+  if (typeof chromeApi.tabs.update === "function") {
+    // CreateProperties does not accept autoDiscardable. Protect the new tab
+    // before the caller navigates it, without touching the user's source tab.
+    try {
+      await chromeApi.tabs.update(runnerTabId, {autoDiscardable: false});
+    } catch {
+      // Older Chromium variants may not implement the property.
+    }
+  }
   notifyOwnedDetailRunnerTab({chromeApi, runnerTabId, sourceTab});
   return tab;
 }

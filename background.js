@@ -228,6 +228,7 @@ const SOCIAL_ACCOUNT_IDENTITY_REFRESH_MS = 5 * 60 * 1000;
 const SOCIAL_ACCOUNT_IDENTITY_CACHE_MAX_AGE_MS = 30 * 60 * 1000;
 const UNATTENDED_SUPERVISOR_SUSPEND_GAP_MS = 2.5 * 60 * 1000;
 const UNATTENDED_SUPERVISOR_WAKE_GRACE_MS = 2 * 60 * 1000;
+const UNATTENDED_WAKE_HEARTBEAT_POLL_MS = 10 * 1000;
 const UNATTENDED_SUPERVISOR_LOCK_WAIT_MS = 5 * 60 * 1000;
 const UNATTENDED_RUN_SCHEMA_VERSION = 2;
 const UNATTENDED_RUN_ARCHIVE_LIMIT = 50;
@@ -273,6 +274,7 @@ const UNATTENDED_RUN_REPORTABLE_STATUSES = new Set([
 let unattendedKeywordAlarmInFlight = false;
 let unattendedSupervisorInFlight = false;
 let lastUnattendedSupervisorTickAt = 0;
+let unattendedWakeHeartbeatTimer = null;
 const contentRelayHeartbeatByRequestId = new Map();
 // 在途内容中继登记表（0.4.16，只登记不改行为）。停止保护核对用它判断页面上
 // 的采集活动是谁发起的。纯内存：SW 重启会清空它，同时也终止了它登记的全部
@@ -706,6 +708,7 @@ function normalizeUnattendedRunProgress(progress = null, fallbackMessage = '') {
     runStartedAt: String(progress.runStartedAt || ''),
     progressScope: String(progress.progressScope || ''),
     phase: String(progress.phase || ''),
+    ...(progress.wakeReason ? {wakeReason: String(progress.wakeReason).slice(0, 60)} : {}),
     round,
     roundCurrent,
     roundTotal,
@@ -16322,8 +16325,12 @@ async function updateUnattendedKeywordRun({requestId = '', attemptId = '', patch
     const nextStatus = UNATTENDED_RUN_REPORTABLE_STATUSES.has(requestedStatus)
       ? requestedStatus
       : request.status;
+    const receivedWakeHeartbeat = Boolean(safePatch.heartbeatAt && request.wakeGraceUntil);
     const normalizedProgress = hasProgress
-      ? normalizeUnattendedRunProgress(safePatch.progress, safePatch.message)
+      ? normalizeUnattendedRunProgress({
+          ...safePatch.progress,
+          wakeReason: request.progress?.wakeReason,
+        }, safePatch.message)
       : request.progress || null;
     let waitUntil = String(request.recoveryWaitUntil || '');
     if (Object.prototype.hasOwnProperty.call(safePatch, 'waitUntil')) {
@@ -16373,6 +16380,15 @@ async function updateUnattendedKeywordRun({requestId = '', attemptId = '', patch
       recoveryWaitUntil: waitUntil,
       updatedAt: now,
     };
+    if (receivedWakeHeartbeat) {
+      nextRequest.wakeGraceUntil = '';
+      if (nextRequest.recoveryWaitUntil === request.wakeGraceUntil) {
+        nextRequest.recoveryWaitUntil = '';
+      }
+      if (nextRequest.progress?.waitUntil === request.wakeGraceUntil) {
+        nextRequest.progress = {...nextRequest.progress, waitUntil: '', remainingMs: null};
+      }
+    }
     if (isTerminalUnattendedRunStatus(nextStatus)) {
       nextRequest.finishedAt = String(safePatch.finishedAt || now);
       nextRequest.recoveryPendingLaunch = false;
@@ -18080,6 +18096,29 @@ async function manuallyRecoverUnattendedKeywordRun({
   };
 }
 
+function scheduleUnattendedWakeHeartbeatCheck(request) {
+  if (unattendedWakeHeartbeatTimer !== null) clearTimeout(unattendedWakeHeartbeatTimer);
+  unattendedWakeHeartbeatTimer = setTimeout(async () => {
+    unattendedWakeHeartbeatTimer = null;
+    try {
+      const current = await readUnattendedKeywordRunRequest();
+      if (current?.id !== request.id || current.attemptId !== request.attemptId ||
+          current.wakeGraceUntil !== request.wakeGraceUntil ||
+          isTerminalUnattendedRunStatus(current.status)) return;
+      await superviseUnattendedKeywordRun({reason: 'wake_heartbeat_poll'});
+      const after = await readUnattendedKeywordRunRequest();
+      if (after?.id === current.id && after.attemptId === current.attemptId &&
+          after.wakeGraceUntil === current.wakeGraceUntil &&
+          Date.now() < parseTimestampMs(current.wakeGraceUntil) + UNATTENDED_WAKE_HEARTBEAT_POLL_MS) {
+        scheduleUnattendedWakeHeartbeatCheck(after);
+      }
+    } catch (error) {
+      console.warn('[onstarvoice] unattended wake heartbeat check failed', error);
+    }
+  }, UNATTENDED_WAKE_HEARTBEAT_POLL_MS);
+  unattendedWakeHeartbeatTimer?.unref?.();
+}
+
 async function applyUnattendedWakeGrace(request, reason = 'wake') {
   return await runUnattendedRunMutation(async () => {
     const current = await readUnattendedKeywordRunRequest();
@@ -18112,6 +18151,7 @@ async function applyUnattendedWakeGrace(request, reason = 'wake') {
           ? current.progress
           : {}),
         phase: 'waiting_runner_reconnect',
+        wakeReason: reason,
         waitUntil: wakeGraceUntil,
         remainingMs: UNATTENDED_SUPERVISOR_WAKE_GRACE_MS,
         message,
@@ -18126,6 +18166,7 @@ async function applyUnattendedWakeGrace(request, reason = 'wake') {
         at: now.toISOString(),
       },
     });
+    scheduleUnattendedWakeHeartbeatCheck(nextRequest);
     return nextRequest;
   });
 }
@@ -18168,7 +18209,11 @@ async function superviseUnattendedKeywordRun({
       supervisorGap > UNATTENDED_SUPERVISOR_SUSPEND_GAP_MS ||
       alarmDelay > UNATTENDED_SUPERVISOR_SUSPEND_GAP_MS;
     if (wokeFromSuspension && !removedCurrentRunner) {
-      request = await applyUnattendedWakeGrace(request, reason);
+      const wakeReason = applyWakeGrace ? reason
+        : alarmDelay > UNATTENDED_SUPERVISOR_SUSPEND_GAP_MS
+          ? 'supervisor_alarm_delayed'
+          : 'supervisor_tick_gap';
+      request = await applyUnattendedWakeGrace(request, wakeReason);
       return {healthy: true, reason: 'wake_grace', request};
     }
 
@@ -18197,7 +18242,12 @@ async function superviseUnattendedKeywordRun({
     if (health.healthy) {
       return health;
     }
-    if (health.reason === 'runner_tab_frozen') {
+    if (!removedCurrentRunner && request.wakeReason === 'runner_tab_frozen' && request.wakeGraceUntil) {
+      const graceEnd = parseTimestampMs(request.wakeGraceUntil);
+      if (nowMs < graceEnd + UNATTENDED_WAKE_HEARTBEAT_POLL_MS) {
+        return {healthy: true, reason: 'wake_heartbeat_pending', request};
+      }
+    } else if (health.reason === 'runner_tab_frozen') {
       const wakeResult = await wakeFrozenUnattendedRunnerTab(
         request,
         health.runnerTab,
