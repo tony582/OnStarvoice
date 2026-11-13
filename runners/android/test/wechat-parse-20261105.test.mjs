@@ -259,12 +259,13 @@ test('an ad card under a comment and the 「首评」 label are not comment text
     [['沪上青山Vlog', '上海', '换这款多少钱啊'], ['勇哥的视界', '山东', '同问']]);
 });
 
-test('name badge variants still merge; complete prefix variants remain separate without cut evidence', () => {
+test('name badge variants still merge and matching adjacent bylines allow a missing character', () => {
   const first = panel('comments-stickers-20261106-0'), second = panel('comments-stickers-20261106-1');
   assert.deepEqual(first.comments.map(item => item.author), ['田纳西瓜皮', '迷途懒猫心', '强']);
   assert.deepEqual(second.comments.map(item => item.author), ['田纳西瓜皮', '迷途懒猫凶', '强']);
   const merged = mergeCommentScreens([first, second]);
-  assert.equal(merged.length, 4, JSON.stringify(summary(merged)));
+  assert.equal(merged.length, 3, JSON.stringify(summary(merged)));
+  assert.equal(merged[0].content, '安吉星“也要付钱的，一天一块钱起');
   assert.ok(merged[2].content.endsWith('最后一地鸡毛'), '首评 is not part of the text');
   assert.equal(namesAgree('迷途懒猫心', '迷途懒猫凶'), true);
   assert.equal(namesAgree('迷途懒猫', '迷途懒猫心'), true);

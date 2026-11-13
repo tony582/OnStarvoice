@@ -210,7 +210,7 @@ export function createWechatFlow({screen, view, rememberIme = () => {}, restoreI
       const bar = commentButton(await view.look({signal, roi: REGION.workBar}), {fallback: POINT.comments, shift: MORE_VIDEOS_SHIFT});
       await screen.tap(bar.x, bar.y, {signal});
       await wait(1500, signal);
-      try { return await readCommentPanel({screen, view, limit, signal}); }
+      try { return await readCommentPanel({screen, view, limit, signal, wait}); }
       finally {
         await screen.back({timeoutMs: 5000});
         await wait(700);

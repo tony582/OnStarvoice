@@ -1,4 +1,4 @@
-import {comparable, similarity} from './wechat-ocr-parse.mjs';
+import {COMMENT_REPLY_BODY_X, comparable, similarity} from './wechat-ocr-parse.mjs';
 import {footerEvidence, position} from './wechat-article-parse.mjs';
 const REGIONS = '内蒙古 黑龙江 新疆 西藏 宁夏 广西 香港 澳门 北京 天津 上海 重庆 河北 河南 云南 辽宁 湖南 安徽 山东 江苏 浙江 江西 湖北 甘肃 山西 陕西 吉林 福建 贵州 广东 青海 四川 海南 台湾'.split(' ');
 const TIME = /((?:\d{4}年)?\d{1,2}月\d{1,2}日|\d{1,2}-\d{1,2}|\d+(?:分钟|小时|天|周|个月)前?|昨天|前天|刚刚)\s*$/u;
@@ -37,12 +37,8 @@ export function parseArticleComments(rows, {reachedEnd = false, topLevelOnly = f
   const restricted = relevant.some(row => row.x < 200 && /^作者已设置关注后可以留言$/u.test(row.text.trim()));
   const open = relevant.some(row => row.x < 200 && /^写留言$/u.test(row.text.trim()));
   const count = footer.header?.text.match(/\d+/u);
-  const headers = [], uncertainBoundaries = []; let unparsed = false;
-  const inScope = row => !topLevelOnly || row.x < REPLY_X;
-  const markUnparsed = (row, boundary = false) => {
-    unparsed ||= inScope(row);
-    if (boundary) uncertainBoundaries.push(row);
-  };
+  const headers = [], uncertainBoundaries = [];
+  const inScope = reply => !topLevelOnly || !reply;
   // OCR sometimes drops 广's dot (厂告). The label and brand share a baseline; start at its upper edge,
   // not the label's y, so every ad line is excluded. Brand names in ordinary comments are never a signal.
   const adBoundaries = relevant.filter(row => row.x > 900 && row.w <= 180 && row.h <= 60 && /^[广厂]告[\p{P}\p{S}\s]*$/u.test(row.text.trim()))
@@ -53,7 +49,7 @@ export function parseArticleComments(rows, {reachedEnd = false, topLevelOnly = f
     const date = row.text.match(TIME);
     if (!date) {
       if (REGIONS.some(region => row.text.includes(region)) && /\d{1,2}月\d{1,2}[日口ロ号]?$/u.test(row.text.trim())) {
-        markUnparsed(row, true);
+        uncertainBoundaries.push(row);
       }
       continue;
     }
@@ -62,32 +58,38 @@ export function parseArticleComments(rows, {reachedEnd = false, topLevelOnly = f
     const replyControl = relevant.some(other => other.x > 800 && Math.abs(other.y - row.y) < 55 && /^回复/u.test(other.text));
     // Foreign/hidden IP locations cannot be split reliably from a display name using OCR alone. Preserve
     // the visible byline and text when the adjacent reply control proves a comment; mark coverage partial.
-    if (!location) { markUnparsed(row, !replyControl); if (!replyControl) continue; }
+    if (!location && !replyControl) { uncertainBoundaries.push(row); continue; }
     const author = location ? prefix.slice(0, -location.length).trim() : prefix;
-    if (!author || author.length > 60) { markUnparsed(row, true); continue; }
+    if (!author || author.length > 60) { uncertainBoundaries.push(row); continue; }
     const identity = authorIdentity(author);
-    if (identity.authorUncertain) markUnparsed(row);
-    headers.push({...row, ...identity, location, timeLabel: date[1], reply: row.x >= REPLY_X});
+    headers.push({...row, ...identity, location, timeLabel: date[1]});
   }
+  const boundaries = [...headers.map(row => row.y), ...uncertainBoundaries.map(row => row.y), ...adBoundaries];
+  const nextBoundary = row => Math.min(1900, ...boundaries.filter(y => y > row.y));
+  const bodyLines = (row, next) => relevant.filter(item => item.y > row.y + row.h - 10 && item.y < next - 5
+    && item.x >= 120 && item.x < 850 && !IGNORE.test(item.text.trim())
+    && !/^(?:•|作者已设置|留言\d|展开\d)/u.test(item.text.trim()));
+  const isReply = (row, first) => first && first.y - row.y < 140
+    ? first.x >= COMMENT_REPLY_BODY_X : row.x >= REPLY_X;
+  const uncertainTop = new Set(uncertainBoundaries.filter(row => inScope(isReply(row, bodyLines(row, nextBoundary(row))[0])))
+    .map(row => row.y));
+  let unparsed = uncertainTop.size > 0;
+  const comments = headers.map(row => {
+    const next = nextBoundary(row), lines = bodyLines(row, next);
+    const reply = isReply(row, lines[0]);
+    if (!row.location || row.authorUncertain) unparsed ||= inScope(reply);
+    const last = lines.at(-1);
+    const cut = uncertainTop.has(next) || next === 1900 && (row.y > 1700 || (last?.y ?? 0) + (last?.h ?? 0) > 1800);
+    const likes = relevant.find(item => Math.abs(item.y - row.y) < 40 && item.x > 940 && /^\d+$/u.test(item.text));
+    return {author: row.author, ...(row.authorUncertain ? {authorUncertain: true} : {}), location: row.location, timeLabel: row.timeLabel,
+      content: lines.map(item => item.text).join(''), likeCount: likes ? Number(likes.text) : null, reply, cut};
+  }).filter(item => item.content && inScope(item.reply));
   // The centered invitation is a system empty state only in the observed comment area, not a comment
   // containing those words. Keep normal comment text intact and never override an observed nonzero count.
   const emptyPrompt = !headers.length && !unparsed && !(Number(count?.[0]) > 0) && footer.header && (open || restricted)
     && relevant.find(row => Math.abs(row.x + row.w / 2 - 540) < 140 && row.h <= 60
       && /^还没有留言(?:[，,]?\s*来写首评)?$/u.test(row.text.trim()));
   const empty = !!emptyPrompt || relevant.some(row => row.x < 200 && /^(暂无留言|暂无评论)$/u.test(row.text.trim()));
-  const comments = headers.map((row, index) => {
-    const next = Math.min(headers[index + 1]?.y ?? 1900, ...uncertainBoundaries.filter(item => item.y > row.y).map(item => item.y),
-      ...adBoundaries.filter(y => y > row.y));
-    const lines = relevant.filter(item => item.y > row.y + row.h - 10 && item.y < next - 5 && item.x >= row.x - 25
-      && item.x < 850 && !IGNORE.test(item.text.trim()) && !/^•/u.test(item.text.trim())
-      && !/^(作者已设置|留言\d|展开\d)/u.test(item.text.trim()));
-    const last = lines.at(-1);
-    const cut = uncertainBoundaries.some(item => item.y === next && inScope(item))
-      || next === 1900 && (row.y > 1700 || (last?.y ?? 0) + (last?.h ?? 0) > 1800);
-    const likes = relevant.find(item => Math.abs(item.y - row.y) < 40 && item.x > 940 && /^\d+$/u.test(item.text));
-    return {author: row.author, ...(row.authorUncertain ? {authorUncertain: true} : {}), location: row.location, timeLabel: row.timeLabel,
-      content: lines.map(item => item.text).join(''), likeCount: likes ? Number(likes.text) : null, reply: row.reply, cut};
-  }).filter(item => item.content && (!topLevelOnly || !item.reply));
   return {comments, unparsed, headerCount: count ? Number(count[0]) : empty ? 0 : null, empty,
     postingState: closed ? 'closed' : restricted ? 'followers_only' : open || emptyPrompt ? 'open' : 'unknown', closed,
     entrySeen: !!footer.header || closed || restricted || open || empty,

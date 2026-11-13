@@ -1,4 +1,4 @@
-import {COMMENT_INPUT_TOP, comparable, similarity} from './wechat-ocr-parse.mjs';
+import {COMMENT_INPUT_TOP, COMMENT_REPLY_BODY_X, comparable, similarity} from './wechat-ocr-parse.mjs';
 
 // Reads the WeChat 8.0.80 comment panel from recognized text rows (DE106, 1080 px wide, measured 2026-11-05):
 // header "评论 N" near y 664; the post's own author row (with 作者) and caption; then per comment a line
@@ -57,8 +57,7 @@ const number = text => {
 };
 
 /**
- * One screenshot of the open panel → {headerCount, post, comments, expand, bottomCut}. `expand` lists the
- * "N条回复" controls with their tap points; `bottomCut` is true when the last comment may continue below.
+ * The bylines also provide scroll anchors when a comment body is cut off.
  */
 export function parseCommentScreen(rows, {bottom = COMMENT_INPUT_TOP} = {}) {
   const visible = rows.filter(row => row.y >= PANEL_TOP - 20 && row.y + row.h <= bottom).sort((a, b) => a.y - b.y || a.x - b.x);
@@ -104,7 +103,9 @@ export function parseCommentScreen(rows, {bottom = COMMENT_INPUT_TOP} = {}) {
       if (/^[♪◎♫]|上热门|人帮过/u.test(row.text)) { captionOpen = false; continue; }
       post.caption += row.text; continue;
     }
-    if (current && (row.x >= (current.reply ? REPLY_X[0] : TOP_LEVEL_X[0])) && row.y - current.lastY < 140) {
+    if (current && row.x >= TOP_LEVEL_X[0] && row.y - current.lastY < 140) {
+      // OCR can merge a reply avatar into its byline. The first body row supplies the indentation.
+      if (!current.content) current.reply = row.x >= COMMENT_REPLY_BODY_X;
       current.content += row.text; current.lastY = row.y;
     }
   }
@@ -114,7 +115,8 @@ export function parseCommentScreen(rows, {bottom = COMMENT_INPUT_TOP} = {}) {
     if (!item.content.trim() && nextRowY(item.headerY) - item.headerY >= IMAGE_GAP) item.content = IMAGE_COMMENT;
   }
   const last = comments.at(-1);
-  return {headerCount, post, expand, comments: comments.map(({key: _key, headerY: _y, lastY, ...item}) => ({...item,
+  const anchors = comments.map(({author, timeLabel}) => ({author, timeLabel}));
+  return {headerCount, post, expand, anchors, comments: comments.map(({key: _key, headerY: _y, lastY, ...item}) => ({...item,
       content: cleanCapturedComment(item.content),
       cut: bottom - lastY < 130 && item === last})).filter(item => item.content),
   bottomCut: !!last && bottom - last.lastY < 130};
@@ -141,33 +143,65 @@ export function textsAgree(a, b, {aCut = false, bCut = false} = {}) {
 }
 export const sameComment = (a, b) => namesAgree(a.author, b.author) && textsAgree(a.content, b.content, {aCut:a.cut,bCut:b.cut});
 
+function withinTwoEdits(a, b) {
+  if (Math.abs(a.length - b.length) > 2) return false;
+  // Only the diagonal band can lead to a distance of two or less.
+  let previous = new Map([[0, 0], [1, 1], [2, 2]]);
+  for (let i = 1; i <= a.length; i++) {
+    const current = new Map();
+    for (let j = Math.max(0, i - 2); j <= Math.min(b.length, i + 2); j++) {
+      current.set(j, j === 0 ? i : Math.min((previous.get(j) ?? 3) + 1, (current.get(j - 1) ?? 3) + 1,
+        (previous.get(j - 1) ?? 3) + Number(a[i - 1] !== b[j - 1])));
+    }
+    if ([...current.values()].every(cost => cost > 2)) return false;
+    previous = current;
+  }
+  return previous.get(b.length) <= 2;
+}
+
+function adjacentOcrVariant(a, b) {
+  if (!a.location || !a.timeLabel || a.location !== b.location || a.timeLabel !== b.timeLabel
+    || !comparable(a.author) || comparable(a.author) !== comparable(b.author)) return false;
+  const x = bareText(a.content), y = bareText(b.content);
+  // Tiny comments need stronger evidence than an edit allowance of two characters.
+  return similarity(x, y) >= 0.8 || (Math.min(x.length, y.length) >= 5 && withinTwoEdits(x, y));
+}
+
 /**
  * Merge screens in scroll order. Overlapping comments (same commenter, same text as far as OCR lets us tell) are
  * kept once; a cut comment is replaced by its longer, later reading. Replies point at the index of their top-level comment.
  */
 export function mergeCommentScreens(screens, {limit = Infinity} = {}) {
   const merged = [];
-  let parentIndex = null;
+  let parentIndex = null, previous = new Map();
   for (const screen of screens) {
-    for (const raw of screen.comments) {
-      const item={...raw,content:cleanCapturedComment(raw.content)};
-      if (!item.content) continue;
+    const current = new Map();
+    const items = screen.comments.map(raw => ({...raw, content: cleanCapturedComment(raw.content)})).filter(item => item.content);
+    for (const item of items) {
       const floor=item.reply ? parentIndex : null;
-      const existing = merged.findIndex(seen => Boolean(seen.reply)===Boolean(item.reply)
+      let existing = merged.findIndex(seen => Boolean(seen.reply)===Boolean(item.reply)
         && (!item.reply || (floor !== null && seen.parentIndex===floor)) && sameComment(seen, item));
+      if (existing < 0 && !item.reply) {
+        const match = [...previous].find(([index, before]) => !before.reply && !current.has(index) && adjacentOcrVariant(before, item)
+          && !items.some(other => other !== item && !other.reply && sameComment(before, other)));
+        if (match) existing = match[0];
+      }
       if (existing >= 0) {
         const seen = merged[existing];
         if (comparable(item.content).length > comparable(seen.content).length) Object.assign(seen, {content: item.content, cut: item.cut});
         if (seen.likeCount === null && item.likeCount !== null) seen.likeCount = item.likeCount;
+        current.set(existing, item);
         if (!item.reply) parentIndex = existing;
         continue;
       }
       if (merged.length >= limit) { if (!item.reply) parentIndex=null; continue; }
       const entry = {author: item.author, location: item.location, timeLabel: item.timeLabel, content: item.content,
         likeCount: item.likeCount, reply: item.reply, parentIndex: item.reply ? parentIndex : null, cut: item.cut};
+      current.set(merged.length, item);
       merged.push(entry);
       if (!item.reply) parentIndex = merged.length - 1;
     }
+    previous = current;
   }
   return merged.map(({cut: _cut, ...item}) => item);
 }

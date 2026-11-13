@@ -12,6 +12,7 @@ const COLUMNS = Object.freeze([{x0: 18, x1: 531}, {x0: 548, x1: 1061}]);
 export const RESULTS_TOP = 480;
 // The comment input box at the bottom of the panel; no tap may land here.
 export const COMMENT_INPUT_TOP = 2100;
+export const COMMENT_REPLY_BODY_X = 200;
 
 const DURATION = /^(?:\d{1,2}[:：-]\d{2}(?:[:：]\d{2})?|00)$/u;
 const FOLD = /[.。…·•]+$/u;

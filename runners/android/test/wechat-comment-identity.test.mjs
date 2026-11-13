@@ -1,7 +1,47 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
 import {textsAgree,mergeCommentScreens,parseCommentScreen} from '../src/device/wechat-comments-parse.mjs';
 const c=(content,reply=false,extras={})=>({author:'同一位车主',content,reply,likeCount:null,...extras});
+const fixture = JSON.parse(readFileSync(new URL('./fixtures/wechat/comments-retest-20261113.json', import.meta.url)));
+const topLevel = screens => screens.map(rows => {
+  const parsed = parseCommentScreen(rows);
+  return {...parsed, comments: parsed.comments.filter(item => !item.reply)};
+});
+
+test('real Dou-dou replay classifies the merged byline by its indented body and leaves nine distinct top-level comments', () => {
+  const parsed = parseCommentScreen(fixture['dou-dou'][1]);
+  assert.equal(parsed.comments.find(item => item.author === '悟3~')?.reply, true);
+  const comments = mergeCommentScreens(topLevel(fixture['dou-dou']));
+  assert.deepEqual(comments.map(item => item.author), [
+    '垄断悠闲', '养鱼新手2480', 'Rookie V', '發0713發', '魏来可期-8880', '晨曦', '八九区我的', '符号Ing', '温柔的梦里久',
+  ]);
+  assert.equal(comments.find(item => item.author === '符号Ing').content, '壁纸怎么弄的？');
+  assert.ok(comments.every(item => item.reply === false && item.parentIndex === null));
+});
+
+test('real Gao replay preserves both different comments from 唯', () => {
+  const items = mergeCommentScreens(topLevel(fixture.gao));
+  assert.deepEqual(items.map(item => [item.author, item.content]),
+    [['唯', '前提我需要一个 优盘里面的内容'], ['唯', '来一个']]);
+});
+
+test('one-character differences merge only on adjacent screens with the same author, place and time', () => {
+  const context = {location: '江苏', timeLabel: '2小时前'};
+  const one = c('壁纸怎么弄的？', false, context);
+  const two = c('壁纸怎么弄？', false, context);
+  const panel = (...comments) => ({comments});
+  for (const readings of [[one, two], [two, one]]) {
+    // OCR variants and two genuine near-identical comments with the same visible byline are indistinguishable.
+    assert.deepEqual(mergeCommentScreens(readings.map(item => panel(item))).map(item => item.content), [one.content]);
+  }
+  assert.equal(mergeCommentScreens([panel(one, two)]).length, 2);
+  assert.equal(mergeCommentScreens([panel(one), panel(), panel(two)]).length, 2);
+  for (const change of [{author: '另一位车主'}, {location: '山东'}, {timeLabel: '1小时前'}, {location: ''}]) {
+    assert.equal(mergeCommentScreens([panel(one), panel({...two, ...change})]).length, 2);
+  }
+  assert.equal(mergeCommentScreens([panel(one), panel(c('来一个', false, context))]).length, 2);
+});
 test('emoji/punctuation comments need a nonempty exact comparable identity',()=>{
   for(const [a,b]of [['👍👍','😡😡'],['？？？','！！！'],['',''],['   ','']])assert.equal(textsAgree(a,b),false);
   assert.equal(textsAgree('👍👍','👍👍'),true);assert.equal(textsAgree('？？？','???'),true);

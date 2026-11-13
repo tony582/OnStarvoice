@@ -142,6 +142,17 @@ test('T13 missing authors delimit preceding comments without inventing names or 
   assert.deepEqual(parseArticleComments(invalid).comments.map(item => item.content), ['第一条已知留言', '后面的有效留言']);
 });
 
+test('article reply level follows the body when the avatar and byline are read together', () => {
+  const source = [row('留言2', 55, 400), row('读者甲 上海 11月9日', 163, 600), row('一级留言', 163, 675),
+    {...row('回复者 北京 11月9日', 155, 760), h: 70}, row('缩进的回复正文', 234, 826),
+    row('读者乙 江苏 11月9日', 235, 950), row('另一条一级留言', 163, 1030)];
+  const parsed = parseArticleComments(source);
+  assert.deepEqual(parsed.comments.map(item => [item.author, item.content, item.reply]), [
+    ['读者甲', '一级留言', false], ['回复者', '缩进的回复正文', true], ['读者乙', '另一条一级留言', false],
+  ]);
+  assert.deepEqual(parseArticleComments(source, {topLevelOnly: true}).comments.map(item => item.author), ['读者甲', '读者乙']);
+});
+
 test('T13 small right-side advertisement markers delimit only the preceding comment', () => {
   for (const marker of ['广告', '广告♥', '广告<']) {
     const source = [row('留言2', 55, 400), row('甲 上海 11月9日', 163, 600), row('正常正文提到京东和广告应保留', 163, 680),

@@ -29,6 +29,7 @@ export function wechatPostEvent({task, card, rank, shareUrl, info, comments, cap
       coverUrl: bounded(info.coverUrl, 2000), isImage: info.isImage === true, exportId: bounded(info.exportId, 200)},
     comments: {
       status: comments?.status ?? 'disabled',
+      ...(comments?.reason ? {reason: bounded(comments.reason, 160)} : {}),
       headerCount: Number.isSafeInteger(comments?.headerCount) ? comments.headerCount : null,
       items: (comments?.items ?? []).slice(0, 500).map(item => ({author: bounded(item.author, 120), location: bounded(item.location, 20),
         timeLabel: bounded(item.timeLabel, 40), content: bounded(item.content, 2000),
