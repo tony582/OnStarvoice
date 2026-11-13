@@ -125,7 +125,7 @@ function plain(value) {
 
 // state 可以在两个 harness 之间共享：第二个 harness 相当于 service worker 重启
 // （内存里的中继登记、中止标记、tabs.onCreated 记录全部丢失，存储与标签页保留）。
-function createHarness({state = null} = {}) {
+function createHarness({state = null, clock = null} = {}) {
   const shared = state || {
     storage: {},
     sessionStore: {},
@@ -402,10 +402,11 @@ function createHarness({state = null} = {}) {
     atob: globalThis.atob,
     btoa: globalThis.btoa,
     clearInterval,
-    clearTimeout,
+    clearTimeout: clock?.clearTimeout || clearTimeout,
     fetch,
     setInterval,
-    setTimeout: unrefSetTimeout,
+    ...(clock ? {Date: clock.Date} : {}),
+    setTimeout: clock?.setTimeout || unrefSetTimeout,
     importScripts() {},
     OnStarvoiceCloudTaskAgent: {
       buildHeartbeatPayload(options = {}) {
@@ -444,7 +445,7 @@ function createHarness({state = null} = {}) {
       `  claimUnattendedKeywordRun,\n` +
       `  renewCaptureExecutionLock,\n` +
       `  readActiveCaptureExecutionLock,\n` +
-      `  markCaptureRequestAborted,\n` +
+      `  markCaptureRequestAborted, markContentRelayHeartbeat, getContentRelayTimeoutMs, updateUnattendedKeywordRun, applyUnattendedWakeGrace, attemptUnattendedRecoverySelfStop,\n` +
       `  isCaptureRequestAborted,\n` +
       `  listRequestRelays,\n` +
       `  listOwnedCaptureTabsForRequest,\n` +
@@ -1942,4 +1943,194 @@ test("another rotation before the self-stop proves keeps the older attempt in sc
   // A1 的 runner 仍按旧轮次处理（不是 request_changed）。
   assert.equal(second.selfStopReason, "capture_still_active");
   assertSelfStopSafety(harness);
+});
+
+test("marking an in-flight capture aborted rejects promptly and cancels its exact id once", async () => {
+  const h = createHarness();
+  seedRunningRequest(h);
+  h.content(SOURCE_TAB).onAction = () => new Promise(() => {});
+  const relay = h.api.relay(SOURCE_TAB, {
+    action: "captureSingleNote", captureRequestId: CAPTURE_ID,
+  });
+  let outcome;
+  void relay.then(() => { outcome = "success"; }, error => { outcome = error.code; });
+  h.api.markCaptureRequestAborted(CAPTURE_ID);
+  h.api.markCaptureRequestAborted(CAPTURE_ID);
+  await waitFor(() => outcome, {timeoutMs: 850});
+  assert.equal(outcome, "CAPTURE_CANCELED");
+  const cancels = h.sentTabMessages.filter(({payload}) => payload.action === "cancelCapture");
+  assert.deepEqual(cancels.map(({tabId, payload}) => [tabId, payload.captureRequestId]), [
+    [SOURCE_TAB, CAPTURE_ID],
+  ]);
+  assert.deepEqual(h.forbiddenTabCalls.reload, []);
+});
+
+test("self-stop aborts the blocked producer and closes the runner on its first flushed receipt", async () => {
+  const h = createHarness();
+  seedRunningRequest(h);
+  h.content(SOURCE_TAB).onAction = () => new Promise(() => {});
+  const relay = h.api.relay(SOURCE_TAB, {
+    action: "captureSingleNote", captureRequestId: CAPTURE_ID,
+  }, {runnerRequestId: REQUEST_ID, runnerAttemptId: A1});
+  const receipt = relay.catch(async error => {
+    assert.equal(error.code, "CAPTURE_CANCELED");
+    await retireRunner(h);
+  });
+  await recover(h);
+  assert.equal(h.storage[REQUEST_KEY].recoverySelfStop?.done?.tries, 1);
+  assert.equal(h.storage[REQUEST_KEY].recoverySelfStop?.done?.runnerClosedWithoutReceipt, false);
+  assert.equal(h.tabs.has(RUNNER_TAB), false);
+  assert.deepEqual(h.forbiddenTabCalls.reload, []);
+  await receipt;
+});
+
+test("a missing or discarded old runner does not keep its stale flushing receipt alive", async () => {
+  for (const missing of [true, false]) {
+    const h = createHarness();
+    seedRunningRequest(h);
+    await retireRunner(h, A1, {flushing: true, flushed: false, pendingUploads: 2});
+    if (missing) h.tabs.delete(RUNNER_TAB);
+    else h.patchTab(RUNNER_TAB, {discarded: true});
+    h.killDocument(RUNNER_DOCUMENT);
+    await recover(h, "runner_tab_missing");
+    assert.equal(h.storage[REQUEST_KEY].recoverySelfStop?.done?.tries, 1);
+    assert.equal(h.storage[REQUEST_KEY].recoverySelfStop?.done?.runnerGoneWithoutReceipt, true);
+  }
+});
+
+test("wake grace publishes the source and accepts a fresh heartbeat from the same attempt", async () => {
+  const h = createHarness();
+  const request = seedRunningRequest(h);
+  const protectedRequest = await h.api.applyUnattendedWakeGrace(request, "runner_tab_frozen");
+  assert.equal(protectedRequest.progress.wakeReason, "runner_tab_frozen");
+  await h.api.updateUnattendedKeywordRun({
+    requestId: REQUEST_ID, attemptId: A1,
+    patch: {heartbeatAt: new Date().toISOString()},
+  });
+  const health = await h.api.superviseUnattendedKeywordRun();
+  assert.equal(health.healthy, true);
+  assert.equal(h.storage[REQUEST_KEY].attemptId, A1);
+  assert.equal(h.storage[REQUEST_KEY].wakeGraceUntil, "");
+});
+
+function createRelayClock() {
+  let now = Date.now();
+  let sequence = 0;
+  const timers = new Map();
+  return {
+    Date: class extends Date {
+      constructor(...args) { super(...(args.length ? args : [now])); }
+      static now() { return now; }
+    },
+    setTimeout(handler, delay) {
+      const id = ++sequence;
+      timers.set(id, {handler, at: now + delay});
+      return id;
+    },
+    clearTimeout(id) { timers.delete(id); },
+    async advance(ms) {
+      const end = now + ms;
+      for (;;) {
+        const [id, next] = [...timers].sort(([, a], [, b]) => a.at - b.at)[0] || [];
+        if (!next || next.at > end) break;
+        now = next.at;
+        timers.delete(id);
+        next.handler();
+        await new Promise(resolve => setImmediate(resolve));
+      }
+      now = end;
+    },
+  };
+}
+
+test("waiting progress does not renew the 90-second watchdog, but a growing count does", async () => {
+  for (const growing of [false, true]) {
+    const clock = createRelayClock();
+    const h = createHarness({clock});
+    seedRunningRequest(h);
+    h.content(SOURCE_TAB).onAction = () => new Promise(() => {});
+    let failure;
+    void h.api.relay(SOURCE_TAB, {
+      action: "captureSingleNote", captureRequestId: CAPTURE_ID, maxDurationMs: 600000,
+    }, {runnerRequestId: REQUEST_ID, runnerAttemptId: A1}).catch(error => {
+      failure = error.code;
+    });
+    for (let tick = 1; tick <= 2; tick++) {
+      await clock.advance(40000);
+      h.api.markContentRelayHeartbeat({
+        captureRequestId: CAPTURE_ID, phase: "waiting_detail", loadedCount: growing ? tick : 0,
+      });
+    }
+    await clock.advance(10000);
+    assert.equal(failure, growing ? undefined : "CONTENT_RELAY_STALLED");
+  }
+});
+
+test("a long ordinary relay shares a five-minute ceiling with its retry", async () => {
+  const clock = createRelayClock();
+  const h = createHarness({clock});
+  seedRunningRequest(h);
+  const workerId = await createRegisteredWorker(h);
+  let attempts = 0;
+  h.addTab({id: workerId, url: "https://www.douyin.com/video/1", content: {
+    onAction(payload) {
+      if (payload.action === "ping") return {ok: true};
+      attempts += 1;
+      return new Promise(() => {});
+    },
+  }});
+  let outcome;
+  const payload = {action: "captureSingleNote", captureRequestId: CAPTURE_ID, maxDurationMs: 600000};
+  void h.api.relay(workerId, payload, {
+    runnerRequestId: REQUEST_ID, runnerAttemptId: A1, taskId: TASK_KEY,
+  }).catch(error => { outcome = error.code; });
+  await clock.advance(90000);
+  for (let index = 1; index <= 4; index++) {
+    await clock.advance(40000);
+    h.api.markContentRelayHeartbeat({captureRequestId: CAPTURE_ID, loadedCount: index});
+  }
+  await clock.advance(50000);
+  assert.equal(h.api.getContentRelayTimeoutMs(payload, 360000), 300000);
+  assert.equal(attempts, 2);
+  assert.equal(outcome, "CONTENT_RELAY_TIMEOUT");
+});
+
+test("forcing an old flushing runner requires ten stagnant minutes and preserves protected tabs", async () => {
+  for (const scenario of ["early", "stagnant", "improving", "focused", "current", "progress", "lock"]) {
+    const clock = createRelayClock();
+    const h = createHarness({clock});
+    seedRunningRequest(h);
+    const a2 = {...h.storage[REQUEST_KEY], attemptId: "attempt-2", previousAttemptId: A1,
+      status: "recovering", runnerTabId: null};
+    h.storage[REQUEST_KEY] = a2;
+    const intent = {fromAttemptId: A1, runnerTabId: RUNNER_TAB,
+      progressTabId: scenario === "progress" ? RUNNER_TAB : SOURCE_TAB,
+      startedAt: new Date(clock.Date.now()).toISOString(), captureRequestIds: [CAPTURE_ID]};
+    const options = {mode: "recovery", tryIndex: 1};
+    await retireRunner(h, A1, {flushing: true, flushed: false, pendingUploads: 0, producerStopped: true});
+    const first = await h.api.attemptUnattendedRecoverySelfStop(a2, intent, options);
+    assert.equal(first.reason, "checkpoint_reports_pending", scenario);
+    await clock.advance(scenario === "early" ? 599000 : 600000);
+    if (scenario === "improving") {
+      // A change in a previously known pending count restarts the observation window.
+      await retireRunner(h, A1, {flushing: true, flushed: false, pendingUploads: 1, producerStopped: true});
+    }
+    if (scenario === "focused") {
+      h.patchTab(RUNNER_TAB, {active: true, lastAccessed: clock.Date.now()});
+      h.state.windowFocus.set(1, true);
+    }
+    if (scenario === "current") {
+      h.patchTab(RUNNER_TAB, {url: runnerUrl(REQUEST_ID, a2.attemptId)});
+    }
+    if (scenario === "lock") h.storage[LOCK_KEY].holderTabId = RUNNER_TAB;
+    const result = await h.api.attemptUnattendedRecoverySelfStop(a2, intent, options);
+    if (scenario === "stagnant") {
+      assert.equal(result.done?.runnerClosedWithoutReceipt, true);
+      assert.equal(result.done?.abandonedPendingUploads, 0);
+      assert.deepEqual(h.removedTabIds, [RUNNER_TAB]);
+    } else {
+      assert.deepEqual(h.removedTabIds, [], scenario);
+    }
+    assert.equal(h.tabs.has(SOURCE_TAB), true);
+  }
 });

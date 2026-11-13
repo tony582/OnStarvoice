@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
+import {createRecordSyncQueue} from "../../utils/record-sync-queue.js";
 
 // 0.4.19：请求槽换代后，旧轮次的 runner 立即退役（事件驱动，不等卡住的流水线）。
 
@@ -31,6 +32,7 @@ function createRunner({
   activeAttemptId = "attempt-1",
   queue = null,
   flushMs = 60 * 1000,
+  producerStopMs = 120 * 1000,
 } = {}) {
   const calls = {
     cancelFlags: [],
@@ -73,6 +75,7 @@ function createRunner({
     activeUnattendedStreamingSyncQueue: queue,
     retiredUnattendedAttemptKey: "",
     UNATTENDED_ATTEMPT_RETIREMENT_FLUSH_MS: flushMs,
+    UNATTENDED_ATTEMPT_PRODUCER_STOP_MS: producerStopMs,
   });
   context.sendUnattendedRuntimeMessage = message => context.chrome.runtime.sendMessage(message);
   vm.runInContext(
@@ -400,4 +403,49 @@ test('a retirement receipt the background refuses is not resent, while pending u
     assert.equal(sends, 1, `the first refusal is final (${withQueue ? 'with' : 'without'} uploads)`);
     if (withQueue) assert.ok(drains >= 3, 'uploads still drain to completion');
   }
+});
+
+test("retirement counts skipped and permanent failures separately from retryable uploads", async () => {
+  for (const retryable of [false, true]) {
+    const saved = new Map([
+      ["skipped", {synced: false}], ["permanent", {synced: false}],
+      ["success", {synced: false}], ...(retryable ? [["retry", {synced: false}]] : []),
+    ]);
+    const queue = createRecordSyncQueue({
+      shouldRetry: result => result.code === "NETWORK_ERROR",
+      processRecord: async ({recordId}) => {
+        if (recordId === "skipped") return {ok: true, skipped: true};
+        if (recordId === "permanent") return {ok: false, code: "INVALID_RECORD"};
+        if (recordId === "retry") return {ok: false, code: "NETWORK_ERROR"};
+        saved.get(recordId).synced = true;
+        return {ok: true};
+      },
+    });
+    for (const id of saved.keys()) queue.enqueue(id);
+    await queue.drain();
+    const runner = createRunner({queue});
+    await runner.context.__retire({requestId: "request-r", attemptId: "attempt-1"});
+    const receipt = runner.calls.messages.at(-1);
+    assert.equal(receipt.skippedCount, 1);
+    assert.equal(receipt.permanentFailedCount, 1);
+    assert.equal(receipt.flushed, !retryable);
+    assert.equal(receipt.pendingUploads, Number(retryable));
+    assert.deepEqual(saved.get("skipped"), {synced: false});
+    assert.deepEqual(saved.get("permanent"), {synced: false});
+  }
+});
+
+test("after the producer wait expires, the queue drains and the receipt still requires the producer to exit", async () => {
+  const queue = createQueue({remainingBefore: 1});
+  let finishProducing;
+  const stopped = new Promise(resolve => { finishProducing = resolve; });
+  queue.whenProducerStopped = () => stopped;
+  const runner = createRunner({queue, producerStopMs: 15, flushMs: 40});
+  await runner.context.__retire({requestId: "request-r", attemptId: "attempt-1"});
+  assert.equal(queue.getStats().remainingCount, 0);
+  assert.equal(runner.calls.messages.at(-1).producerStopTimedOut, true);
+  assert.equal(runner.calls.messages.at(-1).flushed, false);
+  finishProducing();
+  await settle();
+  assert.equal(runner.calls.messages.at(-1).flushed, true);
 });

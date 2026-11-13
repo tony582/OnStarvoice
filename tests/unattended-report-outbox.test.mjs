@@ -1158,3 +1158,33 @@ test('final closure drains its own real outbox while another request and success
   assert.deepEqual(storedEntries(harness.storage).map(e => [e.requestId, e.attemptId]).sort(), [['R', 'new'], ['other', 'A']]);
   assert.equal(harness.timers.size, 0);
 });
+
+test("sidebar and background flushes serialize delivery without deleting a new revision", async () => {
+  const storage = createStorage();
+  const requestId = "concurrent-r";
+  const attemptId = "concurrent-a";
+  await enqueueUnattendedCheckpointReport({requestId, attemptId, patch: {progressSeq: 1, checkpoint: {}}}, {storage});
+  const sent = [];
+  let enter;
+  let finish;
+  const entered = new Promise(resolve => { enter = resolve; });
+  const finishing = new Promise(resolve => { finish = resolve; });
+  const send = async ({patch}) => {
+    sent.push(patch.progressSeq);
+    if (patch.progressSeq === 1) {
+      enter();
+      await finishing;
+    }
+    return {ok: true, accepted: true};
+  };
+  const sidebar = flushUnattendedCheckpointReportOutbox({requestId, attemptId, send}, {storage});
+  await entered;
+  const background = flushUnattendedCheckpointReportOutbox({requestId, attemptId, send}, {storage});
+  await new Promise(resolve => setImmediate(resolve));
+  const before = [...sent];
+  await enqueueUnattendedCheckpointReport({requestId, attemptId, patch: {progressSeq: 2, checkpoint: {}}}, {storage});
+  finish();
+  await Promise.all([sidebar, background]);
+  assert.deepEqual(before, [1]);
+  assert.deepEqual(sent, [1, 2]);
+});

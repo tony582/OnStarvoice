@@ -2803,3 +2803,38 @@ test("the cloud agent advertises previousCaptureStopCheckV1 and posts receipts t
   const skipped = await agent.completeStopFenceCheck({token: "t", checkId: ""});
   assert.equal(skipped.reason, "missing_check_id");
 });
+
+test("node check drains its two old checkpoints with no runner and leaves another request alone", async () => {
+  const h = createHarness();
+  seedTypicalFence(h);
+  h.tabs.delete(30);
+  const row = (requestId, attemptId) => ({
+    id: `${requestId}:${attemptId}`, requestId, attemptId, revision: attemptId,
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    patch: {checkpoint: {completedKeywords: []}},
+  });
+  const old1 = `${OUTBOX_PREFIX}${REQUEST_ID}:${PREVIOUS_ATTEMPT_ID}`;
+  const old2 = `${OUTBOX_PREFIX}${REQUEST_ID}:attempt-0`;
+  const foreign = `${OUTBOX_PREFIX}different:attempt-1`;
+  h.storage[old1] = row(REQUEST_ID, PREVIOUS_ATTEMPT_ID);
+  h.storage[old2] = row(REQUEST_ID, "attempt-0");
+  h.storage[foreign] = row("different", "attempt-1");
+
+  const result = await runCheck(h);
+  assert.equal(result.reason, "previous_capture_stopped", JSON.stringify(result));
+  assert.equal(h.storage[old1], undefined);
+  assert.equal(h.storage[old2], undefined);
+  assert.equal(h.storage[foreign].requestId, "different");
+});
+
+test("operator confirmation releases a recovery fence without a final retirement receipt", async () => {
+  const h = createHarness();
+  seedTypicalFence(h);
+  h.storage[REQUEST_KEY].recoverySelfStop = {fromAttemptId: PREVIOUS_ATTEMPT_ID};
+  const result = plain(await h.api.releaseStopFenceLocalResourcesForOperator(
+    buildOffer({mode: "release_only", checkId: "release-recovery"}),
+  ));
+  assert.equal(result.reason, "local_release_done", JSON.stringify(result));
+  assert.equal(result.runnerClosedWithoutReceipt, true);
+  assert.deepEqual(h.removedTabIds, [30]);
+});
