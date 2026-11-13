@@ -8,7 +8,7 @@ const TOP_LEVEL_X = [120, 185];
 const REPLY_X = [186, 320];
 const LIKE_X = 860;
 const TIME_AT_END = /^(.*?)[\s.。…·]*((?:\d{1,4}\s*(?:分钟|小时|天|周|星期|个月|年)前)|刚刚|昨天|前天|(?:\d{4}年)?\d{1,2}月\d{1,2}日|\d{1,2}-\d{1,2})$/u;
-const BADGES = /(已帮作者上热门|帮作者上热门|作者赞过|作者|置顶|热评)/gu;
+const COMMENT_BADGES = /已?帮作者上热门|作者(?:赞|回复)过|置顶|热评/gu;
 const NOISE_PREFIX = /^[^\p{L}\p{N}]+/u;
 // "4条回复～"; OCR sometimes reads 复 or the arrow as く/～, so only the number and 条回 are required.
 const REPLIES = /^(?:展开)?(\d{1,4})\s*条回/u;
@@ -35,7 +35,8 @@ function header(row) {
   const text = row.text.normalize('NFKC').trim();
   const match = text.match(TIME_AT_END);
   if (!match || !match[1].trim()) return null;
-  const tokens = match[1].replace(BADGES, ' ').replace(NOISE_PREFIX, '').trim().split(/\s+/u).filter(Boolean);
+  const byline = match[1].replace(COMMENT_BADGES, ' ');
+  const tokens = byline.replace(/作者/gu, ' ').replace(NOISE_PREFIX, '').trim().split(/\s+/u).filter(Boolean);
   if (!tokens.length) return null;
   let location = '';
   if (tokens.length > 1 && /^[一-龥]{2,3}$/u.test(tokens.at(-1))) location = tokens.pop();
@@ -47,7 +48,7 @@ function header(row) {
   }
   // Verified/medal glyphs after a name come back as symbols (∞, ♥, V).
   const author = tokens.join(' ').replace(/[\s.。…·•∞♥♡❤✓√()（）°]+0*$/u, '').replace(/\s+0+$/u, '').trim();
-  return author ? {author, location, timeLabel: match[2].replace(/\s+/gu, '')} : null;
+  return author ? {author, location, timeLabel: match[2].replace(/\s+/gu, ''), postAuthor: byline.includes('作者')} : null;
 }
 
 const number = text => {
@@ -60,7 +61,11 @@ const number = text => {
  * The bylines also provide scroll anchors when a comment body is cut off.
  */
 export function parseCommentScreen(rows, {bottom = COMMENT_INPUT_TOP} = {}) {
-  const visible = rows.filter(row => row.y >= PANEL_TOP - 20 && row.y + row.h <= bottom).sort((a, b) => a.y - b.y || a.x - b.x);
+  const visible = rows.filter(row => {
+    const gap = bottom - row.y - row.h;
+    // A cropped byline at the bottom can otherwise be mistaken for the previous comment's body.
+    return row.y >= PANEL_TOP - 20 && gap >= 0 && (row.h >= 35 || gap > 12);
+  }).sort((a, b) => a.y - b.y || a.x - b.x);
   const title = visible.find(row => row.y < PANEL_TOP + 60 && /^评论/u.test(row.text.replace(/\s+/gu, '')));
   const headerCount = title ? number(title.text.replace(/^评论/u, '')) : null;
   const comments = [], expand = [];
@@ -89,13 +94,14 @@ export function parseCommentScreen(rows, {bottom = COMMENT_INPUT_TOP} = {}) {
     const head = (inTop || inReply) ? header(row) : null;
     if (head) inAd = false;
     else if (inAd) continue;
-    if (head && /作者/u.test(row.text) && !post) {
-      post = {...head, caption: ''}; captionOpen = true; current = null;
-      continue;
-    }
     if (head) {
-      current = {...head, content: '', likeCount: null, reply: inReply, headerY: row.y, lastY: row.y};
-      current.key = `${comparable(head.author)}@${row.y}`;
+      const {postAuthor, ...byline} = head;
+      if (postAuthor && inTop && !post && !comments.length) {
+        post = {...byline, caption: ''}; captionOpen = true; current = null;
+        continue;
+      }
+      current = {...byline, content: '', likeCount: null, reply: inReply, headerY: row.y, lastY: row.y};
+      current.key = `${comparable(byline.author)}@${row.y}`;
       comments.push(current); captionOpen = false;
       continue;
     }
@@ -159,9 +165,18 @@ function withinTwoEdits(a, b) {
   return previous.get(b.length) <= 2;
 }
 
+const withoutBadge = name => name.replace(/(?:[凶∞]+0{0,2}|0{1,2})$/u, '');
+function adjacentNamesAgree(a, b) {
+  const left = comparable(a), right = comparable(b);
+  if (!left || !right) return false;
+  if (left === right) return true;
+  const leftName = withoutBadge(left), rightName = withoutBadge(right);
+  return leftName === right || rightName === left || Boolean(leftName && leftName === rightName);
+}
+
 function adjacentOcrVariant(a, b) {
   if (!a.location || !a.timeLabel || a.location !== b.location || a.timeLabel !== b.timeLabel
-    || !comparable(a.author) || comparable(a.author) !== comparable(b.author)) return false;
+    || !adjacentNamesAgree(a.author, b.author)) return false;
   const x = bareText(a.content), y = bareText(b.content);
   // Tiny comments need stronger evidence than an edit allowance of two characters.
   return similarity(x, y) >= 0.8 || (Math.min(x.length, y.length) >= 5 && withinTwoEdits(x, y));

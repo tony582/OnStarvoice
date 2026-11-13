@@ -94,7 +94,8 @@ export async function runWechatTask({task, store, device, permit, preview, clock
     const journal = new DeviceClosureJournal({store, task, clock, deviceClosureVerified});
     ledger = new BudgetLedger({task, store, clock, resumeAuthorized, excludedElapsedMs: preparationMs});
     gate = new OperationGate({permit, beforeAction: () => ledger.assertAllowed(), journal, timeoutMs: actionTimeoutMs});
-    const call = (method, params = {}) => gate.run(signal => device[method]({...params, signal}), method);
+    const call = (method, params = {}) => gate.run((signal, {budgetMs}) =>
+      device[method]({...params, signal, ...(method === 'readComments' ? {budgetMs} : {})}), method);
     const state = await call('inspect');
     requireEvidence(state?.deviceId === task.deviceId, 'device_identity_mismatch');
     if (state.readyForSearch === false) throw new RunnerFault(state.reason ?? 'device_not_ready');

@@ -4,6 +4,7 @@ import {readFileSync} from 'node:fs';
 import {textsAgree,mergeCommentScreens,parseCommentScreen} from '../src/device/wechat-comments-parse.mjs';
 const c=(content,reply=false,extras={})=>({author:'同一位车主',content,reply,likeCount:null,...extras});
 const fixture = JSON.parse(readFileSync(new URL('./fixtures/wechat/comments-retest-20261113.json', import.meta.url)));
+const dasheng = JSON.parse(readFileSync(new URL('./fixtures/wechat/comments-finish-20261113.json', import.meta.url))).dasheng;
 const topLevel = screens => screens.map(rows => {
   const parsed = parseCommentScreen(rows);
   return {...parsed, comments: parsed.comments.filter(item => !item.reply)};
@@ -24,6 +25,52 @@ test('real Gao replay preserves both different comments from 唯', () => {
   const items = mergeCommentScreens(topLevel(fixture.gao));
   assert.deepEqual(items.map(item => [item.author, item.content]),
     [['唯', '前提我需要一个 优盘里面的内容'], ['唯', '来一个']]);
+});
+
+test('Dasheng screen 005 leaves the cropped reply byline out of 老李’s body', () => {
+  const screens = topLevel(dasheng.slice(3, 5));
+  const readings = screens.map(screen => screen.comments.find(item => item.author === '老李').content);
+  assert.deepEqual(readings, ['嘣嘣嘣嘣嘣嘣。', '嘣嘣嘣嘣嘣嘣。']);
+  assert.equal(mergeCommentScreens(screens).filter(item => item.author === '老李').length, 1);
+  // The height alone does not disqualify a complete short line higher in the panel.
+  const shortLine = {text:'嗯', x:150, y:850, w:35, h:30};
+  const rows = [{...shortLine, text:'另一位车主 广东 1天前', y:790, h:42}, shortLine];
+  assert.equal(parseCommentScreen(rows).comments[0].content, '嗯');
+});
+
+test('Dasheng screens 009 and 010 merge the same 郑钜涵 reading without rewriting the retained author', () => {
+  const screens = topLevel(dasheng.slice(7, 9));
+  for (const order of [screens, screens.toReversed()]) {
+    const kept = mergeCommentScreens(order).filter(item => item.author.startsWith('郑钜涵'));
+    assert.equal(kept.length, 1);
+    assert.equal(kept[0].author, order[0].comments.find(item => item.author.startsWith('郑钜涵')).author);
+  }
+});
+
+test('a badge suffix changes comparison only and does not override conflicting bylines', () => {
+  const base = c('留言正文一样', false, {author:'郑钜涵', location:'福建', timeLabel:'4天前'});
+  const merge = (a, b) => mergeCommentScreens([{comments:[a]}, {comments:[b]}]);
+  for (const badge of ['0', '00', '凶', '∞']) {
+    const variant = {...base, author:base.author + badge};
+    assert.deepEqual(merge(variant, base).map(item => item.author), [variant.author]);
+  }
+  assert.deepEqual(merge({...base, author:'车友1000'}, {...base, author:'车友10'}).map(item => item.author), ['车友1000']);
+  assert.equal(merge(base, {...base, author:'郑钜涵00', location:'江苏'}).length, 2);
+  assert.equal(merge(base, {...base, author:'郑钜涵00', timeLabel:'3天前'}).length, 2);
+  assert.equal(merge(base, {...base, author:'郑钜涵00', content:'这段留言是另一回事'}).length, 2);
+  assert.equal(merge({...base, author:'0'}, {...base, author:'00'}).length, 2);
+});
+
+test('Dasheng replay has 26 distinct top-level comments with the known second image omitted', () => {
+  // Screens 004 and 008 were rejected for missing overlap; 005 and 009 are the accepted reverse readings.
+  const screens = topLevel(dasheng.filter((_, index) => index !== 2 && index !== 6));
+  const items = mergeCommentScreens(screens);
+  assert.deepEqual(items.map(item => item.author), [
+    '郑兴媛00', 'jm0', '佐助;Sars k', '威龙', '阿宁695200', 'Liu文博600', '老李', 'XX尼德', '微笑天使', '雨林777300',
+    '电焊气割1755凶', '郑钜涵', '桅柠.K', '笑笑', '马浩宇', '张永衡', '重庆', 'juj天通苑', '狩喵', 'Slow Drown', '黄宝熠',
+    '郁文8529', '豆', '水果', '婷婷RXT', '马健翔',
+  ]);
+  assert.ok(items.every(item => item.reply === false && item.parentIndex === null));
 });
 
 test('one-character differences merge only on adjacent screens with the same author, place and time', () => {

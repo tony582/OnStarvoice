@@ -49,6 +49,7 @@ export const SWIPE = Object.freeze({
   results: [540, 1900, 540, 820, 450],
   comments: [540, 1950, 540, 1150, 600, 200],
   commentsBack: [540, 1150, 540, 1550, 600, 200],
+  commentsTowardTop: [540, 1150, 540, 1950, 600, 200],
   shareRow2: [900, 1880, 150, 1880, 400],
 });
 export const REGION = Object.freeze({
