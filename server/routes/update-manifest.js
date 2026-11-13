@@ -3,12 +3,24 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.33',
+  latestVersion: '0.4.34',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-11-08',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.33-20261108.zip',
+  releaseDate: '2026-11-13',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.34-20261113.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.34',
+      releaseDate: '2026-11-13',
+      releaseNotes: [{
+        tag: '无人值守稳定性',
+        notes: [
+          {title: '单帖卡住后继续', desc: '抖音页面卡住时只跳过当前这一帖，任务继续。'},
+          {title: '停止立即生效', desc: '停止会立刻生效，已保存的数据继续冲刷。'},
+          {title: '节点自动核对', desc: '旧运行页安全停止后，节点自动放行，无需人工确认。'},
+        ],
+      }],
+    },
     {
       version: '0.4.33',
       releaseDate: '2026-11-08',

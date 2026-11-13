@@ -106,8 +106,8 @@ test('extension update manifest matches the packaged source version', () => {
     aboutHtml,
     new RegExp(`扩展 v${manifest.version.replaceAll('.', '\\.')}[^<]*<span class="date">${EXTENSION_UPDATE_MANIFEST.releaseDate}<\\/span><span class="pill">最新<\\/span>`, 'u'),
   );
-  assert.deepEqual(EXTENSION_UPDATE_MANIFEST.releases.slice(1, 19).map(release => release.version),
-    ['0.4.32', '0.4.31', '0.4.30', '0.4.29', '0.4.28', '0.4.27', '0.4.26', '0.4.25', '0.4.24', '0.4.23', '0.4.22', '0.4.21', '0.4.20', '0.4.19', '0.4.18', '0.4.17', '0.4.15', '0.4.14']);
+  assert.deepEqual(EXTENSION_UPDATE_MANIFEST.releases.slice(1, 20).map(release => release.version),
+    ['0.4.33', '0.4.32', '0.4.31', '0.4.30', '0.4.29', '0.4.28', '0.4.27', '0.4.26', '0.4.25', '0.4.24', '0.4.23', '0.4.22', '0.4.21', '0.4.20', '0.4.19', '0.4.18', '0.4.17', '0.4.15', '0.4.14']);
   assert.match(JSON.stringify(EXTENSION_UPDATE_MANIFEST.releases.find(release => release.version === '0.4.8')?.releaseNotes), /半年内[\s\S]*不限时间[\s\S]*月历[\s\S]*邮件/u);
   assert.match(aboutHtml, /扩展 v0\.4\.7<span class="date">2026-09-08<\/span><\/h3>/u);
   assert.equal((aboutHtml.match(/<span class="pill">最新<\/span>/gu) || []).length, 1);
@@ -300,8 +300,6 @@ test('0.4.32 describes the self-heal handoffs and what still needs a person', ()
 
 test('0.4.33 describes counted repairs and the warning finish without promising every post', () => {
   assert.equal(EXTENSION_UPDATE_MANIFEST.minSupportedVersion, '0.3.51');
-  assert.equal(EXTENSION_UPDATE_MANIFEST.downloadUrl,
-    'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.33-20261108.zip');
   const release = EXTENSION_UPDATE_MANIFEST.releases.find(item => item.version === '0.4.33');
   assert.equal(release?.releaseDate, '2026-11-08');
   const notes = JSON.stringify(release.releaseNotes);
@@ -314,4 +312,17 @@ test('0.4.33 describes counted repairs and the warning finish without promising 
     assert.ok(about.includes(phrase), `about page: ${phrase}`);
   }
   assert.doesNotMatch(notes, /全部成功|不再失败|无需任何人工/u);
+});
+
+test('0.4.34 publishes the unattended relay, stop and automatic confirmation changes', () => {
+  assert.equal(EXTENSION_UPDATE_MANIFEST.downloadUrl,
+    'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.34-20261113.zip');
+  const release = EXTENSION_UPDATE_MANIFEST.releases[0];
+  assert.equal(release?.releaseDate, '2026-11-13');
+  const notes = JSON.stringify(release.releaseNotes);
+  const about = aboutHtml.slice(aboutHtml.indexOf('扩展 v0.4.34<'), aboutHtml.indexOf('扩展 v0.4.33<'));
+  for (const text of ['只跳过当前这一帖', '停止会立刻生效', '安全停止后，节点自动放行']) {
+    assert.ok(notes.includes(text));
+    assert.ok(about.includes(text));
+  }
 });
