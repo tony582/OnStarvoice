@@ -449,3 +449,47 @@ test("after the producer wait expires, the queue drains and the receipt still re
   await settle();
   assert.equal(runner.calls.messages.at(-1).flushed, true);
 });
+
+test("a successor retries only durable unsynced records from its own authorization scope", async () => {
+  const source = readSection(sidebarSource,
+    "async function retrySavedUnattendedRunnerUploads(",
+    "async function maybeRunAutoSyncAfterDetailCapture(");
+  const prefix = "onstarvoice.unattendedRunnerUploadHandoff.v1.";
+  const scopedKey = prefix + "own";
+  const otherKey = prefix + "foreign";
+  const records = new Map([
+    ["pending", {id: "pending", status: "draft"}],
+    ["already", {id: "already", status: "synced"}],
+    ["foreign", {id: "foreign", status: "draft"}],
+  ]);
+  const own = {agentId: "node", tenantId: "tenant", documentId: "old-runner",
+    recordIds: ["pending", "already"]};
+  const stored = {[scopedKey]: own, [otherKey]: {...own, tenantId: "foreign", recordIds: ["foreign"]}};
+  let oldRunnerAlive = true;
+  const sends = [];
+  const context = vm.createContext({
+    UNATTENDED_RUNNER_UPLOAD_HANDOFF_PREFIX: prefix,
+    navigator: {locks: {request: async (_name, _options, run) => run({})}},
+    chrome: {
+      runtime: {getContexts: async () => oldRunnerAlive ? [{documentId: "old-runner"}] : []},
+      storage: {local: {get: async () => ({...stored}), remove: async key => {delete stored[key];}}},
+    },
+    getAuth: async () => ({verified: true, captureAgent: {id: "node"}, tenant: {id: "tenant"}}),
+    getRecords: async ids => ids.map(id => records.get(id)).filter(Boolean),
+    maybeRunAutoSyncAfterDetailCapture: async (_settings, {recordIds}) => {
+      sends.push(...recordIds);
+      for (const id of recordIds) records.get(id).status = "synced";
+    },
+  });
+  vm.runInContext(source + "\nglobalThis.run = retrySavedUnattendedRunnerUploads;", context);
+  const settings = {autoSyncAfterDetailCapture: true};
+  await context.run(settings);
+  assert.deepEqual(sends, []);
+  assert.equal(stored[scopedKey], own);
+  oldRunnerAlive = false;
+  await context.run(settings);
+  assert.deepEqual(sends, ["pending"]);
+  assert.equal(stored[scopedKey], undefined);
+  assert.equal(stored[otherKey].tenantId, "foreign");
+  assert.equal(records.size, 3);
+});

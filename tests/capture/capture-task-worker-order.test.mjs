@@ -817,7 +817,9 @@ test("Douyin direct-route readiness failure falls back to the record search moda
   });
 });
 
-test("Douyin extractor readiness failure reuses its worker and advances only to the record modal", async () => {
+for (const timeout of [false, true]) test(timeout
+  ? "a Douyin relay timeout marks one detail failed and still captures the next record"
+  : "Douyin extractor readiness failure reuses its worker and advances only to the record modal", async () => {
   const sourceTab = {
     id: 73,
     windowId: 8,
@@ -835,6 +837,7 @@ test("Douyin extractor readiness failure reuses its worker and advances only to 
     url: "about:blank",
   };
   const noteId = "766193585000000101";
+  const nextNoteId = "766193585000000102";
   const directUrl = `https://www.douyin.com/video/${noteId}`;
   const modalUrl = `${sourceTab.url}&modal_id=${noteId}`;
   const navigationUrls = [];
@@ -867,6 +870,9 @@ test("Douyin extractor readiness failure reuses its worker and advances only to 
           captureTabIds.push(message.tabId);
           events.push(`capture:${captureCount}`);
           if (captureCount === 1) {
+            if (timeout) return {ok: false, error: {
+              code: "CONTENT_RELAY_TIMEOUT", message: "页面采集步骤超时",
+            }};
             return {
               ok: true,
               data: {
@@ -887,8 +893,8 @@ test("Douyin extractor readiness failure reuses its worker and advances only to 
               platform: "douyin",
               type: "single_note",
               data: {
-                noteId,
-                noteUrl: directUrl,
+                noteId: message.payload.expectedNoteId,
+                noteUrl: `https://www.douyin.com/video/${message.payload.expectedNoteId}`,
                 title: "Extractor fallback detail",
                 content: "Fallback capture succeeded from the record modal.",
                 author: "Fallback author",
@@ -1020,6 +1026,21 @@ test("Douyin extractor readiness failure reuses its worker and advances only to 
     },
   });
 
+  const recordIds = [recordId];
+  if (timeout) {
+    const nextRecord = await addRecord({
+      id: "douyin-extractor-after-timeout-r2",
+      type: "keyword_notes",
+      platform: "douyin",
+      meta: {sourceUrl: sourceTab.url},
+      payload: {searchUrl: sourceTab.url, items: [{
+        noteId: nextNoteId, noteType: "video", duration: "00:29",
+        url: `https://www.douyin.com/video/${nextNoteId}`,
+      }]},
+    });
+    recordIds.push(nextRecord.id);
+  }
+
   const activeTask = taskContext.beginTaskContext({
     taskType: "capture",
     featureKey: "capture.search",
@@ -1032,13 +1053,24 @@ test("Douyin extractor readiness failure reuses its worker and advances only to 
   });
 
   try {
-    const result = await captureSync.batchCaptureDetailsForRecords([recordId], {
+    const result = await captureSync.batchCaptureDetailsForRecords(recordIds, {
       skipAlreadyCaptured: false,
       captureTaskId: activeTask.taskId,
       detailNavTimeoutMs: 5000,
       detailAfterNavWaitMs: 1,
     });
 
+    if (timeout) {
+      assert.equal(result.failedCount, 1, JSON.stringify(result));
+      assert.equal(result.successCount, 1, JSON.stringify(result));
+      assert.equal(result.canceled, false);
+      assert.equal(result.results[0].recordId, recordId);
+      assert.equal(result.results[0].ok, false);
+      assert.equal(result.results[1].recordId, recordIds[1]);
+      assert.equal(result.results[1].ok, true);
+      assert.equal(sourceNavigationCount, 0);
+      return;
+    }
     assert.equal(result.ok, true, JSON.stringify(result));
     assert.equal(result.successCount, 1);
     assert.equal(createCount, 1);

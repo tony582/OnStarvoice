@@ -2001,7 +2001,9 @@ test("a missing or discarded old runner does not keep its stale flushing receipt
 
 test("wake grace publishes the source and accepts a fresh heartbeat from the same attempt", async () => {
   const h = createHarness();
-  const request = seedRunningRequest(h);
+  const request = seedRunningRequest(h, {
+    businessProgressAt: new Date(Date.now() - 20 * 60 * 1000).toISOString(),
+  });
   const protectedRequest = await h.api.applyUnattendedWakeGrace(request, "runner_tab_frozen");
   assert.equal(protectedRequest.progress.wakeReason, "runner_tab_frozen");
   await h.api.updateUnattendedKeywordRun({
@@ -2145,4 +2147,33 @@ test("forcing an old flushing runner requires ten stagnant minutes and preserves
     }
     assert.equal(h.tabs.has(SOURCE_TAB), true);
   }
+});
+
+test("a terminal node check records a forced close after observing the same old receipt for ten minutes", async () => {
+  const clock = createRelayClock();
+  const h = createHarness({clock});
+  seedRunningRequest(h);
+  h.storage[REQUEST_KEY] = {
+    ...h.storage[REQUEST_KEY], status: "needs_action", attemptId: "attempt-2",
+    previousAttemptId: A1, runnerTabId: null,
+    recoverySelfStop: {v: 1, fromAttemptId: A1},
+    error: {code: "PREVIOUS_CAPTURE_STOP_UNCONFIRMED"},
+  };
+  // The old runner can still flush; the platform source owns the lock tab.
+  h.storage[LOCK_KEY].holderDocumentId = "gone-lock-document";
+  h.killDocument("gone-lock-document");
+  await retireRunner(h, A1, {
+    flushing: true, flushed: false, pendingUploads: 0, producerStopped: true,
+  });
+  const first = await h.api.confirmPreviousUnattendedStopForFenceCheck(buildOffer());
+  assert.equal(first.reason, "checkpoint_reports_pending");
+  assert.equal(h.tabs.has(RUNNER_TAB), true);
+  await clock.advance(600000);
+  const second = await h.api.confirmPreviousUnattendedStopForFenceCheck(buildOffer());
+  assert.equal(second.reason, "previous_capture_stopped", JSON.stringify(second));
+  assert.equal(second.runnerClosedWithoutReceipt, true);
+  assert.equal(second.abandonedPendingUploads, 0);
+  assert.equal(second.forcedCloseEvent.type, "recovery_self_stop_forced_close");
+  assert.equal(h.tabs.has(RUNNER_TAB), false);
+  assert.equal(h.tabs.has(SOURCE_TAB), true);
 });

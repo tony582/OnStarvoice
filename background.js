@@ -155,6 +155,7 @@ const DEFAULT_RUNTIME = {
 
 const UNATTENDED_KEYWORD_ALARM_NAME = 'onstarvoice:unattended-keyword-plan';
 const UNATTENDED_SUPERVISOR_ALARM_NAME = 'onstarvoice:unattended-supervisor';
+const UNATTENDED_WAKE_HEARTBEAT_ALARM_NAME = 'onstarvoice:unattended-wake-heartbeat';
 const UNATTENDED_LOCAL_CLOSURE_ALARM_NAME =
   'onstarvoice:unattended-local-closure';
 const CLOUD_TASK_AGENT_ALARM_NAME = 'onstarvoice:cloud-task-agent';
@@ -1843,6 +1844,13 @@ function buildUnattendedTaskRun(request, previousRun = null) {
       recoveryCount: normalized.recoveryCount,
       maxRecoveryAttempts: UNATTENDED_MAX_RECOVERY_ATTEMPTS,
       recoveryReason: String(normalized.recoveryReason || ''),
+      ...(normalized.recoverySelfStop?.done?.runnerClosedWithoutReceipt
+        ? {runnerClosure: {
+            event: 'recovery_self_stop_forced_close',
+            runnerClosedWithoutReceipt: true,
+            abandonedPendingUploads: Number(normalized.recoverySelfStop.done.abandonedPendingUploads) || 0,
+          }}
+        : {}),
       recoveryWaitUntil: String(normalized.recoveryWaitUntil || ''),
       scheduledMode: plan.mode,
       keywordCount: plan.keywords.length,
@@ -11029,7 +11037,9 @@ function createStopFenceCheckContext(offer, state, epoch = null) {
   const fence = readStopFenceEvidence(request);
   const requestId = offer.requestId;
   const terminalAttemptIds = new Set(
-    [request?.attemptId, request?.previousAttemptId]
+    [request?.attemptId, request?.previousAttemptId, request?.recoverySelfStop?.fromAttemptId,
+      ...(Array.isArray(request?.recoverySelfStop?.olderAttemptIds)
+        ? request.recoverySelfStop.olderAttemptIds : [])]
       .map((value) => String(value || '').trim())
       .filter(Boolean),
   );
@@ -11049,6 +11059,7 @@ function createStopFenceCheckContext(offer, state, epoch = null) {
       isTerminalUnattendedRunStatus(request.status),
   );
   const ctx = {
+    mode: 'fence_check',
     offer,
     checkId: offer.checkId,
     serverTaskId: offer.taskId,
@@ -11795,8 +11806,8 @@ async function closeStopFenceRunnerTabs(ctx, {operatorConfirmed = false} = {}) {
           throw error;
         }
         if (!ctx.isClosableRunnerTab(liveTab)) continue;
-        if (operatorConfirmed && !await isSelfStopRequestSlotCurrent({...ctx, mode: 'fence_check'})) {
-          return {ok: false, reason: 'request_changed', closedTabIds};
+        if (operatorConfirmed && !await isSelfStopRequestSlotCurrent(ctx)) {
+          return {ok: false, reason: 'local_release_failed', closedTabIds};
         }
         // A 0.4.19 recovery runner may still own an in-memory upload queue.
         // A terminal request or an empty checkpoint outbox does not flush it.
@@ -11812,7 +11823,8 @@ async function closeStopFenceRunnerTabs(ctx, {operatorConfirmed = false} = {}) {
               const candidate = await readStagnantRunnerEvidence(ctx, liveTab, receipt);
               forced = candidate ? await revalidateStagnantRunner(ctx, candidate, lock) : null;
             }
-            if ((!forced && !operatorConfirmed) || isProtectedStopFenceRunner(ctx, tabId, lock)) {
+            if ((!forced && !operatorConfirmed) || isProtectedStopFenceRunner(ctx, tabId, lock) ||
+                (operatorConfirmed && await isStopFenceRunnerFocused(liveTab))) {
               return {ok: false, reason: 'checkpoint_reports_pending', closedTabIds};
             }
             withoutReceipt = true;
@@ -11966,6 +11978,7 @@ async function releaseStopFenceLocalResources(
   const closure = await runUnattendedRunMutation(async () => {
     const current = await readUnattendedKeywordRunRequest();
     if (!isStillTerminalR(current)) return {localStopConfirmationAt: ''};
+    const forcedEvent = ctx.forcedRunnerClosures?.length ? forcedRunnerCloseEvent(ctx) : null;
     const next = await persistUnattendedStopConfirmationWithinMutation(
       {
         ...current,
@@ -11975,6 +11988,12 @@ async function releaseStopFenceLocalResources(
           checkId: ctx.checkId,
           taskId: ctx.serverTaskId,
           proofStatus,
+          ...(ctx.runnerGoneWithoutReceipt ? {runnerGoneWithoutReceipt: true} : {}),
+          ...(ctx.runnerClosedWithoutReceipt ? {runnerClosedWithoutReceipt: true} : {}),
+          ...(forcedEvent ? {
+            event: forcedEvent,
+            abandonedPendingUploads: ctx.forcedRunnerClosures.reduce((sum, entry) => sum + entry.pendingUploads, 0),
+          } : {}),
         },
       },
       {stage: 'runtime_released', fingerprint, method},
@@ -12902,7 +12921,7 @@ async function readStagnantRunnerEvidence(ctx, tab, receipt) {
   const requestId = stopFenceRunnerRequestId(tab);
   if (!tabId || requestId !== ctx.requestId || !attemptId ||
       attemptId === (ctx.currentAttemptId || ctx.request?.attemptId) ||
-      !(ctx.terminalAttemptIds.has(attemptId) || ctx.request?.recoverySelfStop) ||
+      !ctx.terminalAttemptIds.has(attemptId) ||
       !ctx.isClosableRunnerTab(tab) ||
       !isUnattendedRunnerTabForRequest(tab, requestId, attemptId) ||
       (tab.pendingUrl && tab.pendingUrl !== tab.url) ||
@@ -12961,7 +12980,8 @@ async function revalidateStagnantRunner(ctx, candidate, lock) {
   if (!contexts.some(context => context.documentId === candidate.documentId &&
       context.tabId === candidate.tabId && context.documentUrl === tab.url)) return null;
   const evidence = await readStagnantRunnerEvidence(ctx, tab, receipt);
-  if (!evidence || evidence.documentId !== candidate.documentId) return null;
+  if (!evidence || evidence.documentId !== candidate.documentId ||
+      JSON.stringify(evidence.pendingRecordIds) !== JSON.stringify(candidate.pendingRecordIds)) return null;
   const outbox = await inspectUnattendedCheckpointOutboxAttempt(ctx.requestId, '', {anyAttempt: true});
   if (!outbox.known || outbox.pendingCount > 0) return null;
   return evidence;
@@ -13405,15 +13425,14 @@ async function attemptUnattendedRecoverySelfStop(request, intent, {
     }
     if (!verdict.ok) return fail(verdict.reason, {sweep, workers});
     // 第 4 步：旧 runner。
-    await flushUnattendedCheckpointReportsInBackground(ctx.requestId);
-    for (const sourceRequestId of ctx.sourceRequestIds) {
-      await flushUnattendedCheckpointReportsInBackground(sourceRequestId);
-    }
-    const outbox = await inspectUnattendedCheckpointOutboxAttempt(
-      ctx.requestId, '', {anyAttempt: true},
-    );
-    if (!outbox.known || outbox.pendingCount > 0) {
-      return fail('checkpoint_reports_pending', {sweep, workers});
+    for (const requestId of [ctx.requestId, ...ctx.sourceRequestIds]) {
+      await flushUnattendedCheckpointReportsInBackground(requestId);
+      const outbox = await inspectUnattendedCheckpointOutboxAttempt(
+        requestId, '', {anyAttempt: true},
+      );
+      if (!outbox.known || outbox.pendingCount > 0) {
+        return fail('checkpoint_reports_pending', {sweep, workers});
+      }
     }
     const runnerPlan = await planSelfStopRunners(ctx, sweep.runnerPending, {
       tryIndex,
@@ -14327,6 +14346,7 @@ async function inspectUnattendedLocalClosurePredicate(
       businessUploads,
     };
   }
+  await flushUnattendedCheckpointReportsInBackground(normalized.id, normalized.attemptId);
   const initialOutbox = await inspectUnattendedCheckpointOutboxAttempt(
     normalized.id,
     normalized.attemptId,
@@ -15134,11 +15154,29 @@ async function snapshotUnattendedKeywordPlanLock() {
 async function cancelAndReleaseUnattendedExecutionTargets(
   lockSnapshot,
   tabIds = [],
+  request = null,
 ) {
-  const relayedCount = await relayCancelToTabs([
-    ...tabIds,
-    lockSnapshot?.holderTabId,
+  const relays = request?.id
+    ? listRequestRelays(request.id, buildUnattendedCaptureTaskId(request.id))
+        .filter(relay => relay.captureRequestId &&
+          (!relay.runnerAttemptId || relay.runnerAttemptId === request.attemptId))
+    : [];
+  for (const relay of relays) markCaptureRequestAborted(relay.captureRequestId);
+  const scopedTargets = new Set(relays.map(relay => relay.tabId));
+  const fallbackTargets = [...tabIds, lockSnapshot?.holderTabId]
+    .filter(tabId => !scopedTargets.has(Number(tabId)));
+  const [legacyCount, scoped] = await Promise.all([
+    relayCancelToTabs(fallbackTargets),
+    Promise.all([...scopedTargets].map(async tabId => {
+      const captureIds = [...new Set(relays.filter(relay => relay.tabId === tabId)
+        .map(relay => relay.captureRequestId))];
+      await Promise.all(captureIds.map(id => cancelAbortedContentCapture(tabId, id)));
+      const proofs = await Promise.all(captureIds.map(captureRequestId =>
+        waitForContentCaptureToSettle(tabId, {captureRequestId})));
+      return proofs.every(proof => proof.ok);
+    })),
   ]);
+  const relayedCount = legacyCount + scoped.filter(Boolean).length;
   if (lockSnapshot?.id) {
     await releaseCaptureExecutionLock(lockSnapshot.id);
   }
@@ -15280,6 +15318,7 @@ async function cancelUnattendedKeywordRunFromControl({
   const relayedCount = await cancelAndReleaseUnattendedExecutionTargets(
     lockSnapshot,
     [explicitTabId, progressRunnerTabId],
+    request,
   );
 
   const now = new Date();
@@ -15395,7 +15434,7 @@ async function cleanupDisabledUnattendedKeywordPlanRuntime({
     }
     await cancelAndReleaseUnattendedExecutionTargets(lockSnapshot, [
       progress?.runnerTabId,
-    ]);
+    ], request);
   });
 }
 
@@ -16649,6 +16688,7 @@ async function updateUnattendedKeywordRun({requestId = '', attemptId = '', patch
       updatedAt: now,
     };
     if (receivedWakeHeartbeat) {
+      nextRequest.wakeReconnectedAt = now;
       nextRequest.wakeGraceUntil = '';
       if (nextRequest.recoveryWaitUntil === request.wakeGraceUntil) {
         nextRequest.recoveryWaitUntil = '';
@@ -16952,7 +16992,13 @@ async function assessUnattendedRunHealth(
     ) {
       return {healthy: false, reason: 'runner_heartbeat_stale'};
     }
-    const businessProgressAt = parseTimestampMs(request.businessProgressAt);
+    const reportedProgressAt = parseTimestampMs(request.businessProgressAt);
+    const reconnectedAt = parseTimestampMs(request.wakeReconnectedAt);
+    // The browser may have suspended both the runner and its business
+    // clock. Apply the same stall limit from the live document's reconnect.
+    const businessProgressAt = Number.isFinite(reconnectedAt)
+      ? Math.max(Number.isFinite(reportedProgressAt) ? reportedProgressAt : 0, reconnectedAt)
+      : reportedProgressAt;
     const progressPhase = String(request?.progress?.phase || '')
       .trim()
       .toLowerCase();
@@ -18385,6 +18431,10 @@ function scheduleUnattendedWakeHeartbeatCheck(request) {
     }
   }, UNATTENDED_WAKE_HEARTBEAT_POLL_MS);
   unattendedWakeHeartbeatTimer?.unref?.();
+  // An alarm backs up the ten-second fast path if MV3 suspends the worker.
+  void Promise.resolve(chrome.alarms.create(UNATTENDED_WAKE_HEARTBEAT_ALARM_NAME, {
+    when: parseTimestampMs(request.wakeGraceUntil) + UNATTENDED_WAKE_HEARTBEAT_POLL_MS,
+  })).catch(() => {});
 }
 
 async function applyUnattendedWakeGrace(request, reason = 'wake') {
@@ -18413,6 +18463,7 @@ async function applyUnattendedWakeGrace(request, reason = 'wake') {
       recoveryWaitUntil: wakeGraceUntil,
       updatedAt: now.toISOString(),
       wakeReason: reason,
+      wakeReconnectedAt: '',
       message,
       progress: {
         ...(current.progress && typeof current.progress === 'object'
@@ -18476,7 +18527,7 @@ async function superviseUnattendedKeywordRun({
       applyWakeGrace ||
       supervisorGap > UNATTENDED_SUPERVISOR_SUSPEND_GAP_MS ||
       alarmDelay > UNATTENDED_SUPERVISOR_SUSPEND_GAP_MS;
-    if (wokeFromSuspension && !removedCurrentRunner) {
+    if (wokeFromSuspension && !removedCurrentRunner && reason !== 'wake_heartbeat_poll') {
       const wakeReason = applyWakeGrace ? reason
         : alarmDelay > UNATTENDED_SUPERVISOR_SUSPEND_GAP_MS
           ? 'supervisor_alarm_delayed'
@@ -20759,6 +20810,10 @@ async function recordUnattendedAttemptRetired(message = {}, sender = {}) {
     return {ok: false, reason: 'not_unattended_runner'};
   }
   const pendingUploads = message?.pendingUploads;
+  const pendingRecordIds = Array.isArray(message?.pendingRecordIds)
+    ? [...new Set(message.pendingRecordIds.slice(0, 250)
+        .map(id => String(id || '').trim().slice(0, 160)).filter(Boolean))].sort()
+    : [];
   const producerStopped = message?.producerStopped === true;
   const previous = await readUnattendedAttemptRetiredReceipt(requestId, attemptId);
   const at = new Date().toISOString();
@@ -20768,7 +20823,8 @@ async function recordUnattendedAttemptRetired(message = {}, sender = {}) {
   const sameFlushing = flushing && previous?.flushing === true &&
     previous.documentId === documentId && previous.tabId === tabId &&
     previous.pendingUploads === pendingUploads &&
-    previous.producerStopped === producerStopped;
+    previous.producerStopped === producerStopped &&
+    JSON.stringify(previous.pendingRecordIds || []) === JSON.stringify(pendingRecordIds);
   const receipt = {
     v: 1,
     requestId,
@@ -20778,10 +20834,7 @@ async function recordUnattendedAttemptRetired(message = {}, sender = {}) {
     at,
     producerStopped,
     flushingSince: flushing ? sameFlushing ? previous.flushingSince || at : at : '',
-    pendingRecordIds: Array.isArray(message?.pendingRecordIds)
-      ? [...new Set(message.pendingRecordIds.slice(0, 250)
-          .map(id => String(id || '').trim().slice(0, 160)).filter(Boolean))]
-      : [],
+    pendingRecordIds,
     reason: String(message?.reason || 'attempt_superseded').trim().slice(0, 60),
     heartbeatStopped: message?.heartbeatStopped === true,
     producerStopTimedOut: message?.producerStopTimedOut === true,
@@ -20953,7 +21006,7 @@ async function canReloadUnattendedRelayWorker(tabId, owner) {
     const request = await readUnattendedKeywordRunRequest();
     const lock = await readStoredCaptureExecutionLock();
     const taskId = buildUnattendedCaptureTaskId(owner.runnerRequestId);
-    const group = captureTaskTabGroupManager?.getGroupByTaskId?.(taskId);
+    const group = captureTaskTabGroupManager?.getTask(taskId);
     const debug = captureDebugSessionManager?.getSessionByTaskId(taskId);
     const tab = await chrome.tabs.get(tabId);
     return request?.id === owner.runnerRequestId &&
@@ -21031,7 +21084,8 @@ async function relayToContentWithRetry(tabId, payload, owner = null) {
           error?.code === 'CONTENT_RELAY_TIMEOUT' ||
           error?.code === 'CONTENT_RELAY_STALLED'
         ) {
-          const cancellation = cancelTimedOutContentCapture(tabId, requestId);
+          const cancellation = supervised && !requestId
+            ? Promise.resolve() : cancelTimedOutContentCapture(tabId, requestId);
           if (Date.now() >= deadlineAt) throw error;
           await awaitStep(cancellation);
           if (requestId && isCaptureRequestAborted(requestId)) {
@@ -24511,6 +24565,14 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     syncCloudTaskAgent({reason: 'cloud_agent_alarm', force: true}).catch((error) => {
       console.error('[onstarvoice] cloud task agent heartbeat failed', error);
     });
+    return;
+  }
+  if (alarm?.name === UNATTENDED_WAKE_HEARTBEAT_ALARM_NAME) {
+    void readUnattendedKeywordRunRequest().then(request => {
+      if (request?.wakeGraceUntil && !isTerminalUnattendedRunStatus(request.status)) {
+        return superviseUnattendedKeywordRun({reason: 'wake_heartbeat_poll'});
+      }
+    }).catch(error => console.warn('[onstarvoice] unattended wake heartbeat alarm failed', error));
     return;
   }
   if (alarm?.name === UNATTENDED_SUPERVISOR_ALARM_NAME) {

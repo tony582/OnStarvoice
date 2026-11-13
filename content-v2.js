@@ -2200,7 +2200,12 @@ function handleCancelCapture(request, sendResponse) {
         Number(activeCaptureRequestCounts.get(targetRequestId)) || 0,
       ) > 0;
     const listCaptureMatched = rememberListCaptureCancellation(listCaptureRunId);
-    if (matched || listCaptureMatched) {
+    const unrelatedCaptureActive = Boolean(targetRequestId &&
+      [...activeCaptureRequestCounts.keys()].some(id => id !== targetRequestId));
+    // The scroll cancellation flag is shared by the document. A targeted
+    // request must never flip it while another capture is using this page.
+    const accepted = (matched || listCaptureMatched) && !unrelatedCaptureActive;
+    if (accepted) {
       setCancelFlag(true);
     }
     try {
@@ -2208,7 +2213,7 @@ function handleCancelCapture(request, sendResponse) {
         activeListCaptureDebugOverlay?.getState?.()?.sessionId,
       );
       if (
-        activeListCaptureDebugOverlay &&
+        accepted && activeListCaptureDebugOverlay &&
         (!listCaptureRunId || activeOverlayRunId === listCaptureRunId)
       ) {
         activeListCaptureDebugOverlay.cancel("用户已请求停止采集");
@@ -2216,7 +2221,6 @@ function handleCancelCapture(request, sendResponse) {
     } catch (error) {
       console.warn("[Content] List capture feedback cancel failed:", error);
     }
-    const accepted = matched || listCaptureMatched;
     sendResponse({
       ok: true,
       message: accepted ? "取消信号已发送" : "目标采集已不在当前页面运行",
