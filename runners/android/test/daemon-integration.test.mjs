@@ -26,6 +26,8 @@ test('setup keeps stable independent identity and private token but never activa
   assert.ok(!contents.includes('activation-secret'));
   assert.equal(statSync(join(f.directory, 'connection.json')).mode & 0o777, 0o600);
   assert.ok(f.state.calls.every(call => !call.token));
+  const version = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+  assert.ok(f.state.calls.length > 0 && f.state.calls.every(call => call.body.appVersion === version));
   await assert.rejects(setupRunner({...input, deviceId: 'ANOTHER_PHONE'}));
   await assert.rejects(setupRunner({...input, baseUrl: 'https://example.com'}));
 });

@@ -4,40 +4,37 @@ import {SWIPE} from './wechat-profile.mjs';
 import {findText} from './wechat-ocr-parse.mjs';
 import {mergeCommentScreens, parseCommentScreen} from './wechat-comments-parse.mjs';
 
-// Reads an open comment panel. The first screen is read synchronously (it confirms the panel and shows where
-// the first "N条回复" controls are); after that the panel is scrolled and photographed without waiting: text
+// Reads an open comment panel. The first screen is read synchronously to confirm the panel.
+// After that the panel is scrolled and photographed without waiting: text
 // recognition runs in parallel and at most MAX_AHEAD screens may be unread while the phone keeps scrolling.
 export const MAX_AHEAD = 2;
 const STALL_SCREENS = 2;
+const topLevelScreen = rows => {
+  const parsed = parseCommentScreen(rows);
+  return {...parsed, comments: parsed.comments.filter(item => item.reply !== true)};
+};
 
-export async function readCommentPanel({screen, view, limit = 50, expandLimit = 3, signal, maxScreens = null}) {
+export async function readCommentPanel({screen, view, limit = 50, signal, maxScreens = null}) {
   let rows = await view.look({signal});
-  let first = parseCommentScreen(rows);
+  let first = topLevelScreen(rows);
   const titled = () => first.headerCount !== null || findText(rows, '评论', {region: {y0: 600, y1: 720, x1: 400}}).length > 0;
   // The 「评论 N」 title was missed on a first reading while the comments were already there (2026-11-06): look again.
   for (let again = 0; again < 2 && !titled(); again++) {
     await pause(700, signal);
     rows = await view.look({signal});
-    first = parseCommentScreen(rows);
+    first = topLevelScreen(rows);
   }
   if (!titled()) {
     throw new DeviceError('comments_unverified', 'The comment panel was not confirmed', {deviceSettled: true});
   }
   const empty = findText(rows, '暂无评论', {exact: false}).length > 0;
   if (empty || limit <= 0) return {status: empty ? 'empty' : 'disabled', headerCount: empty ? 0 : first.headerCount, post: first.post, items: []};
-  // Expand replies from the lowest control upwards: opening one only moves the rows below it.
-  const expandable = first.expand.filter(item => item.tap.y < 2050).slice(0, expandLimit).sort((a, b) => b.tap.y - a.tap.y);
-  for (const control of expandable) {
-    await screen.tap(control.tap.x, control.tap.y, {signal});
-    await pause(1100, signal);
-  }
-  if (expandable.length) { rows = await view.look({signal}); first = parseCommentScreen(rows); }
   const screens = [first];
   const inFlight = [];
   let stalled = 0, known = mergeCommentScreens(screens).length;
   const settle = async () => {
     const {text, index} = inFlight.shift();
-    const parsed = parseCommentScreen((await text).rows);
+    const parsed = topLevelScreen((await text).rows);
     screens[index] = parsed;
     const count = mergeCommentScreens(screens.filter(Boolean)).length;
     stalled = count > known ? 0 : stalled + 1;

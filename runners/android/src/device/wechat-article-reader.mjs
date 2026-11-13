@@ -7,6 +7,8 @@ import {mergeArticleComments, parseArticleComments} from './wechat-article-comme
 
 const text = rows => rows.map(row => row.text).join('\n');
 const visible = rows => rows.filter(row => row.y >= 260 && row.y + row.h < 1900);
+const FAST_SWIPE = [540, 1850, 540, 550, 600, 200];
+const RECOVER_COMMENT_START = [540, 1000, 540, 1650, 600, 200];
 const matches = (a, b) => comparable(a) === comparable(b) || (comparable(a).length > 12
   && JSON.stringify(a.match(/\d+/gu)) === JSON.stringify(b.match(/\d+/gu)) && similarity(a, b) >= 0.9);
 /** Consecutive matching rows give both overlap evidence and the new screen's first unread row. */
@@ -46,10 +48,12 @@ export function createArticleReader({screen, look, assertArticle, card = null, n
   if (!bodyRequired && !initialHeader?.headerVerified) {
     throw new DeviceError('article_identity_unverified', 'Supplemental article reading requires an already verified article', {deviceSettled: true});
   }
-  const expanded = new Set(), unresolvedExpands = new Set(), bodyText = createArticleBody();
+  const bodyText = createArticleBody();
   const state = {pages: 0, rows: [], bodyRows: [], lines: [], items: [], metrics: null, header: null, gap: false, capturedAt: null,
-    reachedEnd: false, loadingReads: 0, justExpanded: false, stable: 0, done: false, stopReason: null, next: false, entrySeen: false, headerCount: null,
-    postingState: 'unknown', unexpanded: false, unparsedComments: false};
+    reachedEnd: false, loadingReads: 0, stable: 0, done: false, stopReason: null, next: false, entrySeen: false, headerCount: null,
+    postingState: 'unknown', unparsedComments: false};
+  const commentScan = {fastScreens: 0, slowScreens: 0, footerSearchMs: null};
+  let scanStartedAt, seek = 'fast';
   const readScreen = async signal => { await assertArticle({signal}); return look({signal}); };
   const snapshot = (commentsEnabled, limit) => {
     const complete = state.reachedEnd && !state.gap && state.header?.headerVerified && state.stopReason !== 'text_budget_exhausted';
@@ -59,9 +63,8 @@ export function createArticleReader({screen, look, assertArticle, card = null, n
     else if (state.postingState === 'closed') { status = 'closed'; reason = 'comments_closed'; }
     else if (state.entrySeen) {
       if (state.headerCount === 0 && !state.items.length) status = 'empty';
-      else if (state.items.length) status = state.stable >= 1 && !state.unexpanded && !state.unparsedComments && !state.items.some(item => item.cut)
+      else if (state.items.length) status = state.stable >= 1 && !state.unparsedComments && !state.items.some(item => item.cut)
         && (state.headerCount === null || state.items.length >= state.headerCount) ? 'captured' : 'partial';
-      if (state.unexpanded) reason = 'replies_not_expanded';
       if (state.unparsedComments) reason = 'comment_header_unparsed';
       if (!reason && status === 'partial') reason = 'visible_comments_incomplete';
       if (!reason && status === 'unknown') reason = 'comment_text_unavailable';
@@ -71,24 +74,29 @@ export function createArticleReader({screen, look, assertArticle, card = null, n
       bodyReason: !bodyRequired ? 'body_delegated' : bodyStatus === 'complete' ? null : !state.lines.length ? state.stopReason ?? 'body_text_unavailable' : state.gap ? 'scroll_gap'
         : !headerVerified ? 'header_unverified' : state.stopReason ?? 'reading_in_progress', metrics: state.metrics,
       evidence: {screens: state.pages, bodyEndObserved: state.reachedEnd, overlapVerified: bodyRequired ? !state.gap : null,
-        originalImagesCaptured: false, ...(!bodyRequired ? {bodyCapture: 'delegated', scanReason: state.stopReason} : {})}},
+        originalImagesCaptured: false, ...(!bodyRequired ? {bodyCapture: 'delegated', scanReason: state.stopReason, commentScan: {...commentScan}} : {})}},
     comments: {status, reason, postingState: state.postingState, headerCount: state.headerCount,
       items: state.items.slice(0, limit).map(({cut, ...item}) => item), visibleScopeComplete: status === 'captured' || status === 'empty',
       truncated: status === 'partial', source: 'screen_ocr', capturedAt: state.capturedAt}, hasMore: !state.done, pagesRead: state.pages};
   };
   return {
-    async read({limit = 20, commentsEnabled = true, expandLimit = 3, budgetMs = 35000, signal} = {}) {
+    async read({limit = 20, commentsEnabled = true, budgetMs = 35000, signal} = {}) {
       limit = Math.max(0, Math.min(500, Number.isFinite(limit) ? Math.floor(limit) : 20));
+      scanStartedAt ??= now();
       const deadline = now() + Math.min(40000, Math.max(1000, budgetMs));
       let chunkPages = 0;
       while (!state.done && chunkPages < maxChunkPages && (chunkPages === 0 || now() < deadline - 4000)) {
         throwIfAborted(signal);
+        const seekingFooter = !bodyRequired && !state.reachedEnd;
+        const fast = seekingFooter && (seek === 'fast' || seek === 'reverse');
+        const reversing = seekingFooter && seek === 'reverse';
         let scrolledForward = false;
         if (state.next) {
           await assertArticle({signal});
-          await screen.swipe(540, 1750, 540, 1200, 1100, {signal});
-          await wait(850, signal);
-          scrolledForward = true;
+          if (fast) await screen.swipeAndHold(...(reversing ? RECOVER_COMMENT_START : FAST_SWIPE), {signal});
+          else await screen.swipe(540, 1750, 540, 1200, 1100, {signal});
+          await wait(fast ? 300 : 850, signal);
+          scrolledForward = !reversing;
         }
         let rows = await readScreen(signal);
         const first = state.pages === 0;
@@ -112,10 +120,9 @@ export function createArticleReader({screen, look, assertArticle, card = null, n
         // whole-screen comparison from ever matching. A footer anchor that did not move after a swipe proves
         // the page cannot scroll further.
         const before = state.reachedEnd ? footerAnchor(state.rows) : null, after = footerAnchor(rows);
-        const pinned = !first && scrolledForward && !state.justExpanded && before && after
+        const pinned = !first && scrolledForward && before && after
           && before.kind === after.kind && before.text === after.text && Math.abs(before.y - after.y) <= 8;
-        const stable = !first && !state.justExpanded && (pinned || stableScreen(state.rows, rows));
-        state.justExpanded = false;
+        const stable = !first && !fast && (pinned || stableScreen(state.rows, rows));
         state.stable = stable ? state.stable + 1 : 0;
         const visibleHeader = observed?.headerVerified && sameArticleTitle(observed.title, state.header?.title) ? observed : null;
         const body = bodyRequired ? articleBodyRows(rows, {first: first || !!visibleHeader, header: visibleHeader ?? state.header, reachedEnd: state.reachedEnd}) : [];
@@ -127,21 +134,33 @@ export function createArticleReader({screen, look, assertArticle, card = null, n
         }
         state.capturedAt = new Date(now()).toISOString();
         state.metrics = mergeMetrics(state.metrics, parseArticleMetrics(rows), state.capturedAt);
-        const footer = footerEvidence(rows); let expandNext = null;
+        const footer = footerEvidence(rows);
+        if (reversing) seek = 'slow';
         // A footer peeking below the safe OCR region does not prove the obscured final body lines were read.
         state.reachedEnd ||= !!footer.read && footer.read.y < 1900
           || !!footer.header && footer.header.y + footer.header.h < 1900;
+        if (seekingFooter && !state.reachedEnd) {
+          if (footer.read || footer.header) seek = 'slow';
+          else {
+            const probe = parseArticleComments(rows, {reachedEnd: true});
+            if (probe.closed) state.reachedEnd = true;
+            else if (probe.entrySeen || probe.comments.length) {
+              if (seek === 'fast') seek = 'reverse';
+              else { state.done = true; state.stopReason = 'comment_start_unverified'; }
+            }
+          }
+        }
+        if (!bodyRequired) {
+          if (fast) commentScan.fastScreens++;
+          else commentScan.slowScreens++;
+          if (seekingFooter && state.reachedEnd) commentScan.footerSearchMs = Math.max(0, now() - scanStartedAt);
+        }
         if (state.reachedEnd) {
-          const comments = parseArticleComments(rows, {reachedEnd: state.reachedEnd});
+          const comments = parseArticleComments(rows, {reachedEnd: true, topLevelOnly: true});
           state.entrySeen ||= comments.entrySeen;
           state.headerCount = comments.headerCount ?? state.headerCount;
           if (comments.postingState !== 'unknown') state.postingState = comments.postingState;
-          for (const item of comments.expand) unresolvedExpands.add(item.key);
-          if (commentsEnabled && limit > 0 && expanded.size < Math.max(0, Math.min(3, expandLimit))) {
-            expandNext = comments.expand.find(item => !expanded.has(item.key)) ?? null;
-          }
-          state.unexpanded = comments.unexpanded || unresolvedExpands.size > 0;
-          state.unparsedComments ||= comments.unparsed || (comments.unexpanded && !comments.expand.length);
+          state.unparsedComments ||= comments.unparsed;
           if (commentsEnabled && limit > 0) state.items = mergeArticleComments(state.items, comments.comments, limit);
           if (state.stable >= 1 || (!commentsEnabled || limit <= 0)) state.done = true;
           if (limit > 0 && state.items.length >= limit) { state.done = true; state.stopReason = 'comment_limit'; }
@@ -151,11 +170,6 @@ export function createArticleReader({screen, look, assertArticle, card = null, n
         } else if (state.stable >= 2) { state.done = true; state.stopReason = 'body_end_unverified'; }
         state.rows = rows; state.bodyRows = body; state.pages++; chunkPages++; state.next = true;
         if (bodyRequired && !state.reachedEnd && !state.lines.length && state.loadingReads <= 4) { state.next = false; await wait(750, signal); }
-        if (expandNext && !state.done) {
-          await assertArticle({signal}); await screen.tap(expandNext.tap.x, expandNext.tap.y, {signal});
-          expanded.add(expandNext.key); unresolvedExpands.delete(expandNext.key); state.unexpanded = unresolvedExpands.size > 0;
-          state.next = false; state.justExpanded = true; state.stable = 0; await wait(650, signal);
-        }
         if (state.pages >= maxPages || (bodyRequired && state.lines.join('\n').length >= maxCharacters)) {
           state.done = true; state.stopReason = state.pages >= maxPages ? 'screen_budget_exhausted' : 'text_budget_exhausted';
         }

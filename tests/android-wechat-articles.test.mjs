@@ -346,7 +346,8 @@ test('actual runner merge and JSON event serialization satisfy the server DOM/ph
       imageUrlsObserved: 2, selectorAcceptance: 'live_dom_20261109', originalImagesCaptured: false},
     metrics: {like: {value: 7, raw: '7', capturedAt: bodyAt}, read: {value: 48000, raw: '4.8万', precision: 'rounded', capturedAt: bodyAt}}};
   const phone = {article: {title: '手机标题不用于覆盖网页', content: '', bodyStatus: 'delegated', source: 'screen_ocr',
-    evidence: {screens: 4, bodyEndObserved: false, overlapVerified: null},
+    evidence: {screens: 4, bodyEndObserved: false, overlapVerified: null,
+      commentScan: {fastScreens: 3, slowScreens: 1, footerSearchMs: 2500}},
     metrics: {like: {value: 0, raw: '0', capturedAt: phoneAt}, read: {value: null, raw: ''},
       recommend: {value: 3, raw: '3', capturedAt: phoneAt}}},
     comments: {status: 'captured', postingState: 'closed', headerCount: 2, source: 'screen_ocr', capturedAt: phoneAt, items: [
@@ -355,6 +356,7 @@ test('actual runner merge and JSON event serialization satisfy the server DOM/ph
   const combined = mergeArticleCapture(page, phone, Date.parse(uploadAt));
   const serialized = JSON.parse(JSON.stringify(articleEvent({task, card: {snippet: '搜索摘要'}, rank: 1,
     shareUrl: `${link}?scene=21`, ...combined, capturedAt: Date.parse(uploadAt)})));
+  assert.deepEqual(serialized.article.evidence.commentScan, {fastScreens: 3, slowScreens: 1, footerSearchMs: 2500});
   const normalized = normalizeArticleEvent(serialized, principal);
   assert.equal(normalized.eventId, serialized.eventId);
   assert.equal(normalized.shareUrl, link);

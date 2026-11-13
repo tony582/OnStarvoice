@@ -1,3 +1,4 @@
+import {readFileSync} from 'node:fs';
 import {DeviceError, bounded} from './bounded.mjs';
 import {runDeviceBinary, runDeviceCommand} from './command.mjs';
 import {validateSerial} from './adb.mjs';
@@ -7,8 +8,13 @@ import {validateSerial} from './adb.mjs';
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 export const UNICODE_IME = 'io.appium.settings/.UnicodeIME';
 const IME = /^[a-z][\w.]*\/[\w.$]+$/u;
+const gestureHelper = new URL('../../tools/gesture/held-swipe.dex', import.meta.url);
 const coordinate = value => {
   if (!Number.isInteger(value) || value < 0 || value > 4000) throw new DeviceError('invalid_coordinate', 'Screen coordinates are out of range');
+  return String(value);
+};
+const milliseconds = (value, min, max) => {
+  if (!Number.isInteger(value) || value < min || value > max) throw new DeviceError('invalid_duration', 'Gesture duration is out of range');
   return String(value);
 };
 
@@ -47,6 +53,23 @@ export function createAdbScreen({adbPath = 'adb', serial, command = runDeviceCom
     tap: (x, y, options) => input(['tap', coordinate(x), coordinate(y)], options),
     swipe: (x1, y1, x2, y2, ms = 400, options) => input(['swipe', coordinate(x1), coordinate(y1), coordinate(x2), coordinate(y2),
       String(Math.max(100, Math.min(2000, Math.round(ms))))], options),
+    async swipeAndHold(x1, y1, x2, y2, movementMs, holdMs, options) {
+      const args = [coordinate(x1), coordinate(y1), coordinate(x2), coordinate(y2),
+        milliseconds(movementMs, 100, 2000), milliseconds(holdMs, 100, 500)];
+      const encoded = readFileSync(gestureHelper).toString('base64');
+      // The helper is fixed bundled bytecode; all gesture arguments above are bounded integers.
+      // Keep the .dex suffix for Android's class loader and clean up the private temp directory.
+      const script = [
+        'umask 077',
+        'gesture_dir=$(mktemp -d /data/local/tmp/starvoice-gesture.XXXXXX) || exit 1',
+        'gesture="$gesture_dir/held-swipe.dex"',
+        'trap \'rm -f "$gesture"; rmdir "$gesture_dir"\' EXIT',
+        `printf %s '${encoded}' | base64 -d > "$gesture" || exit 1`,
+        `CLASSPATH="$gesture" app_process /system/bin StarVoiceHeldSwipe ${args.join(' ')}`,
+      ].join('; ');
+      const result = await shell([script], options);
+      if (result.trim() !== 'held_swipe_ok') throw new DeviceError('held_swipe_failed', 'The phone did not confirm the held swipe');
+    },
     async key(code, {repeat = 1, ...options} = {}) {
       if (!Number.isInteger(code) || code < 1 || code > 400) throw new DeviceError('invalid_key', 'Key code is out of range');
       return input(['keyevent', ...Array.from({length: Math.max(1, Math.min(40, repeat))}, () => String(code))], options);

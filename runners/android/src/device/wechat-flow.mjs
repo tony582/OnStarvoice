@@ -205,12 +205,12 @@ export function createWechatFlow({screen, view, rememberIme = () => {}, restoreI
       return {shareUrl: after};
     },
     /** Comment panel open → read → closed again; the work page is in front afterwards. */
-    async readComments({limit, expandLimit = 3, signal}) {
+    async readComments({limit, signal}) {
       // The bar moves up when WeChat adds its 「更多视频」 strip: find it on the screen before tapping.
       const bar = commentButton(await view.look({signal, roi: REGION.workBar}), {fallback: POINT.comments, shift: MORE_VIDEOS_SHIFT});
       await screen.tap(bar.x, bar.y, {signal});
       await wait(1500, signal);
-      try { return await readCommentPanel({screen, view, limit, expandLimit, signal}); }
+      try { return await readCommentPanel({screen, view, limit, signal}); }
       finally {
         await screen.back({timeoutMs: 5000});
         await wait(700);

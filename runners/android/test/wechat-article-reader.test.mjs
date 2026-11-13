@@ -12,10 +12,20 @@ const fixture = name => JSON.parse(readFileSync(new URL(`./fixtures/wechat-artic
 const t13 = name => fixture('t13-claude-phone-20261110')[name].rows;
 const t13Comments = number => fixture('t13-comment-footer-20261110')[`t12-renew-d/${number}`].rows;
 function harness(pages, options = {}) {
-  let index = 0, checks = 0; const swipes = [];
-  const reader = createArticleReader({screen: {swipe: async (...args) => { swipes.push(args.slice(0, 5)); index = Math.min(index + 1, pages.length - 1); }},
-    look: async () => pages[index], assertArticle: async () => { checks++; }, wait: async () => {}, now: () => 1, ...options});
-  return {reader, swipes, checks: () => checks};
+  let index = 0, checks = 0, now = 1;
+  const swipes = [], waits = [], taps = [];
+  const move = (args, size) => {
+    swipes.push(args.slice(0, size));
+    index = Math.min(index + 1, pages.length - 1);
+    now += args[4] + (size === 6 ? args[5] : 0);
+  };
+  const reader = createArticleReader({
+    screen: {swipe: async (...args) => move(args, 5), swipeAndHold: async (...args) => move(args, 6),
+      tap: async (...args) => taps.push(args)},
+    look: async () => pages[index], assertArticle: async () => { checks++; },
+    wait: async ms => { waits.push(ms); now += ms; }, now: () => now, ...options,
+  });
+  return {reader, swipes, waits, taps, checks: () => checks};
 }
 
 test('bounded chunks continue in place, merge overlap, and capture the complete body when comments are disabled', async () => {
@@ -107,18 +117,21 @@ test('reaching the real footer and the text budget together is partial after tru
   assert.equal(result.article.bodyStatus, 'partial'); assert.equal(result.article.bodyReason, 'text_budget_exhausted');
 });
 
-test('reply expansion is bounded to three verified comment controls and does not claim hidden replies captured', async () => {
-  const end = number => [...lines(8, 12), row('阅读100', 55, 800, 180), row('不喜欢', 855, 800, 160), row('留言8', 55, 1000, 100),
-    row('写留言', 75, 1150, 120), row('小明 上海 11月9日', 163, 1320), row('回复', 865, 1320, 80), row('用户的实际评论', 163, 1400),
-    row(`展开${number}条回复`, 230, 1560, 250)];
-  const pages = [[...header, ...lines(0, 15, 620)], end(1), end(2), end(3), end(4)];
-  let index = 0; const taps = [];
-  const reader = createArticleReader({screen: {swipe: async () => { index = Math.min(index + 1, pages.length - 1); },
-    tap: async (x, y) => { taps.push([x, y]); index = Math.min(index + 1, pages.length - 1); }}, look: async () => pages[index],
-    assertArticle: async () => {}, wait: async () => {}, now: () => 1});
-  const result = await reader.read({limit: 20});
-  assert.equal(taps.length, 3); assert.ok(taps.every(([x, y]) => x > 145 && y > 1400 && y < 1980));
-  assert.equal(result.comments.status, 'partial'); assert.equal(result.comments.reason, 'replies_not_expanded');
+test('article ignores collapsed and visible replies, including an unreadable reply byline', async () => {
+  const end = [row('阅读100', 55, 380, 180), row('不喜欢', 855, 380, 160), row('留言2', 55, 515, 100),
+    row('写留言', 75, 640, 120), row('小明 上海 11月9日', 163, 750), row('第一条一级留言', 163, 820),
+    row('展开3条回复', 230, 925, 250), row('作者 北京 11月9日', 250, 1000), row('这条是回复预览', 250, 1060),
+    row('看不清名字的回复 11月9日', 250, 1160), row('这段也属于回复', 250, 1220),
+    row('小雨 江苏 11月9日', 163, 1340), row('第二条一级留言', 163, 1410)];
+  const {reader, taps} = harness([end, end], supplemental);
+  const result = await reader.read({limit: 20, expandLimit: 3});
+  assert.deepEqual(taps, []);
+  assert.equal(result.comments.status, 'captured');
+  assert.equal(result.comments.reason, null);
+  assert.deepEqual(result.comments.items.map(item => [item.content, item.reply, item.parentIndex]),
+    [['第一条一级留言', false, null], ['第二条一级留言', false, null]]);
+  const limited = await harness([end], supplemental).reader.read({limit: 2});
+  assert.deepEqual(limited.comments.items.map(item => item.content), ['第一条一级留言', '第二条一级留言']);
 });
 
 test('header first paint can stay blank for two frames before body loads without ending or scrolling early', async () => {
@@ -190,23 +203,23 @@ test('T13 footer pinning cannot equate different anchor types, numbers or a move
   }
 });
 
-test('T13 a newly expanded reply cannot count as a pinned footer without a completed forward swipe', async () => {
+test('a collapsed reply control does not delay the next forward swipe at the footer', async () => {
   const common = [row('阅读100', 55, 500, 180), row('不喜欢', 855, 500, 160), row('留言2', 55, 700, 90),
     row('读者 上海 11月9日', 163, 950, 450), row('第一条留言', 163, 1040, 450)];
   const before = [...common, row('展开1条回复', 163, 1140, 450)];
-  const after = [...common, row('回复者 北京 11月9日', 250, 1250, 450), row('这是一条新回复', 250, 1340, 450)];
-  let index = 0; const taps = [], swipes = [];
-  const reader = createArticleReader({...supplemental, maxChunkPages: 1, now: () => 1, wait: async () => {}, assertArticle: async () => {},
-    look: async () => index ? after : before, screen: {tap: async (...args) => { taps.push(args); index++; }, swipe: async (...args) => swipes.push(args)}});
-  assert.equal((await reader.read()).hasMore, true); assert.equal(taps.length, 1);
-  const expanded = await reader.read();
-  assert.equal(expanded.hasMore, true); assert.equal(expanded.comments.items.length, 2);
-  assert.equal(swipes.length, 0, 'reply expansion is not a scroll-limit observation');
+  const {reader, taps, swipes} = harness([before, before], {...supplemental, maxChunkPages: 1});
+  assert.equal((await reader.read()).hasMore, true);
+  const result = await reader.read();
+  assert.equal(result.hasMore, false);
+  assert.equal(result.comments.items.length, 1);
+  assert.equal(result.comments.status, 'partial', 'a real count shortfall is still partial');
+  assert.deepEqual(taps, []);
+  assert.deepEqual(swipes, [[540, 1750, 540, 1200, 1100]]);
 });
 
-test('delegated body scanning continues in bounded short steps from the current position and distinguishes a missing comment entry', async () => {
+test('delegated body scanning uses a held fast swipe before the footer and the original short swipe afterwards', async () => {
   const end = fixture('52-latest-body-6');
-  const {reader, swipes, checks} = harness([lines(40, 48), end, end], {...supplemental, maxChunkPages: 1});
+  const {reader, swipes, waits, checks} = harness([lines(40, 48), end, end], {...supplemental, maxChunkPages: 1});
   const first = await reader.read();
   assert.equal(first.hasMore, true); assert.equal(first.article.bodyStatus, 'delegated');
   assert.equal(first.article.content, ''); assert.equal(first.article.title, '一篇测试文章');
@@ -219,7 +232,37 @@ test('delegated body scanning continues in bounded short steps from the current 
   assert.equal(result.article.content, ''); assert.equal(result.article.evidence.bodyEndObserved, true);
   assert.equal(result.article.evidence.bodyCapture, 'delegated'); assert.equal(result.article.evidence.overlapVerified, null);
   assert.ok(result.article.metrics.read.value > 0); assert.ok(checks() >= result.pagesRead + swipes.length);
-  assert.deepEqual(swipes, [[540, 1750, 540, 1200, 1100], [540, 1750, 540, 1200, 1100]], 'no header seek or body-overlap reverse');
+  assert.deepEqual(swipes, [[540, 1850, 540, 550, 600, 200], [540, 1750, 540, 1200, 1100]]);
+  assert.deepEqual(waits, [300, 850]);
+  assert.deepEqual(result.article.evidence.commentScan, {fastScreens: 2, slowScreens: 1, footerSearchMs: 1100});
+});
+
+test('a fast swipe past the comment heading backs up before collecting the first comment', async () => {
+  const middle = [row('写留言', 75, 310, 150), row('后面的读者 广东 11月9日', 163, 520), row('后面的留言', 163, 605)];
+  const end = [row('留言2', 55, 370, 150), row('写留言', 75, 500, 150),
+    row('最先的读者 上海 11月9日', 163, 650), row('文末第一条留言', 163, 730),
+    ...middle.slice(1).map(item => ({...item, y: item.y + 550}))];
+  const {reader, swipes, waits} = harness([lines(40, 48), middle, end, end], {...supplemental, maxChunkPages: 1});
+  let result;
+  do { result = await reader.read(); } while (result.hasMore);
+  assert.deepEqual(swipes, [[540, 1850, 540, 550, 600, 200], [540, 1000, 540, 1650, 600, 200], [540, 1750, 540, 1200, 1100]]);
+  assert.deepEqual(waits, [300, 300, 850]);
+  assert.deepEqual(result.article.evidence.commentScan, {fastScreens: 3, slowScreens: 1, footerSearchMs: 2200});
+  assert.equal(result.comments.status, 'captured');
+  assert.deepEqual(result.comments.items.map(item => item.content), ['文末第一条留言', '后面的留言']);
+});
+
+test('a visible comment row alone triggers the same bounded reverse and does not claim coverage without a heading', async () => {
+  const middle = [row('后面的读者 广东 11月9日', 163, 520), row('后面的留言', 163, 605)];
+  const {reader, swipes} = harness([lines(40, 48), middle, middle], supplemental);
+  const result = await reader.read();
+  assert.deepEqual(swipes, [[540, 1850, 540, 550, 600, 200], [540, 1000, 540, 1650, 600, 200]]);
+  assert.equal(result.hasMore, false);
+  assert.equal(result.article.evidence.bodyEndObserved, false);
+  assert.equal(result.article.evidence.commentScan.footerSearchMs, null);
+  assert.equal(result.comments.status, 'unknown');
+  assert.equal(result.comments.reason, 'comment_start_unverified');
+  assert.deepEqual(result.comments.items, []);
 });
 
 test('delegated mode preserves closed comments and followers-only public comments without tapping', async () => {

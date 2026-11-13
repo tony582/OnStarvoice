@@ -220,6 +220,31 @@ test('a post is opened by its export id through WeChat\'s scheme entry for the m
   await assert.rejects(refusing.openLink('com.tencent.mm/.X', feedLink(id)), {code: 'app_launch_failed', deviceSettled: true});
 });
 
+test('held swipe sends one bounded adb call with bundled Android 8.1 bytecode and validates the acknowledgement', async () => {
+  const sent = [];
+  const screen = createAdbScreen({serial: '829d89', command: async (_bin, args) => {
+    sent.push(args);
+    return {stdout: 'held_swipe_ok\n'};
+  }});
+  await screen.swipeAndHold(540, 1850, 540, 550, 600, 200);
+  await assert.rejects(screen.swipeAndHold(540, 1850, 540, 550, 600, 501), {code: 'invalid_duration'});
+  await assert.rejects(screen.swipeAndHold(540, 1850, 540, '550; id', 600, 200), {code: 'invalid_coordinate'});
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(screen.swipeAndHold(540, 1850, 540, 550, 600, 200, {signal: controller.signal}), {code: 'aborted'});
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0].slice(0, -1), ['-H', '127.0.0.1', '-P', '5037', '-s', '829d89', 'shell']);
+  const script = sent[0].at(-1);
+  const encoded = script.match(/printf %s '([A-Za-z0-9+/=]+)'/u)?.[1];
+  assert.ok(encoded);
+  assert.deepEqual(Buffer.from(encoded, 'base64').subarray(0, 8), Buffer.from('dex\n038\0'));
+  assert.match(script, /mktemp -d \/data\/local\/tmp\/starvoice-gesture\.XXXXXX/u);
+  assert.match(script, /app_process \/system\/bin StarVoiceHeldSwipe 540 1850 540 550 600 200$/u);
+  assert.match(script, /trap .* EXIT/u);
+  const refusing = createAdbScreen({serial: '829d89', command: async () => ({stdout: ''})});
+  await assert.rejects(refusing.swipeAndHold(540, 1850, 540, 550, 600, 200), {code: 'held_swipe_failed'});
+});
+
 // OnStar test 2026-11-06: four posts whose comments came back duplicated or with foreign text.
 const panel = name => parseCommentScreen(rows(name));
 const summary = comments => comments.map(item => [item.author, item.location, item.content]);

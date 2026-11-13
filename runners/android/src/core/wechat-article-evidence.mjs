@@ -12,6 +12,14 @@ export function articleWorkKey(value) {
   return `wxa_${createHash('sha256').update(url).digest('hex').slice(0, 24)}`;
 }
 const captureTime = (value, fallback) => Number.isFinite(Date.parse(value)) ? new Date(value).toISOString() : new Date(fallback).toISOString();
+const commentScanEvidence = evidence => {
+  const scan = evidence?.commentScan;
+  const isCount = value => Number.isSafeInteger(value) && value >= 0;
+  return scan && isCount(scan.fastScreens) && isCount(scan.slowScreens) ? {commentScan: {
+    fastScreens: scan.fastScreens, slowScreens: scan.slowScreens,
+    footerSearchMs: isCount(scan.footerSearchMs) ? scan.footerSearchMs : null,
+  }} : {};
+};
 const metric = (value, source, capturedAt) => ({raw: text(value?.raw, 40),
   value: Number.isSafeInteger(value?.value) && value.value >= 0 ? value.value : null,
   precision: text(value?.precision, 80) || (Number.isSafeInteger(value?.value) ? 'displayed_integer' : 'unknown'),
@@ -31,7 +39,8 @@ export function mergeArticleCapture(page, phone, capturedAt) {
   }));
   return {article: {...page, source: 'page_dom', capturedAt: captureTime(page.capturedAt, capturedAt), metrics,
     evidence: {...page.evidence, originalImagesCaptured: false,
-      commentScreens: Number.isSafeInteger(mobile.evidence?.screens) ? mobile.evidence.screens : null}}, comments};
+      commentScreens: Number.isSafeInteger(mobile.evidence?.screens) ? mobile.evidence.screens : null,
+      ...commentScanEvidence(mobile.evidence)}}, comments};
 }
 
 /** Durable article identity comes from the copied URL, never OCR author/time or a result-card title. */
@@ -68,7 +77,8 @@ export function articleEvent({task, card, rank, shareUrl, article, comments, cap
         domReadyState: source === 'page_dom' ? text(article.evidence?.domReadyState, 20) : '',
         selectorAcceptance: ['offline_fixtures_only', 'live_dom_20261109'].includes(article.evidence?.selectorAcceptance)
           ? article.evidence.selectorAcceptance : '',
-        imageUrlsObserved: images.length, commentScreens: Number.isSafeInteger(article.evidence?.commentScreens) ? article.evidence.commentScreens : null},
+        imageUrlsObserved: images.length, commentScreens: Number.isSafeInteger(article.evidence?.commentScreens) ? article.evidence.commentScreens : null,
+        ...commentScanEvidence(article.evidence)},
       metrics: Object.fromEntries(['read', 'like', 'share', 'recommend'].map(name => [name, metric(article.metrics?.[name], source, capturedAt)]))},
     comments: {status: comments?.status ?? 'unknown', postingState: comments?.postingState ?? 'unknown',
       source: 'screen_ocr', capturedAt: captureTime(comments?.capturedAt, capturedAt),

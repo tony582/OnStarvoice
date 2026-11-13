@@ -51,9 +51,10 @@ test('image-v1 real phone replay: sparse infographic content survives scrolling 
 
 test('T14 original 014–026 replay keeps ten distinct comments, removes the whole ad, and preserves three uncertain authors', async () => {
   const pages = Object.values(fixture('t14-comment-quality-20261110')); let index = 0;
+  const advance = async () => { index = Math.min(index + 1, pages.length - 1); };
   const reader = createArticleReader({bodyRequired: false,
     initialHeader: {title: '离线回放已核对的文章', account: '汽车365热线', headerVerified: true, source: 'page_dom'},
-    screen: {swipe: async () => { index = Math.min(index + 1, pages.length - 1); }}, look: async () => pages[index].rows,
+    screen: {swipe: advance, swipeAndHold: advance}, look: async () => pages[index].rows,
     assertArticle: async () => {}, wait: async () => {}, now: () => 1});
   const first = await reader.read({limit: 50});
   assert.equal(first.hasMore, true); assert.equal(first.pagesRead, 8);
