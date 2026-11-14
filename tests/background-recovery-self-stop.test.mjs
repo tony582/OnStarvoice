@@ -2239,3 +2239,27 @@ test("supervised relay restarts its ninety-second inactivity clock after an Edge
   assert.equal(failure, "CONTENT_RELAY_STALLED");
   assert.deepEqual(h.forbiddenTabCalls.reload, []);
 });
+
+test("short detail and profile relays accept heartbeat-only progress beyond ninety seconds", async () => {
+  for (const action of ["captureBloggerProfile", "captureSingleNote"]) {
+    const clock = createRelayClock();
+    const h = createHarness({clock});
+    seedRunningRequest(h);
+    let finish;
+    h.content(SOURCE_TAB).onAction = () => new Promise(resolve => { finish = resolve; });
+    let failure;
+    const relay = h.api.relay(SOURCE_TAB, {
+      action, captureRequestId: CAPTURE_ID,
+    }, {runnerRequestId: REQUEST_ID, runnerAttemptId: A1}).catch(error => { failure = error.code; });
+    for (let second = 0; second < 180; second += 15) {
+      h.api.markContentRelayHeartbeat({
+        captureRequestId: CAPTURE_ID, phase: "reading", heartbeatOnly: true,
+      });
+      await clock.advance(15000);
+    }
+    assert.equal(failure, undefined, action);
+    assert.deepEqual(h.forbiddenTabCalls.reload, []);
+    finish({ok: true});
+    assert.equal((await relay).ok, true);
+  }
+});

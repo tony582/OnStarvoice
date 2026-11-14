@@ -20115,6 +20115,7 @@ function beginContentRelayHeartbeat(payload = {}, requireBusinessProgress = fals
     updatedAt: now,
     phase: 'request_started',
     requireBusinessProgress,
+    acceptsLivenessHeartbeat: ['captureSingleNote', 'captureBloggerProfile'].includes(payload.action),
     counts: {},
     noteIds: new Set(),
   });
@@ -20136,7 +20137,11 @@ function markContentRelayHeartbeat(progress = {}) {
     previous.updatedAt = Date.now();
     return;
   }
-  if (progress.heartbeatOnly === true) return;
+  if (progress.heartbeatOnly === true) {
+    // These short handlers only send liveness until the final response.
+    if (previous.acceptsLivenessHeartbeat) previous.updatedAt = Date.now();
+    return;
+  }
   let advanced = false;
   // Search reports detected/qualified/filtered counts; comment scrolling
   // reports collectedCount. Generic scroll rounds and UI copy aren't data.
