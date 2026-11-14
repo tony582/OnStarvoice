@@ -3,22 +3,21 @@ import {execute, queryAll, queryOne} from '../db/init.js';
 import {createFeishuDailyClient} from './feishu-daily-report.js';
 import {openDailySecret, resolvedDailyConfig} from './customer-daily-report-config.js';
 import {parsePublishTimestamp} from './publish-date.js';
-import {recordTriageAdmission} from './record-triage-admission.js';
+import {manualRecordRelevance, recordTriageAdmission} from './record-triage-admission.js';
 import {truncateWellFormed} from '../utils/well-formed-text.js';
 
 export function creatorAlertEligible(row, now = Date.now()) {
   if (!row?.followed_creator_subscription_id || row.subscription_status !== 'active' ||
       !row.alert_enabled || row.enabled !== 'true' || row.business_visibility !== 'eligible' ||
-      !['relevant','uncertain'].includes(row.ai_result?.relevance) || !recordTriageAdmission(row).admitted) return false;
+      !['relevant','uncertain'].includes(manualRecordRelevance(row) || row.ai_result?.relevance) || !recordTriageAdmission(row).admitted) return false;
   const time = (row.published_ts && new Date(row.published_ts)) || parsePublishTimestamp(row.publish_time, row.created_at) || new Date(row.created_at);
   const configured = Number(row.max_age);
   const days = Number.isInteger(configured) && configured > 0 ? configured : 7;
   return Math.min(time.getTime(), now) >= now - days * 86400000;
 }
 
-export async function checkFollowedCreatorAlert({tenantId, recordId, relevance}) {
-  if (relevance === 'irrelevant') return;
-  const row = await queryOne(`SELECT r.*, s.status AS subscription_status, s.alert_enabled,
+function loadCreatorAlertRecord(tenantId, recordId) {
+  return queryOne(`SELECT r.*, s.status AS subscription_status, s.alert_enabled,
     COALESCE(NULLIF(s.creator_label,''),s.name) AS creator_label, e.value AS enabled, a.value AS max_age,
     EXISTS(SELECT 1 FROM record_observations o WHERE o.tenant_id=r.tenant_id
       AND o.record_id=r.id AND o.monitor_execution_id IS NOT NULL) AS from_patrol
@@ -27,13 +26,22 @@ export async function checkFollowedCreatorAlert({tenantId, recordId, relevance})
     LEFT JOIN tenant_settings e ON e.tenant_id=r.tenant_id AND e.key='followed_creator_alerts_enabled'
     LEFT JOIN tenant_settings a ON a.tenant_id=r.tenant_id AND a.key='followed_creator_alert_max_age_days'
     WHERE r.tenant_id=$1 AND r.id=$2`, [tenantId, recordId]);
-  if (!creatorAlertEligible(row)) return;
-  const payload = {
+}
+
+function creatorAlertPayload(row) {
+  return {
     title: truncateWellFormed(row.title, 240), creator: row.creator_label, platform: row.platform,
-    brand: (Array.isArray(row.ai_result?.monitoringEvidence?.evidence) ? row.ai_result.monitoringEvidence.evidence : []).map(item => item?.entity).filter(Boolean).slice(0, 4).join('、'), relevance: row.ai_result.relevance, sentiment: row.sentiment,
+    brand: (Array.isArray(row.ai_result?.monitoringEvidence?.evidence) ? row.ai_result.monitoringEvidence.evidence : []).map(item => item?.entity).filter(Boolean).slice(0, 4).join('、'), relevance: manualRecordRelevance(row) || row.ai_result?.relevance, sentiment: row.sentiment,
     publishedAt: row.published_ts || (row.publish_time ? parsePublishTimestamp(row.publish_time, row.created_at)?.toISOString() : null),
     likes: row.likes, url: row.canonical_url || row.url, fromPatrol: row.from_patrol,
   };
+}
+
+export async function checkFollowedCreatorAlert({tenantId, recordId, relevance}) {
+  if (relevance === 'irrelevant') return;
+  const row = await loadCreatorAlertRecord(tenantId, recordId);
+  if (!creatorAlertEligible(row)) return;
+  const payload = creatorAlertPayload(row);
   await execute(`INSERT INTO followed_creator_alerts (tenant_id,record_id,payload) VALUES ($1,$2,$3::jsonb)
     ON CONFLICT (tenant_id,record_id) DO NOTHING`, [tenantId, recordId, JSON.stringify(payload)]);
 }
@@ -105,20 +113,14 @@ export async function processFollowedCreatorAlerts(limit = 20) {
     last_error='发送结果待核实，不会自动重试'
     WHERE status='sending' AND channel='webhook' AND claimed_at < now()-interval '2 minutes'`);
   await execute(`UPDATE followed_creator_alerts SET status=CASE WHEN attempts<3 THEN 'pending' ELSE 'failed' END,
-    claimed_at=NULL WHERE status='sending' AND channel='app' AND claimed_at < now()-interval '2 minutes'`);
+    claimed_at=NULL,
+    finished_at=CASE WHEN attempts>=3 THEN now() ELSE NULL END,
+    last_error=CASE WHEN attempts>=3 THEN '已达到发送次数上限，最后一次发送结果待核实' ELSE last_error END
+    WHERE status='sending' AND channel='app' AND claimed_at < now()-interval '2 minutes'`);
   const due = await queryAll(`SELECT id,tenant_id,record_id,payload,channel,target_key FROM followed_creator_alerts
     WHERE status='pending' AND next_attempt_at<=now() ORDER BY next_attempt_at,id LIMIT $1`, [limit]);
   for (const row of due) {
     const config = await creatorAlertSettings(row.tenant_id);
-    if (row.record_id) {
-      const active = await queryOne(`SELECT 1 FROM records r JOIN monitor_subscriptions s
-        ON s.id=r.followed_creator_subscription_id AND s.tenant_id=r.tenant_id
-        WHERE r.id=$1 AND r.tenant_id=$2 AND s.status='active' AND s.alert_enabled`,[row.record_id,row.tenant_id]);
-      if (!active || config.followed_creator_alerts_enabled !== 'true') {
-        await execute("UPDATE followed_creator_alerts SET status='cancelled',finished_at=now() WHERE id=$1 AND status='pending'",[row.id]);
-        continue;
-      }
-    }
     let target;
     try { target = await creatorAlertTarget(row.tenant_id, config); } catch {}
     if (!target) {
@@ -136,17 +138,28 @@ export async function processFollowedCreatorAlerts(limit = 20) {
         "UPDATE followed_creator_alerts SET status='failed',finished_at=now(),last_error='发送目标已变更' WHERE id=$1 AND status='pending'",[row.id]);
       continue;
     }
+    let payload = row.payload;
+    if (row.record_id) {
+      const latest = await loadCreatorAlertRecord(row.tenant_id, row.record_id);
+      if (!creatorAlertEligible(latest)) {
+        await execute(`UPDATE followed_creator_alerts SET status='cancelled',finished_at=now(),
+          last_error='作品已不符合提醒条件'
+          WHERE id=$1 AND status='sending' AND attempts=$2`, [row.id,claimed.attempts]);
+        continue;
+      }
+      payload = creatorAlertPayload(latest);
+    }
     let status = 'sent';
     let message = '';
     try {
-      await createFeishuDailyClient(target).sendPost({post:creatorAlertPost(row.payload),uuid:row.id});
+      await createFeishuDailyClient(target).sendPost({post:creatorAlertPost(payload),uuid:row.id});
     } catch (error) {
       status = creatorAlertFailure(target.channel,claimed.attempts,error);
       message = error?.safeMessage || '发送失败，请核对飞书配置';
     }
-    await execute(`UPDATE followed_creator_alerts SET status=$1,last_error=$2,
+    await execute(`UPDATE followed_creator_alerts SET status=$1,last_error=$2,payload=$5::jsonb,
       finished_at=CASE WHEN $1='pending' THEN NULL ELSE now() END,
       next_attempt_at=now()+interval '1 minute'
-      WHERE id=$3 AND status='sending' AND attempts=$4`, [status,message,row.id,claimed.attempts]);
+      WHERE id=$3 AND status='sending' AND attempts=$4`, [status,message,row.id,claimed.attempts,JSON.stringify(payload)]);
   }
 }

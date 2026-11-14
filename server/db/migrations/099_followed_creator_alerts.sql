@@ -5,7 +5,7 @@ ALTER TABLE monitor_subscriptions
   ADD COLUMN alert_enabled boolean NOT NULL DEFAULT true,
   ADD COLUMN auto_patrol_enabled boolean NOT NULL DEFAULT false;
 
-UPDATE monitor_subscriptions SET auto_patrol_enabled = (status = 'active')
+UPDATE monitor_subscriptions SET auto_patrol_enabled = (status = 'active' AND COALESCE(account_url, '') <> '')
 WHERE subject_type = 'creator';
 
 CREATE UNIQUE INDEX monitor_creator_platform_identity

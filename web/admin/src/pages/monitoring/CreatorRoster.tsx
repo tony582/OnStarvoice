@@ -13,7 +13,7 @@ type Account = {
 }
 const blank = { id: '', creatorLabel: '', name: '', platform: 'douyin', url: '', accountNo: '', finderId: '', aliases: '',
   status: 'active', alertEnabled: true, autoPatrolEnabled: false }
-type Preview = { counts: { create: number; update: number; error: number }; rows: Array<{ line: number; action: string; name?: string; message?: string; platform?: string }> }
+type Preview = { counts: { create: number; update: number; error: number; reenable: number }; rows: Array<{ line: number; action: string; name?: string; message?: string; platform?: string }> }
 const results: Record<string,string> = { succeeded: '成功', failed: '失败', pending: '待执行', running: '执行中', cancelled: '已取消' }
 const endpoint = '/monitor/followed-creators'
 
@@ -98,6 +98,7 @@ export function CreatorRoster({ onScan, onViewHits }: { onScan: (id: string) => 
       <textarea id="creator-roster-import" className="w-full rounded border bg-background p-2 text-sm" rows={5} value={importText} onChange={e=>{setImportText(e.target.value);setPreview(null)}} />
       {preview && <div className="space-y-1 text-sm">
         <p>新增 {preview.counts.create} 个 · 更新 {preview.counts.update} 个 · 解析失败 {preview.counts.error} 个</p>
+        {preview.counts.reenable > 0 && <p className="font-medium">将重新启用 {preview.counts.reenable} 个已暂停账号</p>}
         <ul className="max-h-48 overflow-auto">{preview.rows.map((r,i)=><li key={i}>第 {r.line} 行 · {r.message || `${r.action==='create'?'新增':'更新'} ${r.name}（${platformName(r.platform || '')}）`}</li>)}</ul>
       </div>}
       <div className="flex gap-2">
@@ -120,7 +121,7 @@ export function CreatorRoster({ onScan, onViewHits }: { onScan: (id: string) => 
         </p></div>
         <div className="text-xs text-muted-foreground">{a.last_run_at ? new Date(a.last_run_at).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'}) : '暂无巡查时间'} · {results[a.latest_result || ''] || '暂无结果'}{a.last_error && <p>{a.last_error}</p>}</div>
         <div className="flex flex-wrap gap-1">
-          {onViewHits && <Button size="sm" variant="ghost" onClick={()=>onViewHits(a.id)}>命中</Button>}
+          {a.platform!=='wechat_channels' && onViewHits && <Button size="sm" variant="ghost" onClick={()=>onViewHits(a.id)}>命中</Button>}
           {a.platform!=='wechat_channels' && <Button size="sm" variant="outline" disabled={!canWrite()} onClick={()=>onScan(a.id)}>分配扫描</Button>}
           {canManage && <><Button variant="ghost" size="sm" onClick={()=>open(a)}>编辑</Button><Button variant="ghost" size="sm" disabled={busy} onClick={()=>{
             if(window.confirm(`删除「${a.name}」的${platformName(a.platform)}账号？`)) void act(async()=>{await api.delete(endpoint+'/'+a.id);setRevision(v=>v+1)})

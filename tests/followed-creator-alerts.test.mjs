@@ -102,3 +102,10 @@ test('the profile task card displays one finished creator after a legacy snapsho
   assert.equal(followedCreatorCompletedCount({counts:{completed:0},progress:{current:1}}),1);
   assert.equal(followedCreatorCompletedCount({counts:{processed:1}}),1);
 });
+
+test('an unlabelled continuation does not inherit a suspect creator label',()=>{
+  const text='博主 / 账号\t抖音名称\t抖音主页链接\n疑似账号\t疑似账号\thttps://www.douyin.com/user/suspect\n\t另一个昵称\thttps://www.douyin.com/user/other';
+  const rows=parseCreatorRoster(text);
+  assert.equal(rows[0].input.alertEnabled,false);
+  assert.throws(()=>normalizeCreatorAccount(rows[1].input), /请填写博主名称/u);
+});

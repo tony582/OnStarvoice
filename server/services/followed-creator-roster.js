@@ -37,17 +37,20 @@ export function parseCreatorRoster(tsv) {
   return lines.flatMap((line,index)=>{
     if (!line.trim()) return [];
     const columns = line.split('\t');
-    const get = key => trim(columns[header.indexOf(key)]);
-    const label = get('博主 / 账号') || (/疑似|待确认/u.test(get('抖音名称')) ? get('抖音名称') : previousLabel);
-    previousLabel = label;
-    const inputs = [];
-    const usable = v => v && !/^[-—–]+$/u.test(v);
+    const get = key => {
+      const value = trim(columns[header.indexOf(key)]);
+      return /^[-—–−－]+$/u.test(value) ? '' : value;
+    };
     const douyin = get('抖音名称');
     const channel = get('视频号名称');
+    const label = get('博主 / 账号') || [douyin, channel].find(name => /疑似|待确认/u.test(name)) || previousLabel;
+    const suspect = /疑似|待确认/u.test([label, douyin, channel].join(' '));
+    previousLabel = suspect ? '' : label;
+    const inputs = [];
     const url = get('抖音主页链接');
-    if (usable(douyin) || usable(url)) inputs.push({platform:'douyin',creatorLabel:label,name:douyin,url,accountNo:get('抖音号')});
-    if (usable(channel)) inputs.push({platform:'wechat_channels',creatorLabel:label,name:channel,finderId:get('视频号ID') || get('视频号 ID') || get('视频号原始ID')});
-    return inputs.length ? inputs.map(input=>({line:index+2,input:{...input,alertEnabled:!/(疑似|待确认)/u.test(label+' '+input.name)}})) :
+    if (douyin || url) inputs.push({platform:'douyin',creatorLabel:label,name:douyin,url,accountNo:get('抖音号')});
+    if (channel) inputs.push({platform:'wechat_channels',creatorLabel:label,name:channel,finderId:get('视频号ID') || get('视频号 ID') || get('视频号原始ID')});
+    return inputs.length ? inputs.map(input=>({line:index+2,input:{...input,alertEnabled:!suspect}})) :
       [{line:index+2,error:'本行没有可导入的平台账号'}];
   });
 }
@@ -58,7 +61,7 @@ function trimRoster(value) {
   return text.split(/\r?\n/u);
 }
 
-async function applyAccounts(tx, tenantId, entries, commit) {
+async function applyAccounts(tx, tenantId, entries, commit, {importing}) {
   await tx.queryOne('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`creator-roster:${tenantId}`]);
   const existing = await tx.queryAll(`SELECT * FROM monitor_subscriptions WHERE tenant_id=$1
     AND subject_type='creator' AND status<>'deleted' FOR UPDATE`, [tenantId]);
@@ -80,6 +83,11 @@ async function applyAccounts(tx, tenantId, entries, commit) {
       if (entry.id && match && match.id!==entry.id) throw invalid('该平台账号已存在');
       if (account.nicknames && existing.some(r=>r.id!==current?.id && r.platform===account.platform &&
         r.match_nicknames?.some(n=>account.nicknames.includes(n)))) throw invalid('视频号昵称与已有账号重复');
+      if (importing && current) {
+        account.alertEnabled = current.alert_enabled;
+        account.autoPatrol = current.auto_patrol_enabled;
+      }
+      const reenable = importing && current?.status === 'paused' && account.status === 'active';
       if (commit) {
         const values=[tenantId,account.platform,account.keyword,account.name,account.url,account.label,
           account.accountNo,account.nicknames,account.status,account.alertEnabled,account.autoPatrol,nextCreatorPatrolTime(setting?.value)];
@@ -93,7 +101,7 @@ async function applyAccounts(tx, tenantId, entries, commit) {
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,values);
       }
       if (!current) existing.push({platform:account.platform,keyword:account.keyword,match_nicknames:account.nicknames});
-      results.push({line:entry.line,action:current?'update':'create',name:account.name,platform:account.platform});
+      results.push({line:entry.line,action:current?'update':'create',name:account.name,platform:account.platform,reenable});
     } catch (error) {
       if (error.status!==400) throw error;
       results.push({line:entry.line,action:'error',message:error.message});
@@ -103,8 +111,8 @@ async function applyAccounts(tx, tenantId, entries, commit) {
   return results;
 }
 
-export function applyCreatorRoster(tenantId, entries, commit) {
-  return withTransaction(tx=>applyAccounts(tx,tenantId,entries,commit));
+export function applyCreatorRoster(tenantId, entries, commit, options = {}) {
+  return withTransaction(tx=>applyAccounts(tx,tenantId,entries,commit,options));
 }
 
 export function queueCreatorBackfill(tx, tenantId) {

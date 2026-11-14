@@ -32,8 +32,9 @@ router.get('/followed-creators', ...session, async (req,res,next)=>{
 router.post('/followed-creators/import', ...admin, async (req,res,next)=>{
   try {
     const entries = parseCreatorRoster(req.body?.text);
-    const rows = await applyCreatorRoster(req.tenantId, entries, req.body?.commit===true);
+    const rows = await applyCreatorRoster(req.tenantId, entries, req.body?.commit===true, {importing:true});
     const counts = Object.fromEntries(['create','update','error'].map(action=>[action,rows.filter(r=>r.action===action).length]));
+    counts.reenable = rows.filter(row=>row.reenable).length;
     res.json({rows,counts});
   } catch(error) {
     if (error.status===400) return res.status(400).json({message:error.message});

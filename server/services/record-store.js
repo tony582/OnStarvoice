@@ -1556,6 +1556,7 @@ export async function upsertCapturedRecord(record, context) {
         commentWorkflowStatus: observation.commentWorkflowStatus,
         shouldRelabel: Boolean(relabelReason),
         relabelReason,
+        checkCreatorAlert: Boolean(creatorId && !existing.followed_creator_subscription_id && existing.ai_result?.relevance),
         changedFields,
         officialContent: officialResolution.officialContent,
         officialContentSource: officialResolution.source,
@@ -1656,6 +1657,15 @@ export async function upsertCapturedRecord(record, context) {
   const __result = await retryCapturedRecordIdentityConflict(
     runUpsertTransaction,
   );
+  if (__result.checkCreatorAlert) {
+    delete __result.checkCreatorAlert;
+    try {
+      const {checkFollowedCreatorAlert} = await import('./followed-creator-alerts.js');
+      await checkFollowedCreatorAlert({tenantId, recordId: __result.id});
+    } catch (error) {
+      console.error('[Capture] Followed creator alert check failed:', error?.code || 'unknown');
+    }
+  }
   // 入库后共用媒体队列；视频号失效链接等后续采集的新 URL 再补，不阻塞采集响应。
   if (__result.businessVisibility === 'eligible') {
     if (record.cover_url || (record.platform === 'wechat_channels' && record.author_avatar)) {

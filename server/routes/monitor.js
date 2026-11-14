@@ -1,3 +1,5 @@
+import {canonicalProfileUrl, creatorProfileId} from '../services/followed-creator-identity.js';
+import {projectProfilePatrolSchedule} from '../services/followed-creator-schedule.js';
 import followedCreators from './followed-creators.js';
 import { Router } from 'express';
 import { queryOne, queryAll, execute, getAllSettings, setSettings, withTransaction } from '../db/init.js';
@@ -660,6 +662,12 @@ router.post('/subscriptions', requireTenantAccess, requireTenantWriter, async (r
         message: 'subjectType 仅支持 creator 或 official',
       });
     }
+    const creator = input.subjectType === 'creator';
+    const canonical = creator ? canonicalProfileUrl(input.accountUrl, input.platform) : '';
+    if (canonical) {
+      input.accountUrl = canonical;
+      input.keyword = creatorProfileId(canonical, input.platform);
+    }
     if (!input.keyword) {
       return res.json({ ok: false, error: 'invalid_request', message: '账号 ID 或关键词不能为空' });
     }
@@ -675,6 +683,10 @@ router.post('/subscriptions', requireTenantAccess, requireTenantWriter, async (r
     }
 
     const result = await withTransaction(async tx => {
+      if (creator) {
+        // Serialize with roster imports, including restoration of deleted rows.
+        await tx.queryOne('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`creator-roster:${req.tenantId}`]);
+      }
       const binding = await validateSubscriptionAgentBinding(tx, {
         tenantId: req.tenantId,
         assignedAgentId: input.assignedAgentId,
@@ -703,6 +715,7 @@ router.post('/subscriptions', requireTenantAccess, requireTenantWriter, async (r
           AND (
             ($6::uuid IS NOT NULL AND official_account_id = $6::uuid)
             OR ($7 <> '' AND keyword = $7)
+            OR ($5 = 'creator' AND keyword = $3)
             OR ($4 <> '' AND account_url <> '' AND account_url = $4)
             OR (
               $4 = ''
@@ -710,7 +723,7 @@ router.post('/subscriptions', requireTenantAccess, requireTenantWriter, async (r
               AND keyword = $3
             )
           )
-        ORDER BY status = 'deleted', created_at DESC
+        ORDER BY status = 'deleted', ($5 = 'creator' AND keyword = $3) DESC, created_at DESC
         LIMIT 1
         FOR UPDATE
       `, [
@@ -783,7 +796,6 @@ router.post('/subscriptions', requireTenantAccess, requireTenantWriter, async (r
           req.tenantId,
         ]);
       } else if (!subscription) {
-        created = true;
         subscription = await tx.queryOne(`
           INSERT INTO monitor_subscriptions (
             tenant_id, name, keyword, platform, account_url, notify_on_negative,
@@ -792,6 +804,10 @@ router.post('/subscriptions', requireTenantAccess, requireTenantWriter, async (r
           ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, now(), $9, $10
           )
+          ${creator ? `ON CONFLICT (tenant_id, platform, keyword)
+            WHERE subject_type = 'creator' AND status <> 'deleted'
+              AND platform IN ('douyin', 'xiaohongshu', 'weibo')
+            DO NOTHING` : ''}
           RETURNING *
         `, [
           req.tenantId,
@@ -805,7 +821,20 @@ router.post('/subscriptions', requireTenantAccess, requireTenantWriter, async (r
           input.subjectType,
           binding.agentId,
         ]);
-      } else if (binding.agentId) {
+        created = Boolean(subscription);
+        if (!subscription && creator) {
+          subscription = await tx.queryOne(`
+            SELECT * FROM monitor_subscriptions
+            WHERE tenant_id=$1 AND platform=$2 AND keyword=$3
+              AND subject_type='creator' AND status<>'deleted'
+            FOR UPDATE
+          `, [req.tenantId, input.platform, input.keyword]);
+          if (!subscription) throw Object.assign(new Error('关注账号状态已变更，请重试'), {
+            status: 409, error: 'creator_subscription_changed',
+          });
+        }
+      }
+      if (!created && !restored && binding.agentId) {
         subscription = await tx.queryOne(`
           UPDATE monitor_subscriptions
           SET assigned_agent_id = $1,
@@ -1211,14 +1240,12 @@ router.post('/executions/:id/finish', requireTenantAccess, requireTenantWriter, 
 
       if (!execution) return null;
 
-      await tx.execute(`
-        UPDATE monitor_subscriptions
-        SET last_run_at = $5,
-          last_cursor = COALESCE(NULLIF($1, ''), last_cursor),
-          last_error = $2,
-          updated_at = now()
-        WHERE id = $3 AND tenant_id = $4
-      `, [nextCursor || '', finalStatus === 'failed' ? errorMessage : '', execution.subscription_id, req.tenantId, execution.finished_at]);
+      await projectProfilePatrolSchedule(tx, req.tenantId, [execution.id]);
+      if (nextCursor) {
+        await tx.execute(`UPDATE monitor_subscriptions
+          SET last_cursor = $1, updated_at = now()
+          WHERE id = $2 AND tenant_id = $3`, [nextCursor, execution.subscription_id, req.tenantId]);
+      }
 
       if (finalStatus === 'succeeded') {
         await captureOfficialCommentPatrolSnapshots(
