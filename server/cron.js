@@ -1,3 +1,5 @@
+import {processFollowedCreatorAlerts} from './services/followed-creator-alerts.js';
+import {processFollowedCreatorBackfill} from './services/followed-creator-roster.js';
 import {processCrossPosts} from './services/cross-posts/store.js';
 /**
  * 定时任务调度
@@ -38,6 +40,8 @@ const DEFAULT_JOBS = Object.freeze({
   getSetting,
   labelPendingRecords,
   processCaptureAttentionNotifications,
+  processFollowedCreatorAlerts,
+  processFollowedCreatorBackfill,
   processCustomerDailyReports,
   processCustomerMonthlyReports,
   processCustomerAssistant,
@@ -310,6 +314,16 @@ function schedulerDefinitions(jobs, logger) {
       },
     },
     {name: 'cross-platform-posts', expression: '*/10 * * * *', run: () => jobs.processCrossPosts()},
+    {
+      name: 'followed-creator-alerts',
+      expression: '* * * * *',
+      run: () => jobs.processFollowedCreatorAlerts(20),
+    },
+    {
+      name: 'followed-creator-backfill',
+      expression: '* * * * *',
+      run: () => jobs.processFollowedCreatorBackfill(),
+    },
   ];
 }
 

@@ -1285,6 +1285,13 @@ function queuePostClassificationTasks({ recordId, tenantId, relevance, sentiment
       console.error(`[AI] Alert check failed for record ${recordId}:`, err?.message || err);
     }
 
+    try {
+      const {checkFollowedCreatorAlert} = await import('./followed-creator-alerts.js');
+      await checkFollowedCreatorAlert({tenantId, recordId, relevance});
+    } catch (err) {
+      console.error('[AI] Followed creator alert check failed:', err?.code || 'unknown');
+    }
+
     if (sentiment !== 'negative') return;
     try {
       const { queueNegativeRecordAnalysis } = await import('./opinion-analysis.js');

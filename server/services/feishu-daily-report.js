@@ -509,6 +509,10 @@ export function createFeishuDailyClient(config, { fetchImpl = globalThis.fetch, 
     catch {throw invalid('日报图文内容无法生成，请检查帖子内容或使用飞书文档交付。');}
     const picture = await prepareSummaryImage({snapshot,progress:summaryImageProgress,onProgress:onSummaryImageProgress});
     const post = buildFeishuDailyPost({snapshot,imageKey:picture.imageKey,documentUrl:url.href});
+    return sendPost({post, uuid});
+  }
+
+  async function sendPost({post, uuid}) {
     if (settings.channel === 'webhook') {
       const hook = webhookUrl(settings.webhookUrl);
       if (!settings.webhookSecret) throw invalid('请配置群机器人签名密钥');
@@ -525,5 +529,5 @@ export function createFeishuDailyClient(config, { fetchImpl = globalThis.fetch, 
     if (!ID.test(messageId || '')) throw uncertain('飞书可能已发送群消息，但未返回消息标识');
     return { messageId, acknowledged: true, channel: 'app' };
   }
-  return { createDocument, writeDocument, ensureEditable, prepareSummaryImage, sendReport };
+  return { createDocument, writeDocument, ensureEditable, prepareSummaryImage, sendReport, sendPost };
 }

@@ -1,3 +1,4 @@
+import { CreatorAlertSettings } from './monitoring/CreatorAlertSettings'
 import { Fragment, useCallback, useEffect, useState } from 'react'
 import { Loader2, Building2, Users, KeyRound, Save, Pencil, Copy, RefreshCw, Trash2, Laptop, FlaskConical } from 'lucide-react'
 import { api } from '@/lib/api'
@@ -1035,6 +1036,8 @@ export function SettingsPage() {
           </span>
         </label>
       </SettingsCard>
+
+      <CreatorAlertSettings />
 
       <SettingsCard
         title="视频号发到微信"

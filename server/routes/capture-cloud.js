@@ -1,3 +1,4 @@
+import {nextCreatorPatrolTime} from '../services/followed-creator-schedule.js';
 import {projectDiscoveryTaskResult} from '../services/capture-discovery/detail-projection.js';
 import crypto from 'crypto';
 import {dispatchDiscoveredPost} from '../services/capture-discovery/detail-dispatch.js';
@@ -3475,10 +3476,12 @@ async function syncProfileDiscoverySubscriptions(
       .filter(id => UUID_PATTERN.test(id)),
   )];
   if (ids.length === 0) return;
+  const setting = await tx.queryOne("SELECT value FROM tenant_settings WHERE tenant_id=$1 AND key='monitor_runTimes'", [tenantId]);
   await tx.execute(`
     UPDATE monitor_subscriptions subscription
     SET last_run_at = COALESCE(execution.finished_at, now()),
       next_run_at = CASE
+        WHEN subscription.subject_type = 'creator' THEN $3
         WHEN execution.status = 'failed'
           THEN now() + interval '15 minutes'
         ELSE now() + make_interval(mins => subscription.cadence_minutes)
@@ -3495,7 +3498,8 @@ async function syncProfileDiscoverySubscriptions(
       AND subscription.id = execution.subscription_id
       AND subscription.tenant_id = execution.tenant_id
       AND execution.status IN ('succeeded', 'failed', 'cancelled')
-  `, [tenantId, ids]);
+      AND (subscription.last_run_at IS NULL OR subscription.last_run_at <= execution.finished_at)
+  `, [tenantId, ids, nextCreatorPatrolTime(setting?.value)]);
 }
 
 async function failProfileDiscoveryWork(tx, {
@@ -5274,7 +5278,7 @@ export async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = 
           )
         )
       RETURNING id, assignment_revision, result_record_id,
-        result_observation_id
+        result_observation_id, metadata
     `, [
       projectedStatus,
       NEGATIVE_PATROL_SUCCESS_STATUSES.has(projectedStatus),
@@ -5395,7 +5399,8 @@ export async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = 
       }
     }
 
-    if (isProfilePatrol && UUID_PATTERN.test(text(entry.executionId, 100))) {
+    const boundProfileExecution = text(safeJson(item.metadata).monitorExecutionId, 100);
+    if (isProfilePatrol && UUID_PATTERN.test(boundProfileExecution) && boundProfileExecution === entry.executionId) {
       const monitorStatus =
         entry.status === 'canceled'
           ? 'cancelled'
@@ -5403,7 +5408,7 @@ export async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = 
               entry.status === 'skipped'
             ? 'succeeded'
             : 'failed';
-      const updatedExecutions = await tx.queryAll(`
+      await tx.execute(`
         UPDATE monitor_executions
         SET status = $1,
           records_found = GREATEST(
@@ -5419,7 +5424,6 @@ export async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = 
         WHERE id = $4::uuid
           AND tenant_id = $5
           AND status IN ('pending', 'running')
-        RETURNING id
       `, [
         monitorStatus,
         Math.max(0, Number(entry.hitCount) || 0),
@@ -5430,7 +5434,7 @@ export async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = 
       await syncProfileDiscoverySubscriptions(
         tx,
         agent.tenant_id,
-        updatedExecutions.map(execution => execution.id),
+        [entry.executionId],
       );
     }
 

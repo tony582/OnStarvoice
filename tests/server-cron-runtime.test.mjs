@@ -187,7 +187,7 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
 
   assert.deepEqual(
     fakeCron.registrations.map(item => item.expression),
-    ['17 3 * * *', '*/5 * * * *', '* * * * *', '* * * * *', '* * * * *', '* * * * *', '*/5 * * * * *', '*/5 * * * *', '*/5 * * * *', '*/10 * * * *'],
+    ['17 3 * * *', '*/5 * * * *', '* * * * *', '* * * * *', '* * * * *', '* * * * *', '*/5 * * * * *', '*/5 * * * *', '*/5 * * * *', '*/10 * * * *', '* * * * *', '* * * * *'],
   );
   assert.deepEqual(
     fakeCron.registrations.map(item => item.options.name),
@@ -202,6 +202,8 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
       'onstarvoice:dead-attention-settlement',
       'onstarvoice:ops-control-observer',
       'onstarvoice:cross-platform-posts',
+      'onstarvoice:followed-creator-alerts',
+      'onstarvoice:followed-creator-backfill',
     ],
   );
   assert.ok(fakeCron.registrations.every(item => item.options.noOverlap === true));
@@ -321,7 +323,7 @@ test('compatibility cron composes both groups without duplicate lifecycle calls'
     jobs: safeJobs(),
   });
 
-  assert.equal(fakeCron.registrations.length, 12);
+  assert.equal(fakeCron.registrations.length, 14);
   assert.deepEqual(runtime.runtimes.map(item => item.groupName), ['scheduler', 'ai']);
   assert.deepEqual(messages, ['[Cron] Scheduled jobs started']);
   assert.equal(runtime.stop(), true);

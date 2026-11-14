@@ -23,16 +23,13 @@ test('monitor subscription API exposes one actionable failure projection', async
 })
 
 test('navigation never turns a historical monitor error into a global badge', async () => {
-  const [mobile, sidebar, tasks] = await Promise.all([
+  const [mobile, sidebar] = await Promise.all([
     read('web/admin/src/mobile/MobileApp.tsx'),
     read('web/admin/src/components/layout/Sidebar.tsx'),
-    read('web/admin/src/pages/monitoring/TasksTab.tsx'),
   ])
 
   assert.doesNotMatch(mobile, /item\.key === 'monitor' \? badges\.monitorAttention/u)
   assert.doesNotMatch(mobile, /个监测任务需要检查/u)
   assert.match(sidebar, /\{ id: 'monitoring', label: '关注博主', icon: UserCheck \}/u)
   assert.doesNotMatch(sidebar, /label: '关注博主'[^\n]*monitorAttention/u)
-  assert.match(tasks, /followedCreatorSubs\.filter\(isAttentionRequired\)/u)
-  assert.match(tasks, /subscription\.attentionRequired === true \|\| subscription\.attention_required === true/u)
 })

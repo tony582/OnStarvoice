@@ -1,3 +1,4 @@
+import {identifyFollowedCreator} from './followed-creator-identity.js';
 import {mergeArticleRecord} from './android-control/article-record.js';
 import {recordDiscoveryIngestion,finishDiscoveryObservation} from './capture-discovery/detail-receipt.js';
 import {readDiscoveryCaptureKeyword} from './capture-discovery/record-keyword.js';
@@ -1502,6 +1503,13 @@ export async function upsertCapturedRecord(record, context) {
         officialAccountId: officialResolution.officialAccount?.id,
       });
 
+      const creatorRecord = await tx.queryOne('SELECT * FROM records WHERE id=$1 AND tenant_id=$2', [existing.id, tenantId]);
+      const creatorId = officialResolution.officialAccount ? null : await identifyFollowedCreator(tx, creatorRecord, tenantId);
+      if (creatorId !== creatorRecord.followed_creator_subscription_id) {
+        await tx.execute('UPDATE records SET followed_creator_subscription_id=$1 WHERE id=$2 AND tenant_id=$3',
+          [creatorId, existing.id, tenantId]);
+      }
+
       const observation = await insertObservation(tx, {
         tenantId,
         recordId: existing.id,
@@ -1596,6 +1604,13 @@ export async function upsertCapturedRecord(record, context) {
     ]);
 
     await persistCapturedContentAvailability(tx, {tenantId, recordId: inserted.id, record});
+
+    const creatorRecord = await tx.queryOne('SELECT * FROM records WHERE id=$1 AND tenant_id=$2', [inserted.id, tenantId]);
+    const creatorId = officialResolution.officialAccount ? null : await identifyFollowedCreator(tx, creatorRecord, tenantId);
+    if (creatorId !== creatorRecord.followed_creator_subscription_id) {
+      await tx.execute('UPDATE records SET followed_creator_subscription_id=$1 WHERE id=$2 AND tenant_id=$3',
+        [creatorId, inserted.id, tenantId]);
+    }
 
     const observation = await insertObservation(tx, {
       tenantId,

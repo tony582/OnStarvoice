@@ -1,3 +1,4 @@
+import {canonicalProfileUrl} from '../services/followed-creator-identity.js';
 import crypto from 'node:crypto';
 import {Router} from 'express';
 import {getAllSettings, queryAll, withTransaction} from '../db/init.js';
@@ -85,50 +86,6 @@ function normalizeSubscriptionIds(value) {
   return {ids};
 }
 
-function canonicalProfileUrl(rawUrl, platform) {
-  let parsed;
-  try {
-    parsed = new URL(text(rawUrl, 3000));
-  } catch {
-    return '';
-  }
-  const normalizedPlatform = text(platform, 40).toLowerCase();
-  const host = parsed.hostname.toLowerCase().replace(/\.$/u, '');
-  const base =
-    normalizedPlatform === 'xiaohongshu'
-      ? 'xiaohongshu.com'
-      : normalizedPlatform === 'douyin'
-        ? 'douyin.com'
-        : normalizedPlatform === 'weibo'
-          ? 'weibo.com'
-          : '';
-  if (
-    parsed.protocol !== 'https:' ||
-    parsed.username ||
-    parsed.password ||
-    (parsed.port && parsed.port !== '443') ||
-    !base ||
-    !(host === base || host.endsWith(`.${base}`))
-  ) return '';
-  const validPath =
-    normalizedPlatform === 'xiaohongshu'
-      ? /^\/user\/profile\/[A-Za-z0-9_-]+\/?$/iu.test(parsed.pathname)
-      : normalizedPlatform === 'douyin'
-        ? /^\/user\/[A-Za-z0-9._-]+\/?$/iu.test(parsed.pathname)
-        : /^\/(?:u\/)?[A-Za-z0-9._-]+\/?$/iu.test(parsed.pathname);
-  if (!validPath) return '';
-  const allowedQueryKeys =
-    normalizedPlatform === 'xiaohongshu'
-      ? new Set(['xsec_token', 'xsec_source'])
-      : new Set();
-  for (const key of [...parsed.searchParams.keys()]) {
-    if (!allowedQueryKeys.has(key)) parsed.searchParams.delete(key);
-  }
-  parsed.hash = '';
-  parsed.hostname = host;
-  return parsed.toString();
-}
-
 function publicSubscription(row) {
   return {
     id: row.id,
@@ -166,7 +123,7 @@ router.get(
         SELECT *
         FROM monitor_subscriptions
         WHERE tenant_id = $1
-          AND status = 'active'
+          AND (status = 'active' OR ($2 = 'creator' AND status = 'paused'))
           AND subject_type = $2
           AND COALESCE(account_url, '') <> ''
           AND platform IN ('xiaohongshu', 'douyin', 'weibo')
@@ -334,7 +291,7 @@ router.post(
           )};
         }
         const invalid = subscriptions.filter(row =>
-          row.status !== 'active' ||
+          (row.status !== 'active' && !(subjectType === 'creator' && row.status === 'paused')) ||
           (row.subject_type || 'creator') !== subjectType ||
           !canonicalProfileUrl(row.account_url, row.platform));
         if (invalid.length > 0) {

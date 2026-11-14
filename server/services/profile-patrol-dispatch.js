@@ -1,3 +1,5 @@
+import {canonicalProfileUrl} from './followed-creator-identity.js';
+import {nextCreatorPatrolTime} from './followed-creator-schedule.js';
 import crypto from 'node:crypto';
 import {withTransaction} from '../db/init.js';
 import {
@@ -507,6 +509,7 @@ export async function materializeProfilePatrolTask(tx, {
     JSON.stringify({
       total: subscriptions.length,
       assigned: subscriptions.length,
+      completed: 0,
       processed: 0,
       success: 0,
       failed: 0,
@@ -688,7 +691,8 @@ export async function enqueueDueProfilePatrolTasks(limit = 20) {
         -- because each run chooses its own post and comment limits. This
         -- legacy profile cron only schedules followed creators.
         AND ms.subject_type = 'creator'
-        AND COALESCE(ms.account_url, '') <> ''
+        AND ms.auto_patrol_enabled
+        AND ms.platform IN ('douyin','xiaohongshu','weibo')
         AND ms.next_run_at <= now()
         AND NOT EXISTS (
           SELECT 1
@@ -721,6 +725,16 @@ export async function enqueueDueProfilePatrolTasks(limit = 20) {
     const settingsByTenant = new Map();
 
     for (const subscription of subscriptions) {
+      const canonical = canonicalProfileUrl(subscription.account_url, subscription.platform);
+      if (!canonical) {
+        const setting = await tx.queryOne("SELECT value FROM tenant_settings WHERE tenant_id=$1 AND key='monitor_runTimes'", [subscription.tenant_id]);
+        const message = '博主主页链接无效';
+        await tx.execute(`UPDATE monitor_subscriptions SET last_error=$1, next_run_at=$2, updated_at=now()
+          WHERE id=$3 AND tenant_id=$4`, [message, nextCreatorPatrolTime(setting?.value), subscription.id, subscription.tenant_id]);
+        results.push({kind: 'invalid_profile', subscriptionId: subscription.id, message});
+        continue;
+      }
+      subscription.account_url = canonical;
       const assignedAgentId = text(subscription.assigned_agent_id, 100);
       const subjectType = subscription.subject_type || 'creator';
       const available = await loadAvailableScheduledProfilePatrolAgent(tx, {

@@ -1,3 +1,4 @@
+import { FollowedCreatorBadge } from '@/components/shared/FollowedCreatorBadge'
 import { negativeInteractionClass } from '@/lib/negativeInteraction.mjs'
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
@@ -314,6 +315,7 @@ type TriageFilterSnapshot = {
   sentiment: string
   watchedFilter: string
   crossPlatform: boolean
+  followedCreator: boolean
   suggestionFilter: boolean
   contentTopic: string
   customTagIds: string[]
@@ -333,6 +335,7 @@ function recordMatchesFilters(record: Record<string, unknown>, filters: TriageFi
   if (filters.triageStatuses.length && !filters.triageStatuses.includes(String(record.triage_status || 'unhandled'))) return false
   if (filters.sentiment && String(record.sentiment || '') !== filters.sentiment) return false
   if (filters.watchedFilter === 'watched' && !record.is_watched) return false
+  if (filters.followedCreator && !record.followed_creator_label) return false
   if (filters.crossPlatform && !crossPostSummary(record).count) return false
   if (filters.suggestionFilter && !openTriageSuggestion(record)) return false
   if (filters.contentTopic) {
@@ -358,6 +361,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [relevances, setRelevances] = useState<string[]>(() => normalizePostRelevanceFilter(initial?.relevance))
   const [relevanceConfidences, setRelevanceConfidences] = useState<string[]>(() => normalizePostConfidenceFilter(initial?.relevanceConfidence))
   const [platform, setPlatform] = useState(initial?.platform ?? '')
+  const [followedCreator, setFollowedCreator] = useState(initial?.followedCreator === '1')
   const [crossPlatform, setCrossPlatform] = useState(initial?.crossPlatform === 'true')
   const [suggestionFilter, setSuggestionFilter] = useState(initial?.suggestion === 'non_monitor')
   const [suggestionSummary, setSuggestionSummary] = useState<SuggestionSummary | null>(null)
@@ -420,6 +424,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     const params = new URLSearchParams({ sentiment, platform, keyword })
     if (contentTopic) params.set('contentTopic', contentTopic)
     if (watchedFilter) params.set('watched', watchedFilter)
+    if (followedCreator) params.set('followedCreator', '1')
     if (crossPlatform) params.set('crossPlatform', 'true')
     if (suggestionFilter) params.set('suggestion', 'non_monitor')
     if (archiveView !== 'active') params.set('bucket', archiveView)
@@ -443,7 +448,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     if (dateRanges.handled.from) params.set('handledFrom', dateRanges.handled.from)
     if (dateRanges.handled.to) params.set('handledTo', dateRanges.handled.to)
     return params
-  }, [archiveView, triageStatuses, risk, identity, sentiment, contentTopic, intents, relevances, relevanceConfidences, platform, watchedFilter, crossPlatform, suggestionFilter, keyword, sort, captureKeywords, customTagIds, dateRanges])
+  }, [archiveView, triageStatuses, risk, identity, sentiment, contentTopic, intents, relevances, relevanceConfidences, platform, watchedFilter, crossPlatform, followedCreator, suggestionFilter, keyword, sort, captureKeywords, customTagIds, dateRanges])
 
   // 勾选跟着「当前这一页的查询」走：筛选、排序、翻页、切视图都会自动清空勾选，避免带着看不见的幽灵选中去批量处理。
   const filterQuery = useMemo(() => filterParams().toString(), [filterParams])
@@ -619,14 +624,15 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const activeDateFilterCount = Object.values(dateRanges).filter(range => range.from || range.to).length
   const hasCustomSort = sort.field !== 'publish' || sort.dir !== 'desc'
   const activeIntentCount = intents.length + relevances.length + relevanceConfidences.length
-  const hasActiveFilters = Boolean(suggestionFilter || crossPlatform || platform || sentiment || contentTopic || activeIntentCount || keyword || triageStatuses.length || risk.length || identity.length || captureKeywords.length || customTagIds.length || activeDateFilterCount || hasCustomSort)
+  const hasActiveFilters = Boolean(suggestionFilter || followedCreator || crossPlatform || platform || sentiment || contentTopic || activeIntentCount || keyword || triageStatuses.length || risk.length || identity.length || captureKeywords.length || customTagIds.length || activeDateFilterCount || hasCustomSort)
   const activeFilterCount = [platform, sentiment, contentTopic].filter(Boolean).length
-    + Number(crossPlatform) + Number(suggestionFilter) + activeIntentCount + Number(Boolean(keyword)) + triageStatuses.length + risk.length + identity.length + captureKeywords.length + customTagIds.length + activeDateFilterCount + Number(hasCustomSort)
+    + Number(followedCreator) + Number(crossPlatform) + Number(suggestionFilter) + activeIntentCount + Number(Boolean(keyword)) + triageStatuses.length + risk.length + identity.length + captureKeywords.length + customTagIds.length + activeDateFilterCount + Number(hasCustomSort)
   const clearFilters = () => {
     setPlatform(''); setSentiment(''); setKeyword(''); setKeywordDraft(''); setTriageStatuses([]); setRisk([]); setIdentity([]); setCaptureKeywords([]); setCustomTagIds([]); setDateRanges(emptyDateRanges())
     setIntents([]); setRelevances([]); setRelevanceConfidences([])
     setContentTopic('')
     setCrossPlatform(false)
+    setFollowedCreator(false)
     setSuggestionFilter(false)
     setSort({ field: 'publish', dir: 'desc' })
   }
@@ -1138,8 +1144,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 
   // 已保存但不再符合当前筛选的行：淡显 + 提示，刷新后才移出。
   const filterSnapshot = useMemo<TriageFilterSnapshot>(() => ({
-    archiveView, triageStatuses, sentiment, watchedFilter, crossPlatform, suggestionFilter, contentTopic, customTagIds, intents, relevances, relevanceConfidences,
-  }), [archiveView, triageStatuses, sentiment, watchedFilter, crossPlatform, suggestionFilter, contentTopic, customTagIds, intents, relevances, relevanceConfidences])
+    archiveView, triageStatuses, sentiment, watchedFilter, crossPlatform, followedCreator, suggestionFilter, contentTopic, customTagIds, intents, relevances, relevanceConfidences,
+  }), [archiveView, triageStatuses, sentiment, watchedFilter, crossPlatform, followedCreator, suggestionFilter, contentTopic, customTagIds, intents, relevances, relevanceConfidences])
   const outOfFilterIds = useMemo(() => {
     const ids = new Set<string>()
     for (const record of records) {
@@ -1346,6 +1352,11 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           </div>
 
           <div className="ml-auto inline-flex shrink-0 items-center justify-end gap-1.5">
+            <Button variant="outline" size="sm" aria-pressed={followedCreator}
+              onClick={() => setFollowedCreator(value => !value)}
+              className={cn(followedCreator && 'border-teal-500/40 bg-teal-500/10 text-teal-800 dark:text-teal-200')}>
+              关注博主
+            </Button>
             <Button variant="outline" size="sm" aria-pressed={crossPlatform} aria-label="多平台同发"
               onClick={() => setCrossPlatform(value => !value)}
               className={cn(crossPlatform && 'border-primary/35 bg-primary/8 text-primary hover:bg-primary/12')}>
@@ -1862,6 +1873,7 @@ function MobileRecordCard({ record: r, canWrite, selected, outOfFilter, onToggle
           <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
             <span className="inline-flex min-w-0 items-center gap-1"><User className="h-3 w-3 shrink-0" /><span className="max-w-28 truncate">{r.author_name || '未知作者'}</span></span>
             <span>{platformName(r.platform)}</span>
+            <FollowedCreatorBadge label={r.followed_creator_label} />
             <CrossPostBadge record={r} />
             <RecordSourceAction record={r} compact className="font-semibold" />
           </div>
@@ -2058,7 +2070,8 @@ function RecordRow({ record: r, canWrite, open, selected, outOfFilter, onToggle,
               <span className="inline-flex min-w-0 max-w-[150px] items-center gap-1"><User className="h-2.5 w-2.5 shrink-0" /><span className="truncate">{r.author_name || '未知'}</span></span>
               <span className="text-muted-foreground/50">·</span>
               <span className="shrink-0">{platformName(r.platform)}</span>
-              <CrossPostBadge record={r} />
+              <FollowedCreatorBadge label={r.followed_creator_label} />
+            <CrossPostBadge record={r} />
               <RecordTopicChips record={r} />
               <RecordSourceAction record={r} compact />
               {r.blogger_profile_url && <a href={r.blogger_profile_url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="inline-flex shrink-0 items-center gap-0.5 font-medium text-primary hover:underline"><User className="h-2.5 w-2.5" />主页</a>}

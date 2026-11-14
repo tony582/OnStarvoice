@@ -1,3 +1,4 @@
+import followedCreators from './followed-creators.js';
 import { Router } from 'express';
 import { queryOne, queryAll, execute, getAllSettings, setSettings, withTransaction } from '../db/init.js';
 import { requireTenantAccess, requireTenantWriter } from '../middleware/auth.js';
@@ -7,6 +8,7 @@ import {
 } from '../services/official-comment-patrol-analytics.js';
 
 const router = Router();
+router.use(followedCreators);
 const MONITOR_SETTING_KEYS = new Set([
   'publishWindow',
   'likeThreshold',
@@ -1209,16 +1211,12 @@ router.post('/executions/:id/finish', requireTenantAccess, requireTenantWriter, 
 
       await tx.execute(`
         UPDATE monitor_subscriptions
-        SET last_run_at = now(),
-          next_run_at = CASE
-            WHEN $1 = 'succeeded' THEN now() + make_interval(mins => cadence_minutes)
-            ELSE now() + interval '15 minutes'
-          END,
-          last_cursor = COALESCE(NULLIF($2, ''), last_cursor),
-          last_error = $3,
+        SET last_run_at = $5,
+          last_cursor = COALESCE(NULLIF($1, ''), last_cursor),
+          last_error = $2,
           updated_at = now()
-        WHERE id = $4 AND tenant_id = $5
-      `, [finalStatus, nextCursor || '', finalStatus === 'failed' ? errorMessage : '', execution.subscription_id, req.tenantId]);
+        WHERE id = $3 AND tenant_id = $4
+      `, [nextCursor || '', finalStatus === 'failed' ? errorMessage : '', execution.subscription_id, req.tenantId, execution.finished_at]);
 
       if (finalStatus === 'succeeded') {
         await captureOfficialCommentPatrolSnapshots(

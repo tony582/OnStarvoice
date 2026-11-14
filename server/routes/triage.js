@@ -720,6 +720,8 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       });
     }
     where = watchedFilter.where;
+    if (req.query.followedCreator === '1') where += ` AND EXISTS (SELECT 1 FROM monitor_subscriptions fc
+      WHERE fc.id=r.followed_creator_subscription_id AND fc.tenant_id=r.tenant_id AND fc.status='active')`;
     if (req.query.crossPlatform === 'true') where += ` AND EXISTS (SELECT 1 FROM record_cross_posts cp
       WHERE cp.tenant_id=r.tenant_id AND cp.record_id=r.id AND EXISTS (SELECT 1 FROM record_cross_posts peer
         WHERE peer.tenant_id=cp.tenant_id AND peer.group_id=cp.group_id AND peer.record_id<>cp.record_id))`;
@@ -759,6 +761,7 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       SELECT
         page.matched_total,
         r.business_visibility, r.record_type,
+        COALESCE(NULLIF(fc.creator_label,''),fc.name) AS followed_creator_label,
         r.id, r.external_id, r.platform, r.title, r.content, r.author_name, r.author_avatar, r.author_avatar_local,
         r.author_fans, r.url, r.canonical_url, r.cover_url, r.cover_local, r.image_urls, r.image_local_urls, r.note_type,
         CASE WHEN r.platform='wechat_articles' THEN jsonb_build_object('wechatArticle',
@@ -833,6 +836,7 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
         ) AS latest_negative_comment
       FROM page_records page
       JOIN records r ON r.id = page.id
+      LEFT JOIN monitor_subscriptions fc ON fc.id=r.followed_creator_subscription_id AND fc.tenant_id=r.tenant_id AND fc.status='active'
       LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
       ${LATEST_CONTENT_TICKET_JOIN}
       ${LATEST_CONTENT_PROGRESS_JOIN}
@@ -1568,6 +1572,8 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       });
     }
     where = watchedFilter.where;
+    if (req.query.followedCreator === '1') where += ` AND EXISTS (SELECT 1 FROM monitor_subscriptions fc
+      WHERE fc.id=r.followed_creator_subscription_id AND fc.tenant_id=r.tenant_id AND fc.status='active')`;
     if (req.query.crossPlatform === 'true') where += ` AND EXISTS (SELECT 1 FROM record_cross_posts cp
       WHERE cp.tenant_id=r.tenant_id AND cp.record_id=r.id AND EXISTS (SELECT 1 FROM record_cross_posts peer
         WHERE peer.tenant_id=cp.tenant_id AND peer.group_id=cp.group_id AND peer.record_id<>cp.record_id))`;

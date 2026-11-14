@@ -1,3 +1,4 @@
+import { FollowedCreatorBadge } from './FollowedCreatorBadge'
 import { usePolling } from '@/hooks/usePolling'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
@@ -515,6 +516,7 @@ function RecordDrawerContent({
                     </span>
                     <span className="truncate">{sourceName || '未知作者'}</span>
                   </span>
+                  <FollowedCreatorBadge label={r.followed_creator_label} />
                   {Number(r.author_fans) > 0 && <><MetaDot /><span>粉丝 {formatNumber(r.author_fans)}</span></>}
                   <MetaDot /><span>{platformName(r.platform)}</span>
                   {articleDetail ? <>
