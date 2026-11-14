@@ -2031,12 +2031,13 @@ function createRelayClock() {
       return id;
     },
     clearTimeout(id) { timers.delete(id); },
+    suspend(ms) { now += ms; },
     async advance(ms) {
       const end = now + ms;
       for (;;) {
         const [id, next] = [...timers].sort(([, a], [, b]) => a.at - b.at)[0] || [];
         if (!next || next.at > end) break;
-        now = next.at;
+        now = Math.max(now, next.at);
         timers.delete(id);
         next.handler();
         await new Promise(resolve => setImmediate(resolve));
@@ -2195,4 +2196,46 @@ test("supervised collection with new results still runs after six minutes", asyn
   assert.equal(failure, undefined);
   finish({ok: true});
   assert.equal((await relay).ok, true);
+});
+
+test("supervised relay pauses its watchdog while network pause heartbeats arrive", async () => {
+  const clock = createRelayClock();
+  const h = createHarness({clock});
+  seedRunningRequest(h);
+  let finish;
+  h.content(SOURCE_TAB).onAction = () => new Promise(resolve => { finish = resolve; });
+  let failure;
+  const relay = h.api.relay(SOURCE_TAB, {
+    action: "captureKeywordNotes", captureRequestId: CAPTURE_ID,
+  }, {runnerRequestId: REQUEST_ID, runnerAttemptId: A1}).catch(error => { failure = error.code; });
+  for (let second = 0; second < 300; second += 10) {
+    h.api.markContentRelayHeartbeat({
+      captureRequestId: CAPTURE_ID, phase: "network_paused", heartbeatOnly: true,
+    });
+    await clock.advance(10000);
+  }
+  assert.equal(failure, undefined);
+  assert.deepEqual(h.forbiddenTabCalls.reload, []);
+  finish({ok: true});
+  assert.equal((await relay).ok, true);
+});
+
+test("supervised relay restarts its ninety-second inactivity clock after an Edge suspension", async () => {
+  const clock = createRelayClock();
+  const h = createHarness({clock});
+  seedRunningRequest(h);
+  h.content(SOURCE_TAB).onAction = () => new Promise(() => {});
+  let failure;
+  void h.api.relay(SOURCE_TAB, {
+    action: "captureKeywordNotes", captureRequestId: CAPTURE_ID,
+  }, {runnerRequestId: REQUEST_ID, runnerAttemptId: A1}).catch(error => { failure = error.code; });
+  await clock.advance(40000);
+  clock.suspend(60000);
+  await clock.advance(0);
+  assert.equal(failure, undefined);
+  await clock.advance(89000);
+  assert.equal(failure, undefined);
+  await clock.advance(1000);
+  assert.equal(failure, "CONTENT_RELAY_STALLED");
+  assert.deepEqual(h.forbiddenTabCalls.reload, []);
 });

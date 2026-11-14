@@ -20132,6 +20132,10 @@ function markContentRelayHeartbeat(progress = {}) {
     previous.updatedAt = Number(progress?.updatedAt) || Date.now();
     return;
   }
+  if (previous.phase === 'network_paused') {
+    previous.updatedAt = Date.now();
+    return;
+  }
   if (progress.heartbeatOnly === true) return;
   let advanced = false;
   // Search reports detected/qualified/filtered counts; comment scrolling
@@ -20284,13 +20288,13 @@ async function sendContentMessageWithTimeout(
             ? now - Number(heartbeat.updatedAt || 0)
             : Number.POSITIVE_INFINITY;
           const networkPauseIsAlive =
-            !requireBusinessProgress && heartbeat?.phase === 'network_paused' &&
+            heartbeat?.phase === 'network_paused' &&
             heartbeatAgeBeforeTickMs <= CONTENT_NETWORK_PAUSE_HEARTBEAT_GRACE_MS;
 
           // 合盖休眠/系统冻结会让定时器整体停摆。唤醒后的大间隔不计入
           // 采集用时，并给原页面一次恢复心跳的机会，而不是立刻误判超时。
           if (tickGapMs > CONTENT_RELAY_SUSPEND_GAP_MS) {
-            if (heartbeat && !requireBusinessProgress) {
+            if (heartbeat) {
               heartbeat.updatedAt = now;
               heartbeat.phase = 'system_resumed';
             }
@@ -20307,7 +20311,7 @@ async function sendContentMessageWithTimeout(
             ? now - Number(latestHeartbeat.updatedAt || 0)
             : 0;
           const latestNetworkPauseIsAlive =
-            !requireBusinessProgress && latestHeartbeat?.phase === 'network_paused' &&
+            latestHeartbeat?.phase === 'network_paused' &&
             heartbeatAgeMs <= CONTENT_NETWORK_PAUSE_HEARTBEAT_GRACE_MS;
 
           if (
