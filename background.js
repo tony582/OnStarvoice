@@ -10568,7 +10568,8 @@ const STOP_FENCE_REASON_PRIORITY = [
   'check_timeout',
   'storage_unreadable',
 ];
-const STOP_FENCE_SYNC_BLOCKED_MESSAGE = '同步前检查失败（例如凭证过期），已保留旧运行页，等待运营处理';
+const STOP_FENCE_SYNC_BLOCKED_LABEL = '同步前检查失败（例如凭证过期）';
+const STOP_FENCE_SYNC_BLOCKED_MESSAGE = `${STOP_FENCE_SYNC_BLOCKED_LABEL}，已保留旧运行页，等待运营处理`;
 const STOP_FENCE_REASON_MESSAGES = {
   previous_capture_stopped:
     '设备已确认旧采集页面已停止，已释放本机执行锁与采集辅助',
@@ -11823,6 +11824,7 @@ async function closeStopFenceRunnerTabs(ctx, {operatorConfirmed = false} = {}) {
           if (!isUnattendedRetirementFlushed(receipt) && liveTab.discarded !== true) {
             if (receipt?.syncBlocked === true) {
               ctx.syncBlocked = true;
+              ctx.syncBlockedRunnerTab = liveTab;
               return {ok: false, reason: 'checkpoint_reports_pending', closedTabIds};
             }
             const lock = await readStoredCaptureExecutionLock();
@@ -12119,6 +12121,18 @@ function buildStopFenceCheckResult(ctx, {
         sweep?.titles || new Map(),
         unresolved,
       );
+  const blockedRunner = ctx.syncBlockedRunnerTab;
+  if (!accepted && blockedRunner) {
+    // The existing admin maps its reason code to generic copy. Put the
+    // diagnosis on the pending page, where it also renders evidence text.
+    if (!pendingTabIds.includes(blockedRunner.id)) pendingTabIds.unshift(blockedRunner.id);
+    pendingTabs.unshift({
+      tabId: blockedRunner.id,
+      platform: 'extension',
+      evidence: STOP_FENCE_SYNC_BLOCKED_LABEL,
+      title: String(blockedRunner.title || '旧运行页').slice(0, 40),
+    });
+  }
   const scrollingOldPages = orderedTargets.filter(
     (target) =>
       target.evidence === 'old_document_uninspectable' &&
@@ -12170,8 +12184,8 @@ function buildStopFenceCheckResult(ctx, {
     unresolvedTabCount: unresolved.length,
     relayInFlightCount,
     targets: orderedTargets.slice(0, 40),
-    pendingTabIds,
-    pendingTabs,
+    pendingTabIds: pendingTabIds.slice(0, 20),
+    pendingTabs: pendingTabs.slice(0, 10),
     runnerTabsClosed,
     ...(ctx.syncBlocked ? {syncBlocked: true} : {}),
     ...(ctx.runnerGoneWithoutReceipt ? {runnerGoneWithoutReceipt: true} : {}),

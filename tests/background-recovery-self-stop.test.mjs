@@ -2287,6 +2287,8 @@ test("a blocked upload remains fenced after ten minutes and explains the block",
   assert.equal(second.reason, "checkpoint_reports_pending");
   assert.equal(second.syncBlocked, true);
   assert.match(second.message, /同步前检查失败（例如凭证过期）/);
+  assert.ok(second.pendingTabs.some(tab => tab.tabId === RUNNER_TAB &&
+    tab.evidence === "同步前检查失败（例如凭证过期）"));
   assert.equal(h.tabs.has(RUNNER_TAB), true);
   assert.deepEqual(h.removedTabIds, []);
   assert.deepEqual(h.forbiddenTabCalls.discard, []);
@@ -2295,7 +2297,7 @@ test("a blocked upload remains fenced after ten minutes and explains the block",
 
 test("node check discards only a continuously unretired old runner and hands off its durable records", async () => {
   for (const scenario of ["frozen", "missing-context", "early", "live", "focused", "current",
-    "progress", "lock", "foreign", "unknown-tab", "receipt", "navigation"]) {
+    "progress", "lock", "source", "foreign", "unknown-tab", "receipt", "navigation"]) {
     const clock = createRelayClock();
     const h = createHarness({clock});
     seedRunningRequest(h);
@@ -2330,6 +2332,9 @@ test("node check discards only a continuously unretired old runner and hands off
     if (scenario === "foreign") h.patchTab(RUNNER_TAB, {url: runnerUrl("another-request", A1)});
     if (scenario === "unknown-tab") h.storage[REQUEST_KEY].recoverySelfStop.runnerTabId = 44;
     if (scenario === "progress") h.storage[REQUEST_KEY].progress.runnerTabId = RUNNER_TAB;
+    if (scenario === "source") h.storage["onstarvoice.keywordSourceBindings.v1"] = {
+      [`unattended:${REQUEST_ID}:${A1}`]: {sources: [{sourceTabId: RUNNER_TAB}]},
+    };
     if (scenario === "lock") h.storage[LOCK_KEY].holderTabId = RUNNER_TAB;
     if (scenario === "navigation") h.patchTab(RUNNER_TAB, {pendingUrl: "https://www.douyin.com/"});
     if (scenario === "receipt") await retireRunner(h, A1, {
