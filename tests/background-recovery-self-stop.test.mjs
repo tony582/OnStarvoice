@@ -211,8 +211,9 @@ function createHarness({state = null, clock = null} = {}) {
       onConnect: createEvent(),
       getManifest: () => ({version: "0.4.19"}),
       getURL: (path) => `${EXTENSION_ORIGIN}/${path}`,
-      async getContexts({documentIds = []} = {}) {
-        return documentIds
+      async getContexts({documentIds, tabIds} = {}) {
+        const selected = documentIds || tabIds?.map(id => tabDocuments.get(id)).filter(Boolean) || [];
+        return selected
           .filter((documentId) => !deadDocuments.has(documentId))
           .map((documentId) => {
             const tabId = [...tabDocuments].find(([, value]) => value === documentId)?.[0];
@@ -2290,4 +2291,68 @@ test("a blocked upload remains fenced after ten minutes and explains the block",
   assert.deepEqual(h.removedTabIds, []);
   assert.deepEqual(h.forbiddenTabCalls.discard, []);
   assert.equal(Object.keys(h.storage).some(key => key.startsWith("onstarvoice.unattendedRunnerUploadHandoff.")), false);
+});
+
+test("node check discards only a continuously unretired old runner and hands off its durable records", async () => {
+  for (const scenario of ["frozen", "missing-context", "early", "live", "focused", "current",
+    "progress", "lock", "foreign", "unknown-tab", "receipt", "navigation"]) {
+    const clock = createRelayClock();
+    const h = createHarness({clock});
+    seedRunningRequest(h);
+    h.storage[REQUEST_KEY] = {
+      ...h.storage[REQUEST_KEY], attemptId: "attempt-2", previousAttemptId: A1,
+      status: "needs_action", runnerTabId: null,
+      recoverySelfStop: {v: 1, fromAttemptId: A1, runnerTabId: RUNNER_TAB},
+      error: {code: "PREVIOUS_CAPTURE_STOP_UNCONFIRMED"},
+    };
+    h.storage[LOCK_KEY].holderDocumentId = "gone-lock-document";
+    h.killDocument("gone-lock-document");
+    h.patchTab(RUNNER_TAB, {frozen: scenario !== "missing-context" && scenario !== "live"});
+    if (scenario === "missing-context") h.killDocument(RUNNER_DOCUMENT);
+    h.storage["onstarvoice.auth"] = {captureAgent: {id: "agent-1"}, tenant: {id: "tenant-1"}};
+    h.storage["onstarvoice.data_pool"] = {records: [
+      ...Array.from({length: 251}, (_, i) => ({
+        id: `saved-${i}`, status: "draft", meta: {unattendedUploadRequestId: REQUEST_ID},
+      })),
+      {id: "synced", status: "synced", meta: {unattendedUploadRequestId: REQUEST_ID}},
+      {id: "other", status: "draft", meta: {unattendedUploadRequestId: "elsewhere"}},
+      {id: "unattributed", status: "draft"},
+    ]};
+    const first = await h.api.confirmPreviousUnattendedStopForFenceCheck(buildOffer());
+    assert.equal(first.accepted, false, scenario);
+    const after = scenario === "early" ? 599999 : 600000;
+    await clock.advance(after);
+    if (scenario === "focused") {
+      h.patchTab(RUNNER_TAB, {active: true});
+      h.state.windowFocus.set(1, true);
+    }
+    if (scenario === "current") h.patchTab(RUNNER_TAB, {url: runnerUrl(REQUEST_ID, "attempt-2")});
+    if (scenario === "foreign") h.patchTab(RUNNER_TAB, {url: runnerUrl("another-request", A1)});
+    if (scenario === "unknown-tab") h.storage[REQUEST_KEY].recoverySelfStop.runnerTabId = 44;
+    if (scenario === "progress") h.storage[REQUEST_KEY].progress.runnerTabId = RUNNER_TAB;
+    if (scenario === "lock") h.storage[LOCK_KEY].holderTabId = RUNNER_TAB;
+    if (scenario === "navigation") h.patchTab(RUNNER_TAB, {pendingUrl: "https://www.douyin.com/"});
+    if (scenario === "receipt") await retireRunner(h, A1, {
+      flushing: true, flushed: false, pendingUploads: 0, producerStopped: false,
+    });
+    const second = await h.api.confirmPreviousUnattendedStopForFenceCheck(buildOffer());
+    const shouldDiscard = scenario === "frozen" || scenario === "missing-context";
+    assert.deepEqual(h.forbiddenTabCalls.discard, shouldDiscard ? [RUNNER_TAB] : [], scenario);
+    assert.deepEqual(h.removedTabIds, [], scenario);
+    assert.deepEqual(h.forbiddenTabCalls.reload, [], scenario);
+    assert.equal(h.tabs.has(SOURCE_TAB), true, scenario);
+    const handoff = Object.entries(h.storage)
+      .find(([key]) => key.startsWith("onstarvoice.unattendedRunnerUploadHandoff.v1."))?.[1];
+    if (shouldDiscard) {
+      assert.equal(second.reason, "previous_capture_stopped", scenario);
+      assert.equal(second.runnerGoneWithoutReceipt, true, scenario);
+      assert.equal(h.tabs.get(RUNNER_TAB).discarded, true, scenario);
+      assert.equal(handoff.tabId, RUNNER_TAB);
+      assert.equal(handoff.recordIds.length, 250);
+      assert.ok(handoff.recordIds.every(id => id.startsWith("saved-")));
+    } else {
+      assert.equal(handoff, undefined, scenario);
+    }
+    assert.equal(h.storage["onstarvoice.data_pool"].records.length, 254, scenario);
+  }
 });

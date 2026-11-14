@@ -148,7 +148,7 @@ async function dedupeHarness() {
   const section = source.slice(source.indexOf('async function saveRecordsWithCacheDedupe('),
     source.indexOf('async function saveCaptureResultRecords('));
   const key = record => `${record.platform}:${record.payload.keyword}:${record.payload.items[0].noteId}`;
-  const context = vm.createContext({runDataPoolMutation, getDataPool, setDataPool,
+  const context = vm.createContext({runDataPoolMutation, getDataPool, setDataPool, RECORD_STATUS: {SYNCED: "synced"},
     buildDataPoolIdentityIndex: records => new Map(records.map(record => [key(record), record])),
     resolveRecordIdentityKeys: record => [key(record)],
     isListCaptureRecordType: type => type === 'keyword_notes',
@@ -347,4 +347,15 @@ test('sidebar treats exclusion coverage as a completed task and reports the excl
   assert.match(context.summary(stats), /已排除 2/);
   assert.match(context.summary(stats), /同步成功 0/);
   assert.equal(context.issue({...stats, failedCount: 1}).code, 'STREAMING_SYNC_INCOMPLETE');
+});
+
+test('an unsynced deduplicated keyword record retains its unattended upload owner on disk', async () => {
+  reset(['old']);
+  const original = await getRecord('old');
+  const save = await dedupeHarness();
+  const fresh = {...original, id: 'not-a-new-record'};
+  const result = await save([fresh], {unattendedRequestId: 'request-r'});
+  assert.deepEqual(Array.from(result.recordIds), ['old']);
+  assert.equal((await getRecord('old')).meta.unattendedUploadRequestId, 'request-r');
+  assert.equal((await getDataPool()).records.length, 1);
 });

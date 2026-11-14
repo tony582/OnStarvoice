@@ -1350,7 +1350,7 @@ async function persistAndPublishCaptureTraceState({
 }
 
 // ==================== M4-03: 前端接入 sync 调用 ====================
-function createListCaptureCheckpointSession({mode = '', source = ''} = {}) {
+function createListCaptureCheckpointSession({mode = '', source = '', unattendedRequestId = ''} = {}) {
   if (!isListCaptureRecordType(mode)) {
     return null;
   }
@@ -1359,6 +1359,7 @@ function createListCaptureCheckpointSession({mode = '', source = ''} = {}) {
     id: `list_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     mode: String(mode || '').trim(),
     source: String(source || '').trim(),
+    unattendedRequestId,
     startedAt: Date.now(),
     queue: Promise.resolve(),
     knownKeys: new Set(),
@@ -1870,7 +1871,9 @@ function uniqueRecordsById(records = []) {
   return [...byId.values()];
 }
 
-async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
+async function saveRecordsWithCacheDedupe(
+  records = [], {session = null, unattendedRequestId = session?.unattendedRequestId || ''} = {},
+) {
   const normalizedRecords = Array.isArray(records) ? records.filter(Boolean) : [];
   if (normalizedRecords.length === 0) {
     return {
@@ -1891,9 +1894,11 @@ async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
     const refreshedRecords = []; // 已存但刷新了互动数:就地改 + 同步,但不 unshift(避免本地重复)
     const skippedRecordIds = [];
     const traceBindings = [];
+    let uploadOwnershipChanged = false;
     let skippedCount = 0;
 
     for (const record of normalizedRecords) {
+      if (unattendedRequestId) record.meta = {...record.meta, unattendedUploadRequestId: unattendedRequestId};
       const recordType = record?.type || record?.recordType;
       if (!isListCaptureRecordType(recordType)) {
         const boundTrace = bindCaptureTrace(
@@ -1953,6 +1958,13 @@ async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
             }
           }
         }
+        const uploadOwnerChanged = Boolean(unattendedRequestId &&
+          existingRecord.status !== RECORD_STATUS.SYNCED &&
+          existingRecord.meta?.unattendedUploadRequestId !== unattendedRequestId);
+        if (uploadOwnerChanged) {
+          existingRecord.meta = {...existingRecord.meta, unattendedUploadRequestId: unattendedRequestId};
+          uploadOwnershipChanged = true;
+        }
         if (
           refreshListCaptureMetricsInPlace(existingRecord, record) ||
           keywordLabelsChanged ||
@@ -1987,7 +1999,7 @@ async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
     if (savedRecords.length > 0) {
       dataPool.records.unshift(...savedRecords); // 只 unshift 全新记录
     }
-    if (savedRecords.length > 0 || refreshedRecords.length > 0) {
+    if (savedRecords.length > 0 || refreshedRecords.length > 0 || uploadOwnershipChanged) {
       // 刷新的记录是 dataPool.records 内的引用、已就地改 → 一并持久化
       await setDataPool(dataPool);
     }
@@ -2018,7 +2030,7 @@ async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
   });
 }
 
-async function saveCaptureResultRecords(captureResult, {session = null} = {}) {
+async function saveCaptureResultRecords(captureResult, {session = null, unattendedRequestId = session?.unattendedRequestId || ''} = {}) {
   const recordsToSave = buildRecordsForStorage(captureResult);
   if (!isListCaptureRecordType(captureResult?.type)) {
     if (recordsToSave.length === 0) {
@@ -2055,7 +2067,7 @@ async function saveCaptureResultRecords(captureResult, {session = null} = {}) {
   if (session?.queue) {
     await session.queue.catch(() => null);
   }
-  const finalSave = await saveRecordsWithCacheDedupe(recordsToSave, {session});
+  const finalSave = await saveRecordsWithCacheDedupe(recordsToSave, {session, unattendedRequestId});
   const finalTraceBindings = Array.isArray(finalSave?.traceBindings)
     ? finalSave.traceBindings
     : [];
@@ -2729,6 +2741,7 @@ async function captureAndSaveInTab({
   captureParams = {},
   onProgress = null,
   checkpointSource = 'captureAndSaveInTab',
+  unattendedRequestId = '',
 } = {}) {
   let savedRecords = [];
   let captureCacheStats = null;
@@ -2736,6 +2749,7 @@ async function captureAndSaveInTab({
   const checkpointSession = beginListCaptureCheckpointSession({
     mode,
     source: checkpointSource,
+    unattendedRequestId,
   });
 
   try {
@@ -16578,7 +16592,7 @@ export function resolveKeywordRepairTargets(repair, {keyword = '', round = 1, pl
     .slice(0, 200);
 }
 
-async function prepareKeywordRepairRecords({keyword, platform, targets}) {
+async function prepareKeywordRepairRecords({keyword, platform, targets, unattendedRequestId}) {
   const items = targets.map((target) => ({
     noteId: target.externalId,
     id: target.externalId,
@@ -16591,7 +16605,7 @@ async function prepareKeywordRepairRecords({keyword, platform, targets}) {
       platform,
       data: {keyword, items, totalCount: items.length, keywordRepair: true},
       meta: {source: 'keyword_repair'},
-    });
+    }, {unattendedRequestId});
     const recordIds = Array.isArray(saved?.recordIds) ? saved.recordIds.filter(Boolean) : [];
     if (recordIds.length === 0) {
       return {keyword, ok: false, partial: true, recordIds: [], keywordRepair: true,
@@ -16614,6 +16628,7 @@ export async function batchCaptureByKeywords({
   sourceTabId = null,
   captureParams = {},
   captureTaskId = '',
+  unattendedRequestId = '',
   searchFilters = null,
   disableAutomaticSearchRetry = false,
   requireVerifiedFilters = false,
@@ -16934,7 +16949,7 @@ export async function batchCaptureByKeywords({
     // Repair handoff: the search already ran on another browser. Only its
     // failed posts come here; they enter the same enhancement path below.
     if (repairTargets.length > 0) {
-      keywordResult = await prepareKeywordRepairRecords({keyword, platform, targets: repairTargets});
+      keywordResult = await prepareKeywordRepairRecords({keyword, platform, targets: repairTargets, unattendedRequestId});
       results.push(keywordResult);
       if (keywordResult.ok) successCount++;
       else failedCount++;
@@ -17253,6 +17268,7 @@ export async function batchCaptureByKeywords({
             listCaptureRunId,
           },
           checkpointSource: 'batch_keyword_capture',
+          unattendedRequestId,
           onProgress: onProgress
             ? (progress = {}) => {
                 onProgress({

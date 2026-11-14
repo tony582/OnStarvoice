@@ -14972,6 +14972,7 @@ async function handleBatchKeywordCapture(options = {}) {
         captureTaskId: captureTaskSessionStarted
           ? persistentCaptureTaskId
           : "",
+        unattendedRequestId: scopedUnattendedRequestId,
         searchFilters: roundSearchFilters,
         disableAutomaticSearchRetry,
         requireVerifiedFilters,
@@ -26044,7 +26045,19 @@ async function retrySavedUnattendedRunnerUploads(settings) {
       // The marker is persisted before removal. Do not race a still-live
       // runner that may be trying to send exactly the same records.
       if (typeof chrome.runtime.getContexts !== "function") continue;
-      const contexts = await chrome.runtime.getContexts({documentIds: [handoff.documentId]});
+      if (handoff.requiresDiscardedTab) {
+        // A marker staged before a rejected/abandoned discard is inert.
+        let discarded = false;
+        try {
+          discarded = (await chrome.tabs.get(handoff.tabId))?.discarded === true;
+        } catch (error) {
+          discarded = /no tab with id/i.test(String(error?.message || ''));
+        }
+        if (!discarded) continue;
+      }
+      const filter = handoff.documentId
+        ? {documentIds: [handoff.documentId]} : {tabIds: [handoff.tabId], contextTypes: ["TAB"]};
+      const contexts = await chrome.runtime.getContexts(filter);
       if (contexts.length > 0) continue;
 
       let records = await getRecords(handoff.recordIds);
