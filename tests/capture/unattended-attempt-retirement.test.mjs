@@ -493,3 +493,16 @@ test("a successor retries only durable unsynced records from its own authorizati
   assert.equal(stored[otherKey].tenantId, "foreign");
   assert.equal(records.size, 3);
 });
+
+test("a blocked upload queue reports the block in its retirement receipt", async () => {
+  const queue = createRecordSyncQueue({processRecord: async () => ({
+    ok: false, blocked: true, error: new Error("expired credentials"),
+  })});
+  queue.enqueue("pending");
+  await queue.drain();
+  const runner = createRunner({queue});
+  await runner.context.__retire({requestId: "request-r", attemptId: "attempt-1"});
+  const receipt = runner.calls.messages.at(-1);
+  assert.equal(receipt.syncBlocked, true);
+  assert.equal(receipt.flushed, false);
+});

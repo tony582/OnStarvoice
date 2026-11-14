@@ -2263,3 +2263,31 @@ test("short detail and profile relays accept heartbeat-only progress beyond nine
     assert.equal((await relay).ok, true);
   }
 });
+
+test("a blocked upload remains fenced after ten minutes and explains the block", async () => {
+  const clock = createRelayClock();
+  const h = createHarness({clock});
+  seedRunningRequest(h);
+  h.storage[REQUEST_KEY] = {
+    ...h.storage[REQUEST_KEY], attemptId: "attempt-2", previousAttemptId: A1,
+    status: "needs_action", runnerTabId: null,
+    recoverySelfStop: {v: 1, fromAttemptId: A1},
+    error: {code: "PREVIOUS_CAPTURE_STOP_UNCONFIRMED"},
+  };
+  h.storage[LOCK_KEY].holderDocumentId = "gone-lock-document";
+  h.killDocument("gone-lock-document");
+  await retireRunner(h, A1, {
+    flushing: true, flushed: false, pendingUploads: 0, producerStopped: true, syncBlocked: true,
+  });
+  const first = await h.api.confirmPreviousUnattendedStopForFenceCheck(buildOffer());
+  assert.equal(first.reason, "checkpoint_reports_pending");
+  await clock.advance(600000);
+  const second = await h.api.confirmPreviousUnattendedStopForFenceCheck(buildOffer());
+  assert.equal(second.reason, "checkpoint_reports_pending");
+  assert.equal(second.syncBlocked, true);
+  assert.match(second.message, /同步前检查失败（例如凭证过期）/);
+  assert.equal(h.tabs.has(RUNNER_TAB), true);
+  assert.deepEqual(h.removedTabIds, []);
+  assert.deepEqual(h.forbiddenTabCalls.discard, []);
+  assert.equal(Object.keys(h.storage).some(key => key.startsWith("onstarvoice.unattendedRunnerUploadHandoff.")), false);
+});

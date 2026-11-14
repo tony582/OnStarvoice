@@ -3288,6 +3288,7 @@ async function retireSupersededUnattendedAttempt({
     const settlementCounts = (stats) => ({
       skippedCount: Math.max(0, Number(stats?.retirementSkippedCount || 0)),
       permanentFailedCount: Math.max(0, Number(stats?.permanentFailedCount || 0)),
+      syncBlocked: stats?.blocked === true,
     });
     await sendReceipt({
       flushed: false,

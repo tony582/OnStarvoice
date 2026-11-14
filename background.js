@@ -10568,6 +10568,7 @@ const STOP_FENCE_REASON_PRIORITY = [
   'check_timeout',
   'storage_unreadable',
 ];
+const STOP_FENCE_SYNC_BLOCKED_MESSAGE = '同步前检查失败（例如凭证过期），已保留旧运行页，等待运营处理';
 const STOP_FENCE_REASON_MESSAGES = {
   previous_capture_stopped:
     '设备已确认旧采集页面已停止，已释放本机执行锁与采集辅助',
@@ -11818,6 +11819,10 @@ async function closeStopFenceRunnerTabs(ctx, {operatorConfirmed = false} = {}) {
             ctx.requestId, stopFenceRunnerAttemptId(liveTab),
           );
           if (!isUnattendedRetirementFlushed(receipt) && liveTab.discarded !== true) {
+            if (receipt?.syncBlocked === true) {
+              ctx.syncBlocked = true;
+              return {ok: false, reason: 'checkpoint_reports_pending', closedTabIds};
+            }
             const lock = await readStoredCaptureExecutionLock();
             if (!operatorConfirmed) {
               const candidate = await readStagnantRunnerEvidence(ctx, liveTab, receipt);
@@ -12124,7 +12129,7 @@ function buildStopFenceCheckResult(ctx, {
       target.evidence === 'off_platform_observing' &&
       errorPageTabIds.has(target.tabId),
   ).length;
-  const message = `${stopFenceReasonMessage(reason)}${
+  const message = `${ctx.syncBlocked ? STOP_FENCE_SYNC_BLOCKED_MESSAGE : stopFenceReasonMessage(reason)}${
     scrollingOldPages > 0 ? `；其中 ${scrollingOldPages} 个页面仍在自动滚动` : ''
   }${
     observingErrorPages > 0
@@ -12166,6 +12171,7 @@ function buildStopFenceCheckResult(ctx, {
     pendingTabIds,
     pendingTabs,
     runnerTabsClosed,
+    ...(ctx.syncBlocked ? {syncBlocked: true} : {}),
     ...(ctx.runnerGoneWithoutReceipt ? {runnerGoneWithoutReceipt: true} : {}),
     ...(ctx.runnerClosedWithoutReceipt ? {runnerClosedWithoutReceipt: true} : {}),
     ...(ctx.forcedRunnerClosures?.length ? {
@@ -12408,6 +12414,7 @@ async function releaseStopFenceLocalResourcesForOperator(offer) {
       release,
       boundToR: ctx.boundToR,
     }),
+    ...(ctx.syncBlocked ? {syncBlocked: true, message: STOP_FENCE_SYNC_BLOCKED_MESSAGE} : {}),
     ...(ctx.runnerClosedWithoutReceipt ? {runnerClosedWithoutReceipt: true} : {}),
   });
   if (!state.ok) return finish('storage_unreadable');
@@ -12932,6 +12939,10 @@ async function readStagnantRunnerEvidence(ctx, tab, receipt) {
       !Number.isSafeInteger(receipt.pendingUploads) || receipt.pendingUploads < 0) {
     return null;
   }
+  if (receipt.syncBlocked === true) {
+    ctx.syncBlocked = true;
+    return null;
+  }
   const now = Date.now();
   const key = buildUnattendedRunnerForceObservationKey(requestId, attemptId);
   const previous = await readExtensionSessionValue(key);
@@ -13030,6 +13041,7 @@ async function planSelfStopRunners(ctx, runnerPending, {tryIndex = 0} = {}) {
   const retained = [];
   for (const runner of runners) {
     if (runner.gone || !runner.receipt) continue;
+    if (runner.receipt.syncBlocked === true) ctx.syncBlocked = true;
     if (!isUnattendedRetirementFlushed(runner.receipt)) {
       try {
         const tab = await chrome.tabs.get(runner.tabId);
@@ -13550,7 +13562,7 @@ async function buildRecoverySelfStopFenceEvidence(
       .find((tabId) => tabId && failingTabIds.includes(tabId)) ||
     failingTabIds[0] ||
     null;
-  return await buildUnattendedStopFenceEvidence({
+  const evidence = await buildUnattendedStopFenceEvidence({
     request: {
       ...request,
       progress: {
@@ -13578,6 +13590,7 @@ async function buildRecoverySelfStopFenceEvidence(
       holderTabId: failedTabId,
     },
   }).catch(() => null);
+  return evidence && result?.ctx?.syncBlocked ? {...evidence, syncBlocked: true} : evidence;
 }
 
 // 写一次自停心跳（每次尝试开始与失败后）：刷新 heartbeatAt、progressSeq，不动
@@ -20831,6 +20844,7 @@ async function recordUnattendedAttemptRetired(message = {}, sender = {}) {
     previous.documentId === documentId && previous.tabId === tabId &&
     previous.pendingUploads === pendingUploads &&
     previous.producerStopped === producerStopped &&
+    Boolean(previous.syncBlocked) === (message?.syncBlocked === true) &&
     JSON.stringify(previous.pendingRecordIds || []) === JSON.stringify(pendingRecordIds);
   const receipt = {
     v: 1,
@@ -20840,6 +20854,7 @@ async function recordUnattendedAttemptRetired(message = {}, sender = {}) {
     tabId,
     at,
     producerStopped,
+    syncBlocked: message?.syncBlocked === true,
     flushingSince: flushing ? sameFlushing ? previous.flushingSince || at : at : '',
     pendingRecordIds,
     reason: String(message?.reason || 'attempt_superseded').trim().slice(0, 60),
