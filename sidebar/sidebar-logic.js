@@ -26011,34 +26011,62 @@ async function maybeRunAutoDetailCaptureAfterListCapture(
 }
 
 async function retrySavedUnattendedRunnerUploads(settings) {
-  if (!settings?.autoSyncAfterDetailCapture || !globalThis.navigator?.locks) return;
+  const storage = chrome.storage.local;
+  if (!globalThis.navigator?.locks || typeof storage.getKeys !== "function") return;
   await navigator.locks.request("onstarvoice.unattendedRunnerUploadHandoff", {ifAvailable: true}, async lock => {
     if (!lock) return;
-    const stored = await chrome.storage.local.get(null);
-    for (const [key, handoff] of Object.entries(stored || {})) {
-      if (!key.startsWith(UNATTENDED_RUNNER_UPLOAD_HANDOFF_PREFIX) || !handoff) continue;
-      const auth = await getAuth();
-      if (!auth.verified || auth.captureAgent?.id !== handoff.agentId ||
-          auth.tenant?.id !== handoff.tenantId) continue;
+    const keys = (await storage.getKeys()).filter(key => key.startsWith(UNATTENDED_RUNNER_UPLOAD_HANDOFF_PREFIX));
+    if (!keys.length) return;
+    const stored = await storage.get(keys);
+    const auth = await getAuth();
+    const expire = async (key, handoff, reason) => {
+      await storage.remove(key);
+      await recordDiagnosticAction({
+        source: "sidebar",
+        action: "unattended_runner_upload_handoff_expired",
+        status: "expired",
+        metadata: {reason, attempts: handoff.attempts || 0, recordCount: handoff.recordIds.length},
+      }).catch(() => {});
+    };
+    for (const [key, handoff] of Object.entries(stored)) {
+      if (!handoff || !Array.isArray(handoff.recordIds)) continue;
+      if (!Number.isFinite(handoff.createdAt) || Date.now() - handoff.createdAt >= 24 * 60 * 60 * 1000) {
+        await expire(key, handoff, "age_limit");
+        continue;
+      }
+      const attempts = Number.isSafeInteger(handoff.attempts) ? Math.max(0, handoff.attempts) : 0;
+      if (attempts >= 3) {
+        await expire(key, handoff, "attempt_limit");
+        continue;
+      }
+      if (!settings?.autoSyncAfterDetailCapture || !auth.verified ||
+          auth.captureAgent?.id !== handoff.agentId || auth.tenant?.id !== handoff.tenantId) continue;
       // The marker is persisted before removal. Do not race a still-live
       // runner that may be trying to send exactly the same records.
       if (typeof chrome.runtime.getContexts !== "function") continue;
       const contexts = await chrome.runtime.getContexts({documentIds: [handoff.documentId]});
       if (contexts.length > 0) continue;
-      const records = await getRecords(handoff.recordIds);
+
+      let records = await getRecords(handoff.recordIds);
       const pending = records.filter(record => record.status !== "synced");
       if (pending.length > 0) {
+        // Spend the attempt before dispatch so even a terminated runner cannot
+        // restart this marker more than three times.
+        handoff.attempts = attempts + 1;
+        await storage.set({[key]: handoff});
         await maybeRunAutoSyncAfterDetailCapture(settings, {
           recordIds: pending.map(record => record.id),
           sourceLabel: "旧运行页已保存记录",
           silent: true,
           refreshAfter: false,
         });
+        records = await getRecords(handoff.recordIds);
       }
-      const remaining = await getRecords(handoff.recordIds);
-      if (remaining.length === handoff.recordIds.length &&
-          remaining.every(record => record.status === "synced")) {
-        await chrome.storage.local.remove(key);
+      if (records.every(record => record.status === "synced")) {
+        if (records.length < handoff.recordIds.length) await expire(key, handoff, "records_missing");
+        else await storage.remove(key);
+      } else if (handoff.attempts === 3) {
+        await expire(key, handoff, "attempt_limit");
       }
     }
   });

@@ -450,6 +450,60 @@ test("after the producer wait expires, the queue drains and the receipt still re
   assert.equal(runner.calls.messages.at(-1).flushed, true);
 });
 
+test("handoffs expire at 24 hours or three sends, without touching any data pool record", async () => {
+  const source = readSection(sidebarSource,
+    "async function retrySavedUnattendedRunnerUploads(",
+    "async function maybeRunAutoSyncAfterDetailCapture(");
+  const prefix = "onstarvoice.unattendedRunnerUploadHandoff.v1.";
+  const now = Date.now();
+  const own = {agentId: "node", tenantId: "tenant", documentId: "gone",
+    recordIds: ["retry"], createdAt: now};
+  const active = prefix + "active";
+  const old = prefix + "old";
+  const removed = prefix + "removed";
+  const records = [{id: "retry", status: "draft"}, {id: "older", status: "draft"}];
+  const stored = {[active]: own, [old]: {...own, recordIds: ["older"], createdAt: now - 86400000},
+    [removed]: {...own, recordIds: ["missing"]}, "onstarvoice.data_pool": {records}};
+  const reads = [];
+  const sends = [];
+  const events = [];
+  const context = vm.createContext({
+    UNATTENDED_RUNNER_UPLOAD_HANDOFF_PREFIX: prefix,
+    navigator: {locks: {request: async (_name, _options, run) => run({})}},
+    chrome: {
+      runtime: {getContexts: async () => []},
+      storage: {local: {
+        getKeys: async () => Object.keys(stored),
+        get: async keys => {
+          reads.push(keys);
+          return keys === null ? {...stored} : Object.fromEntries(keys.map(key => [key, stored[key]]));
+        },
+        set: async patch => Object.assign(stored, patch),
+        remove: async key => {delete stored[key];},
+      }},
+    },
+    getAuth: async () => ({verified: true, captureAgent: {id: "node"}, tenant: {id: "tenant"}}),
+    getRecords: async ids => records.filter(record => ids.includes(record.id)),
+    maybeRunAutoSyncAfterDetailCapture: async (_settings, {recordIds}) => {
+      sends.push(...recordIds);
+      return {ok: false};
+    },
+    recordDiagnosticAction: async event => {events.push(event);},
+  });
+  vm.runInContext(source + "\nglobalThis.run = retrySavedUnattendedRunnerUploads;", context);
+  for (let run = 0; run < 5; run++) await context.run({autoSyncAfterDetailCapture: true});
+  assert.ok(reads.length > 0 && reads.every(keys =>
+    Array.isArray(keys) && keys.every(key => key.startsWith(prefix))));
+  assert.deepEqual(sends, ["retry", "retry", "retry"]);
+  assert.deepEqual(Object.keys(stored), ["onstarvoice.data_pool"]);
+  assert.deepEqual([...events.map(event => event.metadata.reason)].sort(),
+    ["age_limit", "attempt_limit", "records_missing"]);
+  assert.ok(events.every(event => event.action === "unattended_runner_upload_handoff_expired"));
+  assert.deepEqual(stored["onstarvoice.data_pool"].records, [
+    {id: "retry", status: "draft"}, {id: "older", status: "draft"},
+  ]);
+});
+
 test("a successor retries only durable unsynced records from its own authorization scope", async () => {
   const source = readSection(sidebarSource,
     "async function retrySavedUnattendedRunnerUploads(",
@@ -462,7 +516,7 @@ test("a successor retries only durable unsynced records from its own authorizati
     ["already", {id: "already", status: "synced"}],
     ["foreign", {id: "foreign", status: "draft"}],
   ]);
-  const own = {agentId: "node", tenantId: "tenant", documentId: "old-runner",
+  const own = {agentId: "node", tenantId: "tenant", documentId: "old-runner", createdAt: Date.now(),
     recordIds: ["pending", "already"]};
   const stored = {[scopedKey]: own, [otherKey]: {...own, tenantId: "foreign", recordIds: ["foreign"]}};
   let oldRunnerAlive = true;
@@ -472,7 +526,12 @@ test("a successor retries only durable unsynced records from its own authorizati
     navigator: {locks: {request: async (_name, _options, run) => run({})}},
     chrome: {
       runtime: {getContexts: async () => oldRunnerAlive ? [{documentId: "old-runner"}] : []},
-      storage: {local: {get: async () => ({...stored}), remove: async key => {delete stored[key];}}},
+      storage: {local: {
+        getKeys: async () => Object.keys(stored),
+        get: async keys => Object.fromEntries(keys.map(key => [key, stored[key]])),
+        set: async patch => Object.assign(stored, patch),
+        remove: async key => {delete stored[key];},
+      }},
     },
     getAuth: async () => ({verified: true, captureAgent: {id: "node"}, tenant: {id: "tenant"}}),
     getRecords: async ids => ids.map(id => records.get(id)).filter(Boolean),
