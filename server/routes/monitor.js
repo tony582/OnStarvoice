@@ -758,6 +758,8 @@ router.post('/subscriptions', requireTenantAccess, requireTenantWriter, async (r
         subscription = await tx.queryOne(`
           UPDATE monitor_subscriptions
           SET status = 'active',
+            auto_patrol_enabled = false,
+            patrol_retry_count = 0,
             name = $1,
             keyword = $2,
             account_url = $3,

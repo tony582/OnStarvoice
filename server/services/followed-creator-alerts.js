@@ -13,7 +13,7 @@ export function creatorAlertEligible(row, now = Date.now()) {
   const time = (row.published_ts && new Date(row.published_ts)) || parsePublishTimestamp(row.publish_time, row.created_at) || new Date(row.created_at);
   const configured = Number(row.max_age);
   const days = Number.isInteger(configured) && configured > 0 ? configured : 7;
-  return time.getTime() <= now && time.getTime() >= now - days * 86400000;
+  return Math.min(time.getTime(), now) >= now - days * 86400000;
 }
 
 export async function checkFollowedCreatorAlert({tenantId, recordId, relevance}) {

@@ -76,6 +76,7 @@ async function applyAccounts(tx, tenantId, entries, commit) {
       const match = existing.find(r=>r.platform===account.platform && (r.match_nicknames?.[0] || r.keyword)===identity);
       const current = entry.id ? existing.find(r=>r.id===entry.id) : match;
       if (entry.id && !current) throw invalid('账号已删除或不存在');
+      if (entry.id && current.platform !== account.platform) throw invalid('已有账号不能更改平台');
       if (entry.id && match && match.id!==entry.id) throw invalid('该平台账号已存在');
       if (account.nicknames && existing.some(r=>r.id!==current?.id && r.platform===account.platform &&
         r.match_nicknames?.some(n=>account.nicknames.includes(n)))) throw invalid('视频号昵称与已有账号重复');
@@ -84,6 +85,7 @@ async function applyAccounts(tx, tenantId, entries, commit) {
           account.accountNo,account.nicknames,account.status,account.alertEnabled,account.autoPatrol,nextCreatorPatrolTime(setting?.value)];
         if (current) await tx.execute(`UPDATE monitor_subscriptions SET platform=$2,keyword=$3,name=$4,account_url=$5,
           creator_label=$6,account_no=$7,match_nicknames=$8,status=$9,alert_enabled=$10,auto_patrol_enabled=$11,
+          patrol_retry_count=CASE WHEN NOT $11 OR $9<>'active' OR NOT auto_patrol_enabled OR status<>'active' THEN 0 ELSE patrol_retry_count END,
           next_run_at=CASE WHEN $11 AND (NOT auto_patrol_enabled OR status<>'active') THEN $12 ELSE next_run_at END,
           updated_at=now() WHERE tenant_id=$1 AND id=$13`, [...values,current.id]);
         else await tx.execute(`INSERT INTO monitor_subscriptions

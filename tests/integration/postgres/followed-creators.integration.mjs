@@ -9,6 +9,10 @@ import {applyCreatorRoster,processFollowedCreatorBackfill} from '../../../server
 import {checkFollowedCreatorAlert,processFollowedCreatorAlerts} from '../../../server/services/followed-creator-alerts.js';
 import {sealDailySecret} from '../../../server/services/customer-daily-report-config.js';
 import {enqueueDueProfilePatrolTasks} from '../../../server/services/profile-patrol-dispatch.js';
+import {createApp} from '../../../server/app.js';
+import {hashPassword} from '../../../server/services/auth-service.js';
+import {withTransaction} from '../../../server/db/init.js';
+import {projectProfilePatrolSchedule} from '../../../server/services/followed-creator-schedule.js';
 import {upsertCapturedRecord} from '../../../server/services/record-store.js';
 
 test('PostgreSQL roster, matching, alert outbox and scheduler isolation',async t=>{
@@ -66,4 +70,63 @@ test('PostgreSQL roster, matching, alert outbox and scheduler isolation',async t
   const queued=await queryAll('SELECT status,attempts FROM followed_creator_alerts WHERE tenant_id=$1',[tenant]);
   assert.deepEqual(queued,[{status:'ambiguous',attempts:1}]);
   assert.equal(sent,1);
+});
+
+test('restoring a deleted subscription through the legacy HTTP route leaves auto patrol off',async t=>{
+  validatePostgresIntegrationTarget({testDatabaseUrl:process.env.TEST_DATABASE_URL,databaseUrl:process.env.DATABASE_URL,requireDatabaseUrl:true});
+  await runMigrations();
+  const tenant=(await queryOne('INSERT INTO tenants(name) VALUES($1) RETURNING id',[randomUUID()])).id;
+  const email=`creator-${randomUUID()}@integration.invalid`;
+  const password='creator-integration-example';
+  const user=(await queryOne(`INSERT INTO users(email,name,password_hash,status,is_internal,global_role,must_change_password)
+    VALUES($1,'Creator integration',$2,'active',true,'platform_admin',false) RETURNING id`,[email, hashPassword(password)])).id;
+  const server=await new Promise((resolve,reject)=>{
+    const listener=createApp().listen(0,'127.0.0.1',()=>resolve(listener));
+    listener.once('error',reject);
+  });
+  t.after(async()=>{
+    await new Promise((resolve,reject)=>server.close(error=>error?reject(error):resolve()));
+    await execute('DELETE FROM users WHERE id=$1',[user]);
+    await execute('DELETE FROM tenants WHERE id=$1',[tenant]);
+    await closePool();
+  });
+  const inserted=await queryOne(`INSERT INTO monitor_subscriptions(tenant_id,platform,keyword,name,account_url,status,auto_patrol_enabled,patrol_retry_count)
+    VALUES($1,'douyin','restore_test','Restore test','https://www.douyin.com/user/restore_test','deleted',true,2) RETURNING id`, [tenant]);
+  const base=`http://127.0.0.1:${server.address().port}/api`;
+  const login=await fetch(base+'/auth/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email,password})});
+  assert.equal(login.status,200);
+  const restored=await fetch(base+'/monitor/subscriptions',{method:'POST',
+    headers:{'content-type':'application/json','x-tenant-id':tenant,Cookie:login.headers.get('set-cookie').split(';')[0]},
+    body:JSON.stringify({platform:'douyin',subjectType:'creator',keyword:'restore_test',accountUrl:'https://www.douyin.com/user/restore_test'})});
+  assert.equal(restored.status,200);
+  assert.equal((await restored.json()).data.restored,true);
+  assert.deepEqual(await queryOne('SELECT status,auto_patrol_enabled,patrol_retry_count FROM monitor_subscriptions WHERE id=$1',[inserted.id]),
+    {status:'active',auto_patrol_enabled:false,patrol_retry_count:0});
+
+  // A due subscription without a usable node consumes the same bounded retry budget.
+  await setSettings({monitor_runTimes:'00:00'},tenant);
+  await execute("UPDATE monitor_subscriptions SET auto_patrol_enabled=true WHERE id=$1",[inserted.id]);
+  for (const expected of [1,2]) {
+    await execute("UPDATE monitor_subscriptions SET next_run_at=now()-interval '1 second' WHERE id=$1",[inserted.id]);
+    const before=Date.now();
+    const attempts=await enqueueDueProfilePatrolTasks();
+    assert.equal(attempts.find(r=>r.subscriptionId===inserted.id)?.kind,'agent_unavailable');
+    const step=await queryOne('SELECT patrol_retry_count,next_run_at FROM monitor_subscriptions WHERE id=$1',[inserted.id]);
+    // Close to midnight, the next fixed slot correctly supersedes the retry.
+    if (step.next_run_at.getTime() < before+30*60000) break;
+    assert.equal(step.patrol_retry_count,expected);
+    assert.ok(step.next_run_at.getTime()-before < 30*60000+10000);
+  }
+  await setSettings({monitor_runTimes:'10:00'},tenant);
+  // The persistent counter must reset, not just the policy's projected value.
+  await execute('UPDATE monitor_subscriptions SET auto_patrol_enabled=true,patrol_retry_count=2 WHERE id=$1',[inserted.id]);
+  const execution=await queryOne(`INSERT INTO monitor_executions(tenant_id,subscription_id,status,finished_at)
+    VALUES($1,$2,'succeeded','2026-11-14T02:43:00Z') RETURNING id`,[tenant,inserted.id]);
+  await withTransaction(tx=>projectProfilePatrolSchedule(tx,tenant,[execution.id]));
+  const row=await queryOne('SELECT patrol_retry_count,next_run_at FROM monitor_subscriptions WHERE id=$1',[inserted.id]);
+  assert.equal(row.patrol_retry_count,0);
+  assert.equal(row.next_run_at.toISOString(),'2026-11-15T02:00:00.000Z');
+  await execute('UPDATE monitor_subscriptions SET patrol_retry_count=1 WHERE id=$1',[inserted.id]);
+  await withTransaction(tx=>projectProfilePatrolSchedule(tx,tenant,[execution.id]));
+  assert.equal((await queryOne('SELECT patrol_retry_count FROM monitor_subscriptions WHERE id=$1',[inserted.id])).patrol_retry_count,1);
 });

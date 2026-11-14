@@ -14,7 +14,11 @@ router.get('/followed-creators', ...session, async (req,res,next)=>{
   try {
     const accounts = await queryAll(`SELECT s.id,s.name,s.platform,s.keyword,s.account_url,s.status,s.creator_label,
       s.account_no,s.match_nicknames,s.alert_enabled,s.auto_patrol_enabled,s.last_run_at,s.next_run_at,
-      s.last_error, latest.status AS latest_result
+      s.last_error, latest.status AS latest_result,
+      EXISTS (SELECT 1 FROM monitor_subscriptions official
+        WHERE official.tenant_id=s.tenant_id AND official.platform=s.platform
+          AND official.subject_type='official' AND official.status='active'
+          AND s.account_url<>'' AND official.account_url=s.account_url) AS has_official_role
       FROM monitor_subscriptions s
       LEFT JOIN LATERAL (SELECT e.status FROM monitor_executions e
         WHERE e.tenant_id=s.tenant_id AND e.subscription_id=s.id ORDER BY e.created_at DESC LIMIT 1) latest ON true

@@ -81,3 +81,24 @@ test('Excel roster imports suspect identities with alerts disabled and auto patr
   assert.ok(parsed.slice(2).every(r=>!r.alertEnabled && r.label.includes('疑似')));
   assert.equal(parsed.at(-1).keyword,'sph2');
 });
+
+test('creator patrol retries twice within the slot and a success clears the retry counter', async ()=>{
+  const {creatorPatrolNextRun}=await import('../server/services/followed-creator-schedule.js');
+  const run=(outcome,retryCount,time)=>creatorPatrolNextRun({outcome,retryCount,runTimes:'10:00,16:00',now:new Date(time)});
+  const first=run('failed',0,'2026-11-14T02:00:00Z');
+  const second=run('failed',first.retryCount,first.nextRunAt);
+  const third=run('failed',second.retryCount,second.nextRunAt);
+  assert.deepEqual([first,second,third].map(p=>[p.nextRunAt.toISOString(),p.retryCount]),[
+    ['2026-11-14T02:30:00.000Z',1],['2026-11-14T03:00:00.000Z',2],['2026-11-14T08:00:00.000Z',0]]);
+  const success=run('succeeded',second.retryCount,second.nextRunAt);
+  assert.equal(success.retryCount,0);
+  assert.equal(run('failed',success.retryCount,success.nextRunAt).retryCount,1);
+  assert.equal(run('invalid_profile',1,first.nextRunAt).nextRunAt.toISOString(),'2026-11-14T08:00:00.000Z');
+  assert.equal(run('failed',0,'2026-11-14T07:50:00Z').nextRunAt.toISOString(),'2026-11-14T08:00:00.000Z');
+});
+
+test('the profile task card displays one finished creator after a legacy snapshot',async ()=>{
+  const {followedCreatorCompletedCount}=await import('../web/admin/src/pages/dispatch/cloud-tasks/task-result-presentation.mjs');
+  assert.equal(followedCreatorCompletedCount({counts:{completed:0},progress:{current:1}}),1);
+  assert.equal(followedCreatorCompletedCount({counts:{processed:1}}),1);
+});

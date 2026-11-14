@@ -7,7 +7,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { KeywordProgressSummary, TaskDiagnosticsPanel } from './TaskDiagnostics'
 import type { CloudTask } from './lib'
-import { resultCount, resultTiming } from './task-result-presentation.mjs'
+import { followedCreatorCompletedCount, resultCount, resultTiming } from './task-result-presentation.mjs'
 import {
   PLATFORM_LABELS,
   STATUS_LABELS,
@@ -553,7 +553,7 @@ export function TaskCard({
               {followedCreatorPatrol && (
                 <>
                   <div>扫描博主：<span className="text-foreground">{safeNumber(task.counts?.total ?? task.progress?.total)} 个</span></div>
-                  <div>已完成：<span className="text-foreground">{safeNumber(task.counts?.completed ?? task.progress?.current)} 个</span></div>
+                  <div>已完成：<span className="text-foreground">{followedCreatorCompletedCount(task)} 个</span></div>
                 </>
               )}
               {officialAccountDiscovery && (

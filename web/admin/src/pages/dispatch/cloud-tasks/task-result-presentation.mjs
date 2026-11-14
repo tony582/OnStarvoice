@@ -228,3 +228,7 @@ export function orchestrationResultRecovery(item, execution, {parentStatus = '',
   if (status === 'pending' && parentActive) return answer('queued', '等待分配', '工作项尚未开始执行。')
   return answer('unfinished', '未完成', '尚未确认恢复排队或执行状态。')
 }
+
+export function followedCreatorCompletedCount(task) {
+  return Math.max(0, Number(task?.progress?.current ?? task?.counts?.processed ?? task?.counts?.completed) || 0);
+}

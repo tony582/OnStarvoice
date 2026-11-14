@@ -468,10 +468,6 @@ test('profile scan results project through task center without pretending subscr
     /该账号没有返回可验证的扫描结果/u,
   );
   assert.match(captureCloud, /syncProfileDiscoverySubscriptions/u);
-  assert.match(
-    captureCloud,
-    /WHEN execution\.status = 'failed'\s+THEN now\(\) \+ interval '15 minutes'/u,
-  );
 });
 
 test('extension profile scan reuses monitor execution and renders distinct dark task copy', () => {

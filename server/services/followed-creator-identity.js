@@ -75,9 +75,3 @@ export async function loadCreatorCandidates(db, tenantId, platform) {
     FROM monitor_subscriptions WHERE tenant_id=$1 AND platform=$2
       AND subject_type='creator' AND status='active'`, [tenantId, platform]);
 }
-
-export async function identifyFollowedCreator(db, record, tenantId) {
-  if (!['xiaohongshu','douyin','weibo','wechat_channels'].includes(record.platform)
-    || ['blogger_profile','official_content'].includes(record.record_type)) return null;
-  return matchFollowedCreator(record, await loadCreatorCandidates(db, tenantId, record.platform));
-}

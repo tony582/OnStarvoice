@@ -1,4 +1,4 @@
-import {identifyFollowedCreator} from './followed-creator-identity.js';
+import {loadCreatorCandidates, matchFollowedCreator} from './followed-creator-identity.js';
 import {mergeArticleRecord} from './android-control/article-record.js';
 import {recordDiscoveryIngestion,finishDiscoveryObservation} from './capture-discovery/detail-receipt.js';
 import {readDiscoveryCaptureKeyword} from './capture-discovery/record-keyword.js';
@@ -1403,6 +1403,13 @@ export async function upsertCapturedRecord(record, context) {
       : resolveRecordBusinessVisibility(record, releasedWindowExclusion
         ? {...existing, business_visibility: 'eligible'} : existing || {});
 
+    const creatorCandidates = !officialResolution.officialAccount &&
+      !['blogger_profile','official_content'].includes(record.record_type) &&
+      ['douyin','xiaohongshu','weibo','wechat_channels'].includes(record.platform)
+      ? await loadCreatorCandidates(tx, tenantId, record.platform)
+      : [];
+    const creatorIdentityColumns = 'platform, record_type, author_id, author_name, blogger_profile_url, author_account_no, followed_creator_subscription_id';
+
     if (existing) {
       const changedFields = detectChangedFields(existing, { ...record, tags, image_urls: imageUrls, payload });
       const relabelReason = resolveRecordRelabelReason(
@@ -1411,7 +1418,8 @@ export async function upsertCapturedRecord(record, context) {
         changedFields,
       );
 
-      await tx.execute(`
+      const save = creatorCandidates.length ? tx.queryOne : tx.execute;
+      const creatorRecord = await save(`
         UPDATE records SET
           record_type = COALESCE(NULLIF($1, ''), record_type),
           title = COALESCE(NULLIF($2, ''), title),
@@ -1469,6 +1477,7 @@ export async function upsertCapturedRecord(record, context) {
           seen_count = seen_count + 1,
           updated_at = now()
         WHERE id = $33
+        ${creatorCandidates.length ? `RETURNING ${creatorIdentityColumns}` : ''}
       `, [
         record.record_type, record.title, record.content,
         record.author_name, record.author_id, record.author_avatar,
@@ -1503,9 +1512,8 @@ export async function upsertCapturedRecord(record, context) {
         officialAccountId: officialResolution.officialAccount?.id,
       });
 
-      const creatorRecord = await tx.queryOne('SELECT * FROM records WHERE id=$1 AND tenant_id=$2', [existing.id, tenantId]);
-      const creatorId = officialResolution.officialAccount ? null : await identifyFollowedCreator(tx, creatorRecord, tenantId);
-      if (creatorId !== creatorRecord.followed_creator_subscription_id) {
+      const creatorId = creatorCandidates.length ? matchFollowedCreator(creatorRecord, creatorCandidates) : null;
+      if (creatorId !== (existing.followed_creator_subscription_id ?? null)) {
         await tx.execute('UPDATE records SET followed_creator_subscription_id=$1 WHERE id=$2 AND tenant_id=$3',
           [creatorId, existing.id, tenantId]);
       }
@@ -1583,7 +1591,7 @@ export async function upsertCapturedRecord(record, context) {
         $38, $39,
         CASE WHEN $39 = 'eligible' THEN NULL ELSE now() END
       )
-      RETURNING id
+      RETURNING id${creatorCandidates.length ? `, ${creatorIdentityColumns}` : ''}
     `, [
       tenantId, record.external_id || '', record.platform || 'unknown', record.record_type || 'single_note',
       record.title || '', record.content || '',
@@ -1605,10 +1613,9 @@ export async function upsertCapturedRecord(record, context) {
 
     await persistCapturedContentAvailability(tx, {tenantId, recordId: inserted.id, record});
 
-    const creatorRecord = await tx.queryOne('SELECT * FROM records WHERE id=$1 AND tenant_id=$2', [inserted.id, tenantId]);
-    const creatorId = officialResolution.officialAccount ? null : await identifyFollowedCreator(tx, creatorRecord, tenantId);
-    if (creatorId !== creatorRecord.followed_creator_subscription_id) {
-      await tx.execute('UPDATE records SET followed_creator_subscription_id=$1 WHERE id=$2 AND tenant_id=$3',
+    if (creatorCandidates.length) {
+      const creatorId = matchFollowedCreator(inserted, creatorCandidates);
+      if (creatorId) await tx.execute('UPDATE records SET followed_creator_subscription_id=$1 WHERE id=$2 AND tenant_id=$3',
         [creatorId, inserted.id, tenantId]);
     }
 

@@ -1,4 +1,4 @@
-import {nextCreatorPatrolTime} from '../services/followed-creator-schedule.js';
+import {projectProfilePatrolSchedule} from '../services/followed-creator-schedule.js';
 import {projectDiscoveryTaskResult} from '../services/capture-discovery/detail-projection.js';
 import crypto from 'crypto';
 import {dispatchDiscoveredPost} from '../services/capture-discovery/detail-dispatch.js';
@@ -3475,31 +3475,7 @@ async function syncProfileDiscoverySubscriptions(
       .map(id => text(id, 100).toLowerCase())
       .filter(id => UUID_PATTERN.test(id)),
   )];
-  if (ids.length === 0) return;
-  const setting = await tx.queryOne("SELECT value FROM tenant_settings WHERE tenant_id=$1 AND key='monitor_runTimes'", [tenantId]);
-  await tx.execute(`
-    UPDATE monitor_subscriptions subscription
-    SET last_run_at = COALESCE(execution.finished_at, now()),
-      next_run_at = CASE
-        WHEN subscription.subject_type = 'creator' THEN $3
-        WHEN execution.status = 'failed'
-          THEN now() + interval '15 minutes'
-        ELSE now() + make_interval(mins => subscription.cadence_minutes)
-      END,
-      last_error = CASE
-        WHEN execution.status IN ('failed', 'cancelled')
-          THEN execution.error_message
-        ELSE ''
-      END,
-      updated_at = now()
-    FROM monitor_executions execution
-    WHERE execution.tenant_id = $1
-      AND execution.id = ANY($2::uuid[])
-      AND subscription.id = execution.subscription_id
-      AND subscription.tenant_id = execution.tenant_id
-      AND execution.status IN ('succeeded', 'failed', 'cancelled')
-      AND (subscription.last_run_at IS NULL OR subscription.last_run_at <= execution.finished_at)
-  `, [tenantId, ids, nextCreatorPatrolTime(setting?.value)]);
+  await projectProfilePatrolSchedule(tx, tenantId, ids);
 }
 
 async function failProfileDiscoveryWork(tx, {

@@ -1,5 +1,5 @@
 import {canonicalProfileUrl} from './followed-creator-identity.js';
-import {nextCreatorPatrolTime} from './followed-creator-schedule.js';
+import {creatorPatrolNextRun, projectProfilePatrolSchedule} from './followed-creator-schedule.js';
 import crypto from 'node:crypto';
 import {withTransaction} from '../db/init.js';
 import {
@@ -509,7 +509,6 @@ export async function materializeProfilePatrolTask(tx, {
     JSON.stringify({
       total: subscriptions.length,
       assigned: subscriptions.length,
-      completed: 0,
       processed: 0,
       success: 0,
       failed: 0,
@@ -683,6 +682,15 @@ export async function enqueueDueProfilePatrolTasks(limit = 20) {
       tx,
       {limit: safeLimit * 5},
     );
+    const reconciledByTenant = new Map();
+    for (const execution of reconciledExecutions) {
+      const ids = reconciledByTenant.get(execution.tenant_id) || [];
+      ids.push(execution.id);
+      reconciledByTenant.set(execution.tenant_id, ids);
+    }
+    for (const [tenantId, ids] of reconciledByTenant) {
+      await projectProfilePatrolSchedule(tx, tenantId, ids);
+    }
     const subscriptions = await tx.queryAll(`
       SELECT ms.*
       FROM monitor_subscriptions ms
@@ -729,8 +737,9 @@ export async function enqueueDueProfilePatrolTasks(limit = 20) {
       if (!canonical) {
         const setting = await tx.queryOne("SELECT value FROM tenant_settings WHERE tenant_id=$1 AND key='monitor_runTimes'", [subscription.tenant_id]);
         const message = '博主主页链接无效';
-        await tx.execute(`UPDATE monitor_subscriptions SET last_error=$1, next_run_at=$2, updated_at=now()
-          WHERE id=$3 AND tenant_id=$4`, [message, nextCreatorPatrolTime(setting?.value), subscription.id, subscription.tenant_id]);
+        const plan = creatorPatrolNextRun({outcome:'invalid_profile', runTimes:setting?.value});
+        await tx.execute(`UPDATE monitor_subscriptions SET last_error=$1, next_run_at=$2, patrol_retry_count=0, updated_at=now()
+          WHERE id=$3 AND tenant_id=$4`, [message, plan.nextRunAt, subscription.id, subscription.tenant_id]);
         results.push({kind: 'invalid_profile', subscriptionId: subscription.id, message});
         continue;
       }
@@ -745,11 +754,13 @@ export async function enqueueDueProfilePatrolTasks(limit = 20) {
       });
       if (available.failure) {
         const message = available.failure.message;
+        const setting = await tx.queryOne("SELECT value FROM tenant_settings WHERE tenant_id=$1 AND key='monitor_runTimes'", [subscription.tenant_id]);
+        const plan = creatorPatrolNextRun({outcome:'failed',retryCount:subscription.patrol_retry_count,runTimes:setting?.value});
         await tx.execute(`
           UPDATE monitor_subscriptions
-          SET last_error = $1, updated_at = now()
-          WHERE id = $2 AND tenant_id = $3
-        `, [message, subscription.id, subscription.tenant_id]);
+          SET last_error=$1, next_run_at=$2, patrol_retry_count=$3, updated_at=now()
+          WHERE id=$4 AND tenant_id=$5
+        `, [message, plan.nextRunAt, plan.retryCount, subscription.id, subscription.tenant_id]);
         results.push({
           kind: 'agent_unavailable',
           subscriptionId: subscription.id,

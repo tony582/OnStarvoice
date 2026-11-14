@@ -13,3 +13,5 @@ export function orchestrationSearchStepLabel(round: number, searchPasses?: strin
 export type OrchestrationResultEvidence = {steps: Record<string, unknown>[]; childIncomplete: boolean; failedStepCount: number; completedStepCount: number; missingCompletedSteps: boolean; postsUnopenable: boolean; unfinishedStepLabels: string[]; syncNeedsReview: boolean}
 export function orchestrationResultEvidence(item: OrchestrationItemRecord, execution: OrchestrationExecutionRecord | undefined, expectedSearchPasses?: number, searchPasses?: string[]): OrchestrationResultEvidence
 export function orchestrationResultRecovery(item: OrchestrationItemRecord, execution: OrchestrationExecutionRecord | undefined, options?: {parentStatus?: string; automaticRecovery?: boolean; now?: number; evidence?: OrchestrationResultEvidence}): {state: string; label: string; message: string; currentError: string}
+
+export function followedCreatorCompletedCount(task?: {progress?: {current?: unknown}; counts?: {processed?: unknown; completed?: unknown}}): number;

@@ -8,6 +8,7 @@ import { platformName } from '@/lib/utils'
 type Account = {
   id: string; name: string; platform: string; keyword: string; account_url: string; creator_label?: string
   account_no?: string; match_nicknames?: string[]; status: 'active' | 'paused'
+  has_official_role?: boolean
   alert_enabled: boolean; auto_patrol_enabled: boolean; last_run_at?: string; latest_result?: string; last_error?: string
 }
 const blank = { id: '', creatorLabel: '', name: '', platform: 'douyin', url: '', accountNo: '', finderId: '', aliases: '',
@@ -72,7 +73,7 @@ export function CreatorRoster({ onScan, onViewHits }: { onScan: (id: string) => 
       <h3 className="font-semibold">{edit.id?'编辑账号':'新增账号'}</h3>
       <div className="grid gap-3 md:grid-cols-2">
         <label className="text-sm">博主名称<Input required value={edit.creatorLabel} onChange={e=>setEdit({...edit,creatorLabel:e.target.value})}/></label>
-        <label className="text-sm">平台<select className="ml-2 rounded border bg-background p-2" value={edit.platform} onChange={e=>setEdit({...edit,platform:e.target.value})}>
+        <label className="text-sm">平台<select className="ml-2 rounded border bg-background p-2" value={edit.platform} disabled={Boolean(edit.id)} onChange={e=>setEdit({...edit,platform:e.target.value})}>
           <option value="douyin">抖音</option><option value="wechat_channels">视频号</option>
           <option value="xiaohongshu">小红书</option><option value="weibo">微博</option>
         </select></label>
@@ -114,7 +115,7 @@ export function CreatorRoster({ onScan, onViewHits }: { onScan: (id: string) => 
     {Array.from(groups).map(([label,members])=><article key={label} className="rounded-xl border bg-card">
       <h3 className="border-b px-4 py-2 text-sm font-semibold">{label}</h3>
       {members?.map(a=><div key={a.id} className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 text-sm">
-        <div className="min-w-52"><b>{platformName(a.platform)} · {a.name}</b><p className="text-xs text-muted-foreground">
+        <div className="min-w-52"><b>{platformName(a.platform)} · {a.name}{a.has_official_role ? ' · 自营' : ''}</b><p className="text-xs text-muted-foreground">
           {a.status==='active'?'已启用':'已暂停'} · 提醒{a.alert_enabled?'开':'关'} · {a.platform==='wechat_channels'?'暂不支持巡查':`自动巡查${a.auto_patrol_enabled?'开':'关'}`}
         </p></div>
         <div className="text-xs text-muted-foreground">{a.last_run_at ? new Date(a.last_run_at).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'}) : '暂无巡查时间'} · {results[a.latest_result || ''] || '暂无结果'}{a.last_error && <p>{a.last_error}</p>}</div>
