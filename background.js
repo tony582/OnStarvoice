@@ -19947,7 +19947,7 @@ function isBestEffortContentRelayAction(payload = {}) {
   return CONTENT_RELAY_BEST_EFFORT_ACTIONS.has(String(payload?.action || ''));
 }
 
-function getContentRelayTimeoutMs(payload = {}, supervisorStallMs = 0) {
+function getContentRelayTimeoutMs(payload = {}) {
   const action = String(payload?.action || '');
   if (
     action === 'ping' ||
@@ -19961,15 +19961,12 @@ function getContentRelayTimeoutMs(payload = {}, supervisorStallMs = 0) {
   }
 
   const requestedDurationMs = Number(payload?.maxDurationMs);
-  const existingTimeout = Number.isFinite(requestedDurationMs) && requestedDurationMs > 0
+  return Number.isFinite(requestedDurationMs) && requestedDurationMs > 0
     ? Math.min(
       CONTENT_RELAY_MAX_TIMEOUT_MS,
       Math.max(2 * 60 * 1000, requestedDurationMs + 30 * 1000),
     )
     : CONTENT_RELAY_DEFAULT_TIMEOUT_MS;
-  return supervisorStallMs > 0
-    ? Math.min(existingTimeout, supervisorStallMs - 60 * 1000)
-    : existingTimeout;
 }
 
 function normalizeCaptureProgress(progress = null, senderTabId = null) {
@@ -20262,7 +20259,7 @@ async function clearStoredCaptureProgress({
 }
 
 async function sendContentMessageWithTimeout(
-  tabId, payload, timeoutMs, abort = null, requireBusinessProgress = false,
+  tabId, payload, timeoutMs, abort = null, requireBusinessProgress = false, budget = null,
 ) {
   const requestId = beginContentRelayHeartbeat(payload, requireBusinessProgress);
   const inactivityTimeoutMs = requestId
@@ -20299,6 +20296,7 @@ async function sendContentMessageWithTimeout(
             }
           } else if (!networkPauseIsAlive) {
             activeElapsedMs += tickGapMs;
+            if (budget) budget.remainingMs -= tickGapMs;
           }
           lastWatchdogAt = now;
 
@@ -20333,7 +20331,7 @@ async function sendContentMessageWithTimeout(
             return;
           }
 
-          if (activeElapsedMs >= timeoutMs) {
+          if (activeElapsedMs >= timeoutMs || (budget && budget.remainingMs <= 0)) {
             reject(
               createContentRelayWatchdogError(
                 'CONTENT_RELAY_TIMEOUT',
@@ -21023,12 +21021,10 @@ async function canReloadUnattendedRelayWorker(tabId, owner) {
 async function relayToContentWithRetry(tabId, payload, owner = null) {
   const supervised = Boolean(owner?.runnerRequestId && owner?.runnerAttemptId &&
     isUnattendedCaptureRelayPayload(payload) && !isBestEffortContentRelayAction(payload));
-  const supervisorStallMs = supervised
-    ? payload?.action === 'captureComments'
-      ? UNATTENDED_RUN_COMMENT_STAGE_STALL_MS : UNATTENDED_RUN_BUSINESS_STALL_MS
-    : 0;
-  const timeoutMs = getContentRelayTimeoutMs(payload, supervisorStallMs);
-  const deadlineAt = supervised ? Date.now() + timeoutMs : Infinity;
+  const timeoutMs = getContentRelayTimeoutMs(payload);
+  // Count active collection in the watchdog and charge reload/setup against
+  // the same budget. A wall-clock timer across a live send would ignore pauses.
+  const budget = supervised ? {remainingMs: timeoutMs} : null;
   const requestId = getCaptureRequestId(payload);
   const inFlightRelayKey = registerInFlightContentRelay(tabId, payload, owner);
   let abort = null;
@@ -21041,26 +21037,36 @@ async function relayToContentWithRetry(tabId, payload, owner = null) {
     void abort.catch(() => {});
   }
   if (requestId) settledCaptureRequestIds.delete(requestId);
-  let deadlineTimer;
   const deadlineError = () => createContentRelayWatchdogError(
     'CONTENT_RELAY_TIMEOUT',
     `页面采集步骤超过 ${Math.ceil(timeoutMs / 1000)} 秒（动作 ${payload?.action || 'unknown'}，阶段 ${contentRelayHeartbeatByRequestId.get(requestId)?.phase || 'unknown'}）`,
   );
-  const deadline = supervised ? new Promise((_, reject) => {
-    deadlineTimer = setTimeout(() => reject(deadlineError()), timeoutMs);
-  }) : null;
-  const signals = [abort, deadline].filter(Boolean);
-  const awaitStep = (step) => Promise.race([...signals, step]);
-  const isStepOver = () => Date.now() >= deadlineAt || isCaptureRequestAborted(requestId);
-  const stopIfStepOver = () => {
-    if (Date.now() >= deadlineAt) throw deadlineError();
+  const awaitRecovery = async (operation) => {
+    const startedAt = Date.now();
+    const deadlineAt = budget ? startedAt + budget.remainingMs : Infinity;
+    let timer;
+    const deadline = budget ? new Promise((_, reject) => {
+      timer = setTimeout(() => reject(deadlineError()), Math.max(0, budget.remainingMs));
+    }) : null;
+    const signals = [abort, deadline].filter(Boolean);
+    const run = (step) => Promise.race([...signals, Promise.resolve().then(step)]);
+    const expired = () => Date.now() >= deadlineAt;
+    try {
+      if (expired()) throw deadlineError();
+      const result = await operation(run, () => expired() || isCaptureRequestAborted(requestId));
+      if (expired()) throw deadlineError();
+      return result;
+    } finally {
+      clearTimeout(timer);
+      if (budget) budget.remainingMs -= Math.max(0, Date.now() - startedAt);
+    }
   };
   try {
     if (isBestEffortContentRelayAction(payload)) {
       return await sendContentMessageWithTimeout(tabId, payload, timeoutMs);
     }
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      stopIfStepOver();
+      if (budget && budget.remainingMs <= 0) throw deadlineError();
       if (requestId && isCaptureRequestAborted(requestId)) {
         return resolveAbortedCaptureRequest(payload);
       }
@@ -21068,9 +21074,10 @@ async function relayToContentWithRetry(tabId, payload, owner = null) {
         const response = await sendContentMessageWithTimeout(
           tabId,
           payload,
-          Math.min(timeoutMs, Math.max(1, deadlineAt - Date.now())),
-          signals.length ? Promise.race(signals) : null,
+          timeoutMs,
+          abort,
           supervised,
+          budget,
         );
         if (requestId && isCaptureRequestAborted(requestId)) {
           return resolveAbortedCaptureRequest(payload, response);
@@ -21084,50 +21091,39 @@ async function relayToContentWithRetry(tabId, payload, owner = null) {
           error?.code === 'CONTENT_RELAY_TIMEOUT' ||
           error?.code === 'CONTENT_RELAY_STALLED'
         ) {
-          const cancellation = supervised && !requestId
+          const cancel = () => supervised && !requestId
             ? Promise.resolve() : cancelTimedOutContentCapture(tabId, requestId);
-          if (Date.now() >= deadlineAt) throw error;
-          await awaitStep(cancellation);
+          if (budget && budget.remainingMs <= 0) {
+            void cancel();
+            throw error;
+          }
+          const retry = await awaitRecovery(async (run, shouldAbort) => {
+            await run(cancel);
+            if (shouldAbort() || error.code !== 'CONTENT_RELAY_STALLED' || attempt !== 0) return false;
+            if (supervised && !await run(() => canReloadUnattendedRelayWorker(tabId, owner))) {
+              return false;
+            }
+            await run(() => writeContentRelayRecoveryProgress(tabId, payload, attempt + 1).catch(() => null));
+            if (shouldAbort()) return false;
+            return await run(() => reloadStalledCaptureTab(tabId, {shouldAbort}));
+          });
           if (requestId && isCaptureRequestAborted(requestId)) {
             return resolveAbortedCaptureRequest(payload);
           }
-          if (error?.code === 'CONTENT_RELAY_STALLED' && attempt === 0) {
-            if (supervised && !await awaitStep(canReloadUnattendedRelayWorker(tabId, owner))) {
-              throw error;
-            }
-            await awaitStep(writeContentRelayRecoveryProgress(
-              tabId,
-              payload,
-              attempt + 1,
-            ).catch(() => null));
-            if (requestId && isCaptureRequestAborted(requestId)) {
-              return resolveAbortedCaptureRequest(payload);
-            }
-            stopIfStepOver();
-            const reloadCompleted = await awaitStep(reloadStalledCaptureTab(tabId, {
-              shouldAbort: isStepOver,
-            }));
-            stopIfStepOver();
-            if (
-              !reloadCompleted ||
-              (requestId && isCaptureRequestAborted(requestId))
-            ) {
-              return resolveAbortedCaptureRequest(payload);
-            }
-            continue;
-          }
+          if (retry) continue;
           throw error;
         }
         if (!isTransientContentRelayError(error) || attempt === 1) {
           throw error;
         }
 
-        await awaitStep(waitForTabReady(tabId).catch(() => null));
-        if (requestId && isCaptureRequestAborted(requestId)) {
-          return resolveAbortedCaptureRequest(payload);
-        }
-        await awaitStep(ensureContentScriptReady(tabId));
-        await awaitStep(waitForContentScriptReady(tabId));
+        await awaitRecovery(async (run, shouldAbort) => {
+          await run(() => waitForTabReady(tabId).catch(() => null));
+          if (shouldAbort()) return;
+          await run(() => ensureContentScriptReady(tabId));
+          if (shouldAbort()) return;
+          await run(() => waitForContentScriptReady(tabId));
+        });
       }
     }
 
@@ -21138,7 +21134,6 @@ async function relayToContentWithRetry(tabId, payload, owner = null) {
     }
     throw error;
   } finally {
-    clearTimeout(deadlineTimer);
     clearTimeout(inFlightContentRelays.get(inFlightRelayKey)?.abortTimer);
     inFlightContentRelays.delete(inFlightRelayKey);
     if (requestId) {

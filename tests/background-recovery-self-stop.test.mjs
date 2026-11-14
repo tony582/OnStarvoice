@@ -2069,7 +2069,7 @@ test("waiting progress does not renew the 90-second watchdog, but a growing coun
   }
 });
 
-test("a long ordinary relay shares a five-minute ceiling with its retry", async () => {
+test("a long ordinary relay shares its original deadline with its retry", async () => {
   const clock = createRelayClock();
   const h = createHarness({clock});
   seedRunningRequest(h);
@@ -2083,17 +2083,17 @@ test("a long ordinary relay shares a five-minute ceiling with its retry", async 
     },
   }});
   let outcome;
-  const payload = {action: "captureSingleNote", captureRequestId: CAPTURE_ID, maxDurationMs: 600000};
+  const payload = {action: "captureKeywordNotes", captureRequestId: CAPTURE_ID, maxDurationMs: 600000};
   void h.api.relay(workerId, payload, {
     runnerRequestId: REQUEST_ID, runnerAttemptId: A1, taskId: TASK_KEY,
   }).catch(error => { outcome = error.code; });
   await clock.advance(90000);
-  for (let index = 1; index <= 4; index++) {
+  for (let index = 1; index <= 13; index++) {
     await clock.advance(40000);
     h.api.markContentRelayHeartbeat({captureRequestId: CAPTURE_ID, loadedCount: index});
   }
-  await clock.advance(50000);
-  assert.equal(h.api.getContentRelayTimeoutMs(payload, 360000), 300000);
+  await clock.advance(21000);
+  assert.equal(h.api.getContentRelayTimeoutMs(payload), 630000);
   assert.equal(attempts, 2);
   assert.equal(outcome, "CONTENT_RELAY_TIMEOUT");
 });
@@ -2176,4 +2176,23 @@ test("a terminal node check records a forced close after observing the same old 
   assert.equal(second.forcedCloseEvent.type, "recovery_self_stop_forced_close");
   assert.equal(h.tabs.has(RUNNER_TAB), false);
   assert.equal(h.tabs.has(SOURCE_TAB), true);
+});
+
+test("supervised collection with new results still runs after six minutes", async () => {
+  const clock = createRelayClock();
+  const h = createHarness({clock});
+  seedRunningRequest(h);
+  let finish;
+  h.content(SOURCE_TAB).onAction = () => new Promise(resolve => { finish = resolve; });
+  let failure;
+  const relay = h.api.relay(SOURCE_TAB, {
+    action: "captureKeywordNotes", captureRequestId: CAPTURE_ID, maxDurationMs: 600000,
+  }, {runnerRequestId: REQUEST_ID, runnerAttemptId: A1}).catch(error => { failure = error.code; });
+  for (let count = 1; count <= 9; count++) {
+    await clock.advance(40000);
+    h.api.markContentRelayHeartbeat({captureRequestId: CAPTURE_ID, detectedCount: count});
+  }
+  assert.equal(failure, undefined);
+  finish({ok: true});
+  assert.equal((await relay).ok, true);
 });
